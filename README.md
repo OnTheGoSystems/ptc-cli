@@ -19,8 +19,8 @@ Bash script for processing translation files through PTC (Private Translation Cl
 ### Using Configuration File (Recommended)
 
 ```bash
-# Create config.yml (without sensitive data)
-cat > config.yml << 'EOF'
+# Create config file
+cat > .ptc-config.yml << 'EOF'
 source_locale: en
 
 files:
@@ -35,11 +35,11 @@ files:
 EOF
 
 # Process translations with token from command line
-./ptc-cli.sh --config-file config.yml --api-token="$PTC_API_TOKEN"
+./ptc-cli.sh --config-file .ptc-config.yml --api-token="$PTC_API_TOKEN"
 
 # Or set environment variable
 export PTC_API_TOKEN=your-secret-token
-./ptc-cli.sh --config-file config.yml
+./ptc-cli.sh --config-file .ptc-config.yml
 ```
 
 ### Using Patterns
