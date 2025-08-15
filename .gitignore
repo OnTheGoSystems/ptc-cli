@@ -1,0 +1,46 @@
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# Logs
+*.log
+
+# Test data
+tests/fixtures/
+tests/output/
+
+# Backup files
+*.bak
+*.backup
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Configuration files with passwords/tokens
+config/local.config
+config/production.config
+.env
+.env.local
+
+# Local YAML configs with sensitive data
+*.local.yml
+*-local.yml
+config/local/
+config/secrets/
+
+# API token files
+api-token.txt
+.api-token
+*.token
+
+# Runtime data
+pid/
+run/

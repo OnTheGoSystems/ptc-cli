@@ -1,0 +1,26 @@
+# Complete PTC CLI configuration example
+# This file demonstrates all available configuration options
+
+# Basic settings
+source_locale: en
+file_tag_name: main
+api_url: https://app.ptc.wpml.org/api/v1/
+# api_token: NEVER commit API tokens to repository!
+# Use --api-token parameter or PTC_API_TOKEN environment variable instead
+
+# Monitoring settings (optional)
+# monitor_interval: 5
+# monitor_max_attempts: 100
+
+# Files to translate
+files:
+  # React app localization files
+  - file: src/locales/en.json
+    output: src/locales/{{lang}}.json
+  
+  # WordPress plugin translations
+  - file: languages/plugin.pot
+    output: languages/plugin-{{lang}}.po
+    additional_translation_files:
+      mo: languages/plugin-{{lang}}.mo
+      json: languages/plugin-{{lang}}-wp.json

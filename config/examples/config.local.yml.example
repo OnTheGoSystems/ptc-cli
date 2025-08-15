@@ -1,0 +1,28 @@
+# Example local configuration file with API token
+# Copy this file to config.local.yml and fill in your actual API token
+# This file is ignored by git for security
+
+# Basic settings
+source_locale: en
+file_tag_name: main
+api_url: https://app.ptc.wpml.org/api/v1/
+api_token: your-actual-secret-api-token-here
+
+# Monitoring settings
+monitor_interval: 5
+monitor_max_attempts: 100
+
+# Files to translate
+files:
+  - file: src/locales/en.json
+    output: src/locales/{{lang}}.json
+  
+  - file: admin/locales/en.json
+    output: admin/locales/{{lang}}.json
+
+# Usage:
+# 1. Copy this file: cp config/examples/config.local.yml.example config.local.yml
+# 2. Edit config.local.yml with your real API token
+# 3. Run: ./ptc-cli.sh --config-file config.local.yml
+# 
+# Note: config.local.yml is automatically ignored by git
