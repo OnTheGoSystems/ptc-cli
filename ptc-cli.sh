@@ -855,14 +855,15 @@ process_files_in_steps_with_config() {
             local relative_file_path=$(get_relative_path "$file" "$base_dir")
             
             # Get current status
-            local status
-            status=$(get_translation_status_quiet "$relative_file_path" "$PTC_FILE_TAG_NAME")
+            local status_output
+            status_output=$(get_translation_status_quiet "$relative_file_path" "$PTC_FILE_TAG_NAME")
+            local status=$(echo "$status_output" | cut -d'|' -f1)
             set_file_status "$relative_file_path" "$status"
             
             if [[ "$status" == "completed" ]]; then
                 completed_files+=("$file")
                 # Download translations
-                if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
+                if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir"; then
                     log_debug "Downloaded translations for: $relative_file_path"
                 else
                     log_warning "Failed to download translations for: $relative_file_path"
@@ -874,8 +875,19 @@ process_files_in_steps_with_config() {
             fi
         done
         
+        # Build status string
+        local status_string=""
+        for file in "${monitoring_files[@]}"; do
+            local relative_file_path_status=$(get_relative_path "$file" "$base_dir")
+            local file_status
+            file_status=$(get_file_status "$relative_file_path_status")
+            local status_char
+            status_char=$(get_status_char "$file_status")
+            status_string="${status_string}${status_char}"
+        done
+        
         # Display compact status
-        display_file_status $round $PTC_MONITOR_MAX_ATTEMPTS
+        display_file_status "${#completed_files[@]}" "${#monitoring_files[@]}" "$round" "$PTC_MONITOR_MAX_ATTEMPTS" "$status_string"
         
         # Update monitoring array for next round
         if [[ ${#still_monitoring[@]} -gt 0 ]]; then
@@ -1037,14 +1049,15 @@ process_files_in_steps_with_outputs() {
             local relative_file_path=$(get_relative_path "$file" "$base_dir")
             
             # Get current status
-            local status
-            status=$(get_translation_status_quiet "$relative_file_path" "$PTC_FILE_TAG_NAME")
+            local status_output
+            status_output=$(get_translation_status_quiet "$relative_file_path" "$PTC_FILE_TAG_NAME")
+            local status=$(echo "$status_output" | cut -d'|' -f1)
             set_file_status "$relative_file_path" "$status"
             
             if [[ "$status" == "completed" ]]; then
                 completed_files+=("$file")
                 # Download translations
-                if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
+                if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir"; then
                     log_debug "Downloaded translations for: $relative_file_path"
                 else
                     log_warning "Failed to download translations for: $relative_file_path"
@@ -1056,8 +1069,19 @@ process_files_in_steps_with_outputs() {
             fi
         done
         
+        # Build status string
+        local status_string=""
+        for file in "${monitoring_files[@]}"; do
+            local relative_file_path_status=$(get_relative_path "$file" "$base_dir")
+            local file_status
+            file_status=$(get_file_status "$relative_file_path_status")
+            local status_char
+            status_char=$(get_status_char "$file_status")
+            status_string="${status_string}${status_char}"
+        done
+        
         # Display compact status
-        display_file_status $round $PTC_MONITOR_MAX_ATTEMPTS
+        display_file_status "${#completed_files[@]}" "${#monitoring_files[@]}" "$round" "$PTC_MONITOR_MAX_ATTEMPTS" "$status_string"
         
         # Update monitoring array for next round
         if [[ ${#still_monitoring[@]} -gt 0 ]]; then
@@ -1359,6 +1383,11 @@ get_translation_status_quiet() {
     
     local full_url="${status_url}?${query_params}"
     
+    # DETAILED LOGGING FOR DEBUGGING
+    log_debug "=== STATUS CHECK API CALL ==="
+    log_debug "URL: $full_url"
+    log_debug "Token: ${PTC_API_TOKEN:0:10}..."
+    
     local response
     if [[ -n "$PTC_API_TOKEN" ]]; then
         response=$(curl -s -w "%{http_code}" \
@@ -1366,15 +1395,22 @@ get_translation_status_quiet() {
             -H "Authorization: Bearer $PTC_API_TOKEN" \
             "$full_url" 2>/dev/null)
     else
+        log_debug "No API token provided"
         return 1
     fi
     
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
+    # DETAILED LOGGING FOR DEBUGGING
+    log_debug "HTTP Code: $http_code"
+    log_debug "Response Body: $response_body"
+    
     if [[ "$http_code" == "200" ]]; then
         # Parse status from response
         local status=$(echo "$response_body" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "unknown")
+        
+        log_debug "Parsed Status: $status"
         
         # Output the status and response body for caller
         echo "$status|$response_body"
@@ -1386,9 +1422,11 @@ get_translation_status_quiet() {
             return 2  # Still in progress
         fi
     elif [[ "$http_code" == "404" ]]; then
+        log_debug "File not found in translation system"
         echo "not_found|"
         return 1
     else
+        log_debug "API error: HTTP $http_code"
         echo "error|"
         return 1
     fi
@@ -1630,7 +1668,7 @@ download_translations() {
             # Extract ZIP to temporary directory first
             if (cd "$temp_extract_dir" && unzip -o "$temp_zip" 2>/dev/null); then
                 # Move files from temp directory to target directory, preserving structure
-                if find "$temp_extract_dir" -type f -name "*.json" -o -name "*.po" -o -name "*.pot" -o -name "*.mo" 2>/dev/null | while read -r file; do
+                if find "$temp_extract_dir" -type f -name "*.json" -o -name "*.po" -o -name "*.pot" -o -name "*.mo" -o -name "*.yml" -o -name "*.yaml" 2>/dev/null | while read -r file; do
                     local filename=$(basename "$file")
                     local target_file="$target_dir/$filename"
                     log_debug "Moving $filename to $target_file"
