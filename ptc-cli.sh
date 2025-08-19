@@ -31,6 +31,8 @@ PTC_DRY_RUN=false
 PTC_MONITOR_INTERVAL=5   # seconds between status checks
 PTC_MONITOR_MAX_ATTEMPTS=100  # maximum number of status checks
 
+
+
 # Logging functions
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $*" >&2
@@ -1509,6 +1511,8 @@ get_file_status() {
     echo "unknown"
 }
 
+
+
 set_file_status() {
     local target_file="$1"
     local new_status="$2"
@@ -1629,16 +1633,32 @@ download_translations() {
     
     local full_url="${download_url}?${query_params}"
     
+    # Verbose logging for download details
+    log_debug "=== DOWNLOAD API CALL ==="
+    log_debug "Full download URL: $full_url"
+    log_debug "File path: $relative_file_path"
+    log_debug "Tag name: $file_tag_name"
+    log_debug "Base directory: $base_dir"
+    
     # Create temporary file for download
     local temp_zip=$(mktemp /tmp/ptc_translations_XXXXXX.zip)
+    log_debug "Created temporary ZIP file: $temp_zip"
     
     local http_code
     if [[ -n "$PTC_API_TOKEN" ]]; then
+        log_debug "Starting curl download with token: ${PTC_API_TOKEN:0:10}..."
         http_code=$(curl -s -w "%{http_code}" \
             -X GET \
             -H "Authorization: Bearer $PTC_API_TOKEN" \
             -o "$temp_zip" \
             "$full_url" 2>/dev/null)
+        log_debug "Download completed with HTTP code: $http_code"
+        
+        # Check file size to verify download
+        if [[ -f "$temp_zip" ]]; then
+            local file_size=$(stat -f%z "$temp_zip" 2>/dev/null || stat -c%s "$temp_zip" 2>/dev/null || echo "unknown")
+            log_debug "Downloaded file size: $file_size bytes"
+        fi
     else
         log_error "API token required for translation download"
         rm -f "$temp_zip"
@@ -1660,28 +1680,71 @@ download_translations() {
             fi
             
             log_info "Unpacking translations to: $target_dir"
+            log_debug "=== EXTRACTION DETAILS ==="
             log_debug "Source file directory: $source_dir"
+            log_debug "Target directory: $target_dir"
+            log_debug "ZIP file: $temp_zip"
+            
+            # Create target directory if it doesn't exist
+            if [[ ! -d "$target_dir" ]]; then
+                log_debug "Creating target directory: $target_dir"
+                mkdir -p "$target_dir"
+            fi
             
             # Create temporary directory for extraction
             local temp_extract_dir=$(mktemp -d /tmp/ptc_extract_XXXXXX)
+            log_debug "Created extraction directory: $temp_extract_dir"
             
             # Extract ZIP to temporary directory first
+            log_debug "Extracting ZIP contents..."
             if (cd "$temp_extract_dir" && unzip -o "$temp_zip" 2>/dev/null); then
+                log_debug "ZIP extraction successful"
+                
+                # List extracted files for debug
+                log_debug "Extracted files:"
+                find "$temp_extract_dir" -type f 2>/dev/null | while read -r extracted_file; do
+                    local extracted_filename=$(basename "$extracted_file")
+                    local extracted_size=$(stat -f%z "$extracted_file" 2>/dev/null || stat -c%s "$extracted_file" 2>/dev/null || echo "unknown")
+                    log_debug "  - $extracted_filename ($extracted_size bytes)"
+                done
                 # Move files from temp directory to target directory, preserving structure
+                log_debug "Moving translation files to target directory..."
+                local moved_count=0
                 if find "$temp_extract_dir" -type f -name "*.json" -o -name "*.po" -o -name "*.pot" -o -name "*.mo" -o -name "*.yml" -o -name "*.yaml" 2>/dev/null | while read -r file; do
                     local filename=$(basename "$file")
                     local target_file="$target_dir/$filename"
-                    log_debug "Moving $filename to $target_file"
-                    mv "$file" "$target_file" 2>/dev/null || {
-                        log_warning "Failed to move $filename to target location"
+                    log_debug "Moving: $filename → $target_file"
+                    
+                    # Check if target file already exists
+                    if [[ -f "$target_file" ]]; then
+                        log_debug "Overwriting existing file: $target_file"
+                    fi
+                    
+                    if mv "$file" "$target_file" 2>/dev/null; then
+                        # Verify the move was successful
+                        if [[ -f "$target_file" ]]; then
+                            local final_size=$(stat -f%z "$target_file" 2>/dev/null || stat -c%s "$target_file" 2>/dev/null || echo "unknown")
+                            log_debug "Successfully moved $filename ($final_size bytes)"
+                            moved_count=$((moved_count + 1))
+                            
+
+                        else
+                            log_warning "File move reported success but target file not found: $target_file"
+                            return 1
+                        fi
+                    else
+                        log_warning "Failed to move $filename to $target_file"
                         return 1
-                    }
+                    fi
                 done; then
+                    log_debug "Moved $moved_count translation files successfully"
                     log_success "Translations unpacked successfully to $target_dir"
+                    log_debug "Cleaning up temporary files..."
                     rm -rf "$temp_extract_dir" "$temp_zip"
                     return 0
                 else
                     log_error "Failed to move translation files to target directory"
+                    log_debug "Cleaning up temporary files after failure..."
                     rm -rf "$temp_extract_dir" "$temp_zip"
                     return 1
                 fi
