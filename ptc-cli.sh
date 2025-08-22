@@ -782,8 +782,8 @@ process_files_in_steps_with_config() {
             
             # Get output pattern from config for this file
             local output_pattern
-            local config_file_name=$(basename "$relative_file_path")
-            output_pattern=$(grep -A999 '^files:' "$PTC_CONFIG_FILE" | grep -A1 "^ *- file: *$config_file_name" | grep '^ *output:' | sed 's/^ *output: *//' | head -1)
+            # Use full relative path to match YAML config
+            output_pattern=$(grep -A999 '^files:' "$PTC_CONFIG_FILE" | grep -A1 "^ *- file: *$relative_file_path" | grep '^ *output:' | sed 's/^ *output: *//' | head -1)
             
             if [[ -z "$output_pattern" ]]; then
                 # Fallback: generate output pattern automatically
@@ -804,7 +804,7 @@ process_files_in_steps_with_config() {
             
             # Extract additional_translation_files for this file
             local additional_files_json=""
-            additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$config_file_name")
+            additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$relative_file_path")
             
             if make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
                 uploaded_files+=("$file")
@@ -1277,6 +1277,21 @@ make_ptc_api_call() {
     # PTC API endpoint
     local api_url="${PTC_API_URL}source_files"
     
+    if [[ "$PTC_VERBOSE" == "true" ]]; then
+        log_info "=== API REQUEST DETAILS ==="
+        log_info "Uploading file: $relative_file_path"
+        log_info "API endpoint: $api_url"
+        log_info "Output pattern: $output_file_path"
+        log_info "File tag: $file_tag_name"
+        if [[ -n "$additional_files_json" ]]; then
+            log_info "Additional translation files JSON:"
+            log_info "$additional_files_json"
+        else
+            log_info "No additional translation files specified"
+        fi
+        log_info "=========================="
+    fi
+    
     log_debug "Uploading file to PTC API: $api_url"
     
     # Prepare headers for authentication
@@ -1299,16 +1314,51 @@ make_ptc_api_call() {
     local response
     if [[ -n "$PTC_API_TOKEN" ]]; then
         if [[ -n "$additional_files_json" ]]; then
+            # When additional_files are specified, send as JSON instead of form-data
+            if [[ "$PTC_VERBOSE" == "true" ]]; then
+                log_info "Executing JSON request with additional files..."
+                log_info "Additional files: $additional_files_json"
+            fi
+            
+            # Create JSON payload (no file content needed)
+            local json_payload
+            json_payload=$(cat << EOF
+{
+    "file_path": "$relative_file_path",
+    "output_file_path": "$output_file_path", 
+    "file_tag_name": "$file_tag_name",
+    "additional_translation_files": $additional_files_json
+}
+EOF
+)
+            
+            if [[ "$PTC_VERBOSE" == "true" ]]; then
+                log_info "Sending JSON payload:"
+                echo "$json_payload"
+                log_info "curl -X POST \\"
+                log_info "  -H \"Authorization: Bearer [TOKEN]\" \\"
+                log_info "  -H \"Content-Type: application/json\" \\"
+                log_info "  -d '[JSON_PAYLOAD]' \\"
+                log_info "  \"$api_url\""
+            fi
+            
             response=$(curl -s -w "%{http_code}" \
                 -X POST \
                 -H "Authorization: Bearer $PTC_API_TOKEN" \
-                -F "file_path=$relative_file_path" \
-                -F "output_file_path=$output_file_path" \
-                -F "file_tag_name=$file_tag_name" \
-                -F "additional_translation_files=$additional_files_json" \
-                -F "file=@$absolute_file_path" \
+                -H "Content-Type: application/json" \
+                -d "$json_payload" \
                 "$api_url" 2>/dev/null)
         else
+            if [[ "$PTC_VERBOSE" == "true" ]]; then
+                log_info "Executing curl command without additional files..."
+                log_info "curl -X POST \\"
+                log_info "  -H \"Authorization: Bearer [TOKEN]\" \\"
+                log_info "  -F \"file_path=$relative_file_path\" \\"
+                log_info "  -F \"output_file_path=$output_file_path\" \\"
+                log_info "  -F \"file_tag_name=$file_tag_name\" \\"
+                log_info "  -F \"file=@$absolute_file_path\" \\"
+                log_info "  \"$api_url\""
+            fi
             response=$(curl -s -w "%{http_code}" \
                 -X POST \
                 -H "Authorization: Bearer $PTC_API_TOKEN" \
@@ -1320,13 +1370,22 @@ make_ptc_api_call() {
         fi
     else
         if [[ -n "$additional_files_json" ]]; then
+            # When additional_files are specified, send as JSON instead of form-data
+            local json_payload
+            json_payload=$(cat << EOF
+{
+    "file_path": "$relative_file_path",
+    "output_file_path": "$output_file_path", 
+    "file_tag_name": "$file_tag_name",
+    "additional_translation_files": $additional_files_json
+}
+EOF
+)
+            
             response=$(curl -s -w "%{http_code}" \
                 -X POST \
-                -F "file_path=$relative_file_path" \
-                -F "output_file_path=$output_file_path" \
-                -F "file_tag_name=$file_tag_name" \
-                -F "additional_translation_files=$additional_files_json" \
-                -F "file=@$absolute_file_path" \
+                -H "Content-Type: application/json" \
+                -d "$json_payload" \
                 "$api_url" 2>/dev/null)
         else
             response=$(curl -s -w "%{http_code}" \
@@ -1344,9 +1403,25 @@ make_ptc_api_call() {
     
     if [[ "$http_code" == "201" ]]; then
         log_success "File uploaded successfully: $relative_file_path"
+        if [[ "$PTC_VERBOSE" == "true" ]]; then
+            log_info "=== API RESPONSE ==="
+            log_info "HTTP Status: $http_code (Created)"
+            if [[ -n "$response_body" ]]; then
+                log_info "Response body: $response_body"
+            fi
+            log_info "===================="
+        fi
         log_debug "API response: $response_body"
     else
         log_error "Failed to upload file: $relative_file_path (HTTP $http_code)"
+        if [[ "$PTC_VERBOSE" == "true" ]]; then
+            log_info "=== API ERROR RESPONSE ==="
+            log_info "HTTP Status: $http_code"
+            if [[ -n "$response_body" ]]; then
+                log_info "Error response: $response_body"
+            fi
+            log_info "=========================="
+        fi
         log_debug "API response: $response_body"
         return 1
     fi
