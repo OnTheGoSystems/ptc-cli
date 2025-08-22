@@ -22,5 +22,7 @@ files:
   - file: languages/plugin.pot
     output: languages/plugin-{{lang}}.po
     additional_translation_files:
-      mo: languages/plugin-{{lang}}.mo
-      json: languages/plugin-{{lang}}-wp.json
+      - type: mo
+        path: languages/plugin-{{lang}}.mo
+      - type: json
+        path: languages/plugin-{{lang}}-wp.json

@@ -30,8 +30,10 @@ files:
   - file: languages/plugin.pot
     output: languages/plugin-{{lang}}.po
     additional_translation_files:
-      mo: languages/plugin-{{lang}}.mo
-      po: languages/plugin-{{lang}}.po
+      - type: mo
+        path: languages/plugin-{{lang}}.mo
+      - type: po
+        path: languages/plugin-{{lang}}.po
 EOF
 
 # Process translations with token from command line
@@ -118,8 +120,10 @@ files:
   - file: src/locales/en.json
     output: src/locales/{{lang}}.json
     additional_translation_files:
-      mo: dist/locales/{{lang}}.mo
-      php: includes/lang-{{lang}}.php
+      - type: mo
+        path: dist/locales/{{lang}}.mo
+      - type: php
+        path: includes/lang-{{lang}}.php
   
   # Admin panel translations  
   - file: admin/locales/en.json
@@ -129,8 +133,10 @@ files:
   - file: languages/plugin.pot
     output: languages/plugin-{{lang}}.po
     additional_translation_files:
-      mo: languages/plugin-{{lang}}.mo
-      json: languages/plugin-{{lang}}-wp.json
+      - type: mo
+        path: languages/plugin-{{lang}}.mo
+      - type: json
+        path: languages/plugin-{{lang}}-wp.json
 ```
 
 ### Usage Examples
@@ -379,12 +385,15 @@ files:
   - file: languages/plugin.pot
     output: languages/plugin-{{lang}}.po
     additional_translation_files:
-      mo: languages/plugin-{{lang}}.mo
-      json: languages/plugin-{{lang}}.json
-      php: includes/lang-{{lang}}.php
+      - type: mo
+        path: languages/plugin-{{lang}}.mo
+      - type: json
+        path: languages/plugin-{{lang}}.json
+      - type: php
+        path: includes/lang-{{lang}}.php
 ```
 
-These are sent to the API as JSON: `{"mo":"languages/plugin-{{lang}}.mo","json":"languages/plugin-{{lang}}.json"}`
+These are sent to the API as JSON array: `[{"type":"mo","path":"languages/plugin-{{lang}}.mo"},{"type":"json","path":"languages/plugin-{{lang}}.json"},{"type":"php","path":"includes/lang-{{lang}}.php"}]`
 
 ## Error Handling
 

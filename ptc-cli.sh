@@ -101,8 +101,10 @@ CONFIG FILE FORMAT:
       - file: src/locales/en.json
         output: src/locales/{{lang}}.json
         additional_translation_files:
-          mo: dist/{{lang}}.mo
-          php: includes/lang-{{lang}}.php
+          - type: mo
+            path: dist/{{lang}}.mo
+          - type: php
+            path: includes/lang-{{lang}}.php
       
       - file: admin/en.json
         output: admin/{{lang}}.json
@@ -232,6 +234,12 @@ substitute_pattern() {
 }
 
 # Function to extract additional_translation_files for a specific file from YAML
+# Now supports only array format with type and path properties:
+# additional_translation_files:
+#   - type: mo
+#     path: languages/{{lang}}.mo
+#   - type: php  
+#     path: includes/lang-{{lang}}.php
 extract_additional_files() {
     local config_file="$1"
     local target_file="$2"
@@ -266,28 +274,49 @@ extract_additional_files() {
         return 0  # No additional files
     fi
     
-    # Extract additional files as JSON object
-    local additional_files
-    additional_files=$(echo "$file_block" | grep -A20 '^ *additional_translation_files:' | grep '^ *[a-zA-Z_]*:' | grep -v 'additional_translation_files:')
+    # Extract additional files array (new format with type and path)
+    local additional_section
+    additional_section=$(echo "$file_block" | grep -A50 '^ *additional_translation_files:')
     
-    if [[ -z "$additional_files" ]]; then
+    # Extract array items (lines starting with "- type:" or "  type:")
+    local array_items
+    array_items=$(echo "$additional_section" | grep -A1 '^ *- type:')
+    
+    if [[ -z "$array_items" ]]; then
         return 0
     fi
     
-    # Convert to JSON format
-    local json_parts=()
+    # Convert to JSON array format
+    local json_objects=()
+    local current_type=""
+    local current_path=""
+    
     while IFS= read -r line; do
         if [[ -n "$line" ]]; then
-            local key=$(echo "$line" | sed 's/^ *//' | sed 's/:.*//')
-            local value=$(echo "$line" | sed 's/^[^:]*: *//' | sed 's/^["\s]*//' | sed 's/["\s]*$//')
-            json_parts+=("\"$key\":\"$value\"")
+            if echo "$line" | grep -q '^ *- type:'; then
+                # New array item, save previous if exists
+                if [[ -n "$current_type" && -n "$current_path" ]]; then
+                    json_objects+=("{\"type\":\"$current_type\",\"path\":\"$current_path\"}")
+                fi
+                # Extract type
+                current_type=$(echo "$line" | sed 's/^[^:]*: *//' | sed 's/^["\s]*//' | sed 's/["\s]*$//')
+                current_path=""
+            elif echo "$line" | grep -q '^ *path:'; then
+                # Extract path
+                current_path=$(echo "$line" | sed 's/^[^:]*: *//' | sed 's/^["\s]*//' | sed 's/["\s]*$//')
+            fi
         fi
-    done <<< "$additional_files"
+    done <<< "$array_items"
     
-    if [[ ${#json_parts[@]} -gt 0 ]]; then
-        local json_string="{$(IFS=','; echo "${json_parts[*]}")}"
-        echo "$json_string"
-        log_debug "Additional files JSON: $json_string"
+    # Add last item if exists
+    if [[ -n "$current_type" && -n "$current_path" ]]; then
+        json_objects+=("{\"type\":\"$current_type\",\"path\":\"$current_path\"}")
+    fi
+    
+    if [[ ${#json_objects[@]} -gt 0 ]]; then
+        local json_array="[$(IFS=','; echo "${json_objects[*]}")]"
+        echo "$json_array"
+        log_debug "Additional files JSON array: $json_array"
     fi
 }
 
@@ -1634,6 +1663,14 @@ download_translations() {
     local full_url="${download_url}?${query_params}"
     
     # Verbose logging for download details
+    if [[ "$PTC_VERBOSE" == "true" ]]; then
+        log_info "=== DOWNLOAD DETAILS ==="
+        log_info "Downloading translations for: $relative_file_path"
+        log_info "API endpoint: $download_url"
+        log_info "Target directory: $base_dir"
+        log_info "File tag: $file_tag_name"
+    fi
+    
     log_debug "=== DOWNLOAD API CALL ==="
     log_debug "Full download URL: $full_url"
     log_debug "File path: $relative_file_path"
@@ -1646,6 +1683,9 @@ download_translations() {
     
     local http_code
     if [[ -n "$PTC_API_TOKEN" ]]; then
+        if [[ "$PTC_VERBOSE" == "true" ]]; then
+            log_info "Starting download from API..."
+        fi
         log_debug "Starting curl download with token: ${PTC_API_TOKEN:0:10}..."
         http_code=$(curl -s -w "%{http_code}" \
             -X GET \
@@ -1658,6 +1698,9 @@ download_translations() {
         if [[ -f "$temp_zip" ]]; then
             local file_size=$(stat -f%z "$temp_zip" 2>/dev/null || stat -c%s "$temp_zip" 2>/dev/null || echo "unknown")
             log_debug "Downloaded file size: $file_size bytes"
+            if [[ "$PTC_VERBOSE" == "true" ]]; then
+                log_info "Downloaded ZIP file: $file_size bytes"
+            fi
         fi
     else
         log_error "API token required for translation download"
@@ -1679,7 +1722,11 @@ download_translations() {
                 mkdir -p "$target_dir"
             fi
             
-            log_info "Unpacking translations to: $target_dir"
+            if [[ "$PTC_VERBOSE" == "true" ]]; then
+                log_info "=== EXTRACTION DETAILS ==="
+                log_info "Extracting to directory: $target_dir"
+                log_info "Source file directory: $source_dir"
+            fi
             log_debug "=== EXTRACTION DETAILS ==="
             log_debug "Source file directory: $source_dir"
             log_debug "Target directory: $target_dir"
@@ -1696,11 +1743,23 @@ download_translations() {
             log_debug "Created extraction directory: $temp_extract_dir"
             
             # Extract ZIP to temporary directory first
+            if [[ "$PTC_VERBOSE" == "true" ]]; then
+                log_info "Extracting ZIP contents..."
+            fi
             log_debug "Extracting ZIP contents..."
             if (cd "$temp_extract_dir" && unzip -o "$temp_zip" 2>/dev/null); then
                 log_debug "ZIP extraction successful"
                 
-                # List extracted files for debug
+                # List extracted files for debug and verbose mode
+                if [[ "$PTC_VERBOSE" == "true" ]]; then
+                    log_info "Files found in archive:"
+                    find "$temp_extract_dir" -type f 2>/dev/null | while read -r extracted_file; do
+                        local extracted_filename=$(basename "$extracted_file")
+                        local extracted_size=$(stat -f%z "$extracted_file" 2>/dev/null || stat -c%s "$extracted_file" 2>/dev/null || echo "unknown")
+                        log_info "  - $extracted_filename ($extracted_size bytes)"
+                    done
+                fi
+                
                 log_debug "Extracted files:"
                 find "$temp_extract_dir" -type f 2>/dev/null | while read -r extracted_file; do
                     local extracted_filename=$(basename "$extracted_file")
@@ -1708,6 +1767,9 @@ download_translations() {
                     log_debug "  - $extracted_filename ($extracted_size bytes)"
                 done
                 # Move files from temp directory to target directory, preserving structure
+                if [[ "$PTC_VERBOSE" == "true" ]]; then
+                    log_info "Moving translation files to target directory..."
+                fi
                 log_debug "Moving translation files to target directory..."
                 local moved_count=0
                 if find "$temp_extract_dir" -type f -name "*.json" -o -name "*.po" -o -name "*.pot" -o -name "*.mo" -o -name "*.yml" -o -name "*.yaml" 2>/dev/null | while read -r file; do
@@ -1718,6 +1780,9 @@ download_translations() {
                     # Check if target file already exists
                     if [[ -f "$target_file" ]]; then
                         log_debug "Overwriting existing file: $target_file"
+                        if [[ "$PTC_VERBOSE" == "true" ]]; then
+                            log_info "Overwriting: $filename"
+                        fi
                     fi
                     
                     if mv "$file" "$target_file" 2>/dev/null; then
@@ -1725,9 +1790,10 @@ download_translations() {
                         if [[ -f "$target_file" ]]; then
                             local final_size=$(stat -f%z "$target_file" 2>/dev/null || stat -c%s "$target_file" 2>/dev/null || echo "unknown")
                             log_debug "Successfully moved $filename ($final_size bytes)"
+                            if [[ "$PTC_VERBOSE" == "true" ]]; then
+                                log_info "  ✓ $filename ($final_size bytes)"
+                            fi
                             moved_count=$((moved_count + 1))
-                            
-
                         else
                             log_warning "File move reported success but target file not found: $target_file"
                             return 1
@@ -1738,6 +1804,9 @@ download_translations() {
                     fi
                 done; then
                     log_debug "Moved $moved_count translation files successfully"
+                    if [[ "$PTC_VERBOSE" == "true" ]]; then
+                        log_info "Successfully moved $moved_count files"
+                    fi
                     log_success "Translations unpacked successfully to $target_dir"
                     log_debug "Cleaning up temporary files..."
                     rm -rf "$temp_extract_dir" "$temp_zip"
