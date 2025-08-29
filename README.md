@@ -7,7 +7,6 @@ Bash script for processing translation files through PTC (Private Translation Cl
 - 🔍 Flexible file search using globbing or explicit file configuration
 - 🛡️ Strict error handling for CI environments
 - 📝 Detailed logging with color highlighting
-- 🧪 Dry run mode
 - ⚡ Optimized for CI/CD usage
 - 🔄 Step-based processing (Upload → Process → Monitor → Download)
 - 📊 Compact progress monitoring with status indicators
@@ -38,10 +37,6 @@ EOF
 
 # Process translations with token from command line
 ./ptc-cli.sh --config-file .ptc-config.yml --api-token="$PTC_API_TOKEN"
-
-# Or set environment variable
-export PTC_API_TOKEN=your-secret-token
-./ptc-cli.sh --config-file .ptc-config.yml
 ```
 
 ### Using Patterns
@@ -86,17 +81,6 @@ chmod +x ptc-cli.sh
 - `-n, --dry-run` - Show what would be done without executing
 - `-h, --help` - Show help
 - `--version` - Show version
-
-### Pattern Examples
-
-| Pattern | Description | Finds |
-|---------|-------------|-------|
-| `sample-{{lang}}.json` | Files with language extension | `sample-en.json`, `sample-de.json`, `sample-fr.json` |
-| `{{lang}}/**/*.json` | All JSON files in language folders | `en/**/*.json`, `de/**/*.json` |
-| `locales/{{lang}}/messages.json` | Specific file in language folder | `locales/en/messages.json` |
-| `i18n/{{lang}}/*.properties` | Properties files | `i18n/en/app.properties` |
-| `languages/wpsite.pot` | WordPress plugin template | `languages/wpsite.pot` |
-| `languages/**/plugin.pot` | WordPress plugin templates | `languages/plugins/wpsite.pot` |
 
 ## Configuration File Format
 
@@ -285,100 +269,9 @@ process_translations:
     - main
 ```
 
-### Jenkins
-
-```groovy
-pipeline {
-    agent any
-    environment {
-        PTC_API_TOKEN = credentials('ptc-api-token')
-    }
-    stages {
-        stage('Process Translations') {
-            steps {
-                sh '''
-                    chmod +x ptc-cli.sh
-                    ./ptc-cli.sh --config-file config.yml --api-token="$PTC_API_TOKEN" --verbose
-                '''
-            }
-        }
-    }
-}
-```
-
-## Requirements
-
-- Bash 3.2+ (compatible with macOS default bash)
-- Standard Unix utilities: `find`, `grep`, `sed`, `curl`
-- Network access to PTC API
-- Read permissions for project files
-- Valid PTC API token for actual processing
-
-## Project Structure
-
-```
-ptc-cli-bash/
-├── ptc-cli.sh           # Main script
-├── README.md            # Documentation
-├── config/              # Configuration examples
-│   └── examples/        # Configuration examples for different projects
-│       ├── react-app.config      # React application example
-│       ├── java-app.config       # Java application example
-│       ├── wordpress-wpsite.config # WordPress plugin example
-│       └── full-config.yml       # Complete YAML configuration example
-├── tests/               # Tests
-│   ├── test-runner.sh   # Test runner
-│   └── fixtures/        # Test data
-└── docs/                # Additional documentation
-    ├── DEVELOPMENT.md   # Developer guide
-    ├── DEMO.md          # Demo walkthrough
-    └── CHANGELOG.md     # Version history
-```
-
-## API Integration
-
-### Authentication
-
-The script supports Bearer token authentication. **For security, always use environment variables or command-line parameters instead of storing tokens in config files:**
-
-```bash
-# ✅ SECURE: Via environment variable (recommended)
-export PTC_API_TOKEN=your-secret-token
-./ptc-cli.sh --config-file config.yml
-
-# ✅ SECURE: Via command line parameter
-./ptc-cli.sh --config-file config.yml --api-token="$PTC_API_TOKEN"
-
-# ❌ INSECURE: Never store tokens in config files committed to repository!
-# api_token: your-secret-token  # DON'T DO THIS!
-```
-
-**Security Best Practices:**
-- Use CI/CD secrets management (GitHub Secrets, GitLab Variables, etc.)
-- Store tokens in environment variables
-- Use local config files (ignored by git) for development
-- Never commit API tokens to version control
-
-**For Local Development:**
-```bash
-# Create a local config with your token (ignored by git)
-cp config/examples/config.local.yml.example config.local.yml
-# Edit config.local.yml with your real API token
-./ptc-cli.sh --config-file config.local.yml
-```
-
-### API Endpoints
-
-The script uses the following PTC API endpoints:
-
-- `POST /source_files` - Upload files for translation
-- `PUT /source_files/process` - Trigger translation processing
-- `GET /source_files/translation_status` - Check translation status
-- `GET /source_files/download_translations` - Download completed translations
-
 ### Additional Translation Files
 
-When using YAML configuration, you can specify additional files to be generated:
+When using YAML configuration, you can specify additional files to be generated (useful for WordPress):
 
 ```yaml
 files:
@@ -393,16 +286,6 @@ files:
         path: includes/lang-{{lang}}.php
 ```
 
-These are sent to the API as JSON array: `[{"type":"mo","path":"languages/plugin-{{lang}}.mo"},{"type":"json","path":"languages/plugin-{{lang}}.json"},{"type":"php","path":"includes/lang-{{lang}}.php"}]`
-
-## Error Handling
-
-The script uses strict bash mode (`set -euo pipefail`) and properly handles errors:
-
-- **Exit code 0**: Successful execution
-- **Exit code 1**: Argument validation error or no files found
-- **Exit code 2**: File processing error
-
 ### Troubleshooting
 
 **Common Issues:**
@@ -414,12 +297,13 @@ The script uses strict bash mode (`set -euo pipefail`) and properly handles erro
    - Check your API token
    - Verify token has correct permissions
 
-2. **HTTP 404 Not Found**
+2. **HTTP 403 Forbidden**
    ```bash
-   [ERROR] Failed to upload file: example.json (HTTP 404)
+   [ERROR] Failed to upload file: example.json (HTTP 403)
    ```
-   - Check your API URL
-   - Verify the endpoint exists
+   - Check your API token
+   - Check your Subscription
+   - Verify token has correct permissions
 
 3. **Files not found**
    ```bash
@@ -429,22 +313,12 @@ The script uses strict bash mode (`set -euo pipefail`) and properly handles erro
    - Verify source locale matches your files
    - Use `--verbose` to see search details
 
-4. **Translation timeout**
+5. **Translation timeout**
    ```bash
    [WARNING] Timed out files: 1
    ```
    - Increase `--monitor-max-attempts`
    - Check translation status manually with provided curl command
-
-## Logging
-
-The script supports color logging:
-
-- 🔵 **INFO**: General information
-- 🟢 **SUCCESS**: Successful operations
-- 🟡 **WARNING**: Warnings
-- 🔴 **ERROR**: Errors
-- 🔵 **DEBUG**: Debug information (only with --verbose)
 
 ## Development
 
