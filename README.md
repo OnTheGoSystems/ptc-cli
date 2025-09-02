@@ -2,6 +2,8 @@
 
 Bash script for processing translation files through PTC (Private Translation Cloud) API with support for various project configurations.
 
+[Sample repositories](https://github.com/OnTheGoSystems/ptc-cli/wiki/Sample-repositories)
+
 ## Features
 
 - 🔍 Flexible file search using globbing or explicit file configuration
