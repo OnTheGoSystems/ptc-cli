@@ -11,6 +11,7 @@ Bash script for processing translation files through PTC (Private Translation Cl
 - 📝 Detailed logging with color highlighting
 - ⚡ Optimized for CI/CD usage
 - 🔄 Step-based processing (Upload → Process → Monitor → Download)
+- 🎯 Isolated action support (upload, status, download)
 - 📊 Compact progress monitoring with status indicators
 - 🗂️ YAML configuration file support
 - 📋 Additional translation files support (mo, php, json, etc.)
@@ -79,6 +80,7 @@ chmod +x ptc-cli.sh
 - `--monitor-max-attempts COUNT` - Maximum monitoring attempts (default: 100)
 
 **Control Options:**
+- `--action ACTION` - Perform isolated action: upload, status, download
 - `-v, --verbose` - Verbose output
 - `-n, --dry-run` - Show what would be done without executing
 - `-h, --help` - Show help
@@ -137,6 +139,11 @@ files:
 
 # Override specific settings
 ./ptc-cli.sh -c config.yml --api-token=different-token --file-tag-name=feature-branch
+
+# Isolated actions
+./ptc-cli.sh -c config.yml --action upload                   # Only upload files
+./ptc-cli.sh -c config.yml --action status --verbose         # Check translation status
+./ptc-cli.sh -c config.yml --action download                 # Download completed translations
 ```
 
 **With params:**
@@ -155,16 +162,50 @@ files:
 
 # WordPress WPSite example
 ./ptc-cli.sh -s en -p 'languages/wpsite.pot' -t main --api-token=your-token
+
+# Isolated actions with patterns
+./ptc-cli.sh -s en -p 'sample-{{lang}}.json' --action upload --api-token=your-token
+./ptc-cli.sh -s en -p 'sample-{{lang}}.json' --action status --verbose --api-token=your-token
+./ptc-cli.sh -s en -p 'sample-{{lang}}.json' --action download --api-token=your-token
 ```
 
 ## Processing Workflow
 
+The script supports two modes of operation:
+
+### Full Workflow (Default)
 The script follows a step-based approach:
 
 1. **📤 Upload Step**: All files are uploaded to the PTC API
-2. **⚙️ Processing Step**: Translation processing is triggered for all files
+2. **⚙️ Processing Step**: Translation processing is triggered for all files  
 3. **👀 Monitoring Step**: Translation status is monitored with compact progress display
 4. **📥 Download Step**: Completed translations are downloaded and unpacked
+
+### Isolated Actions
+For more granular control, you can perform specific steps in isolation:
+
+#### `--action upload`
+Only uploads files to PTC without starting translation processing.
+```bash
+./ptc-cli.sh -c config.yml --action upload
+```
+
+#### `--action status`
+Checks the translation status of files without downloading.
+```bash
+./ptc-cli.sh -c config.yml --action status --verbose
+```
+
+#### `--action download`
+Downloads completed translations without checking or uploading.
+```bash
+./ptc-cli.sh -c config.yml --action download
+```
+
+**Use Cases for Isolated Actions:**
+- **CI/CD pipelines**: Upload files in one job, check status and download in another
+- **Manual workflows**: Upload files, review translations externally, then download
+- **Debugging**: Check specific status or retry downloads without re-uploading
 
 ### Progress Indicators
 

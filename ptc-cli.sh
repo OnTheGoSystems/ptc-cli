@@ -30,6 +30,7 @@ PTC_VERBOSE=false
 PTC_DRY_RUN=false
 PTC_MONITOR_INTERVAL=5   # seconds between status checks
 PTC_MONITOR_MAX_ATTEMPTS=100  # maximum number of status checks
+PTC_ACTION=""            # specific action to perform: upload, status, download
 
 
 
@@ -66,6 +67,7 @@ show_help() {
 USAGE:
     $SCRIPT_NAME [OPTIONS] --source-locale LOCALE --patterns PATTERN1,PATTERN2,...
     $SCRIPT_NAME [OPTIONS] --config-file CONFIG.yml
+    $SCRIPT_NAME [OPTIONS] --action ACTION_NAME
 
 OPTIONS:
     -s, --source-locale LOCALE     Source language (e.g.: en, de, fr)
@@ -77,6 +79,7 @@ OPTIONS:
     --api-token TOKEN              PTC API authentication token
     --monitor-interval SECONDS     Seconds between status checks (default: 5)
     --monitor-max-attempts COUNT   Maximum status check attempts (default: 100)
+    --action ACTION                Perform isolated action: upload, status, download
     -v, --verbose                  Verbose output
     -n, --dry-run                  Show what would be done without executing
     -h, --help                     Show this help
@@ -119,6 +122,11 @@ USAGE EXAMPLES:
     # Using configuration file:
     $SCRIPT_NAME -c config.yml
     $SCRIPT_NAME --config-file config/translation-config.yml --verbose
+    
+    # Using isolated actions:
+    $SCRIPT_NAME -c config.yml --action upload                   # Only upload files
+    $SCRIPT_NAME -c config.yml --action status --verbose         # Check translation status
+    $SCRIPT_NAME -c config.yml --action download                 # Download completed translations
 "
 }
 
@@ -180,6 +188,19 @@ validate_args() {
         if ! parse_config_file "$PTC_CONFIG_FILE"; then
             return 1
         fi
+    fi
+
+    # Validate action if specified
+    if [[ -n "$PTC_ACTION" ]]; then
+        case "$PTC_ACTION" in
+            upload|status|download)
+                log_debug "Valid action specified: $PTC_ACTION"
+                ;;
+            *)
+                log_error "Invalid action: $PTC_ACTION. Valid actions are: upload, status, download"
+                return 1
+                ;;
+        esac
     fi
 
     if [[ -z "$PTC_SOURCE_LOCALE" ]]; then
@@ -495,8 +516,27 @@ process_files() {
         
         log_info "Total specified ${#found_files[@]} file(s)"
         
-        # Step-based processing workflow with config file support
-        process_files_in_steps_with_config "${found_files[@]}"
+        # Check if specific action is requested
+        if [[ -n "$PTC_ACTION" ]]; then
+            case "$PTC_ACTION" in
+                upload)
+                    perform_upload_action_with_config "${found_files[@]}"
+                    ;;
+                status)
+                    perform_status_action "${found_files[@]}"
+                    ;;
+                download)
+                    perform_download_action "${found_files[@]}"
+                    ;;
+                *)
+                    log_error "Invalid action: $PTC_ACTION"
+                    return 1
+                    ;;
+            esac
+        else
+            # Step-based processing workflow with config file support
+            process_files_in_steps_with_config "${found_files[@]}"
+        fi
     else
         # Patterns mode: discover files automatically 
         log_info "Starting file search for source locale: $PTC_SOURCE_LOCALE"
@@ -540,8 +580,239 @@ process_files() {
         
         log_info "Total found ${#found_files[@]} file(s)"
         
-        # Step-based processing workflow
-        process_files_in_steps "${found_files[@]}"
+        # Check if specific action is requested
+        if [[ -n "$PTC_ACTION" ]]; then
+            case "$PTC_ACTION" in
+                upload)
+                    perform_upload_action "${found_files[@]}"
+                    ;;
+                status)
+                    perform_status_action "${found_files[@]}"
+                    ;;
+                download)
+                    perform_download_action "${found_files[@]}"
+                    ;;
+                *)
+                    log_error "Invalid action: $PTC_ACTION"
+                    return 1
+                    ;;
+            esac
+        else
+            # Step-based processing workflow
+            process_files_in_steps "${found_files[@]}"
+        fi
+    fi
+}
+
+# Function to perform only upload action
+perform_upload_action() {
+    local files=("$@")
+    local base_dir=$(get_base_directory)
+    local uploaded_files=()
+    
+    log_info "=== UPLOAD ACTION: Uploading all files ==="
+    for file in "${files[@]}"; do
+        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        
+        if [[ "$PTC_DRY_RUN" == "true" ]]; then
+            log_info "[DRY RUN] Would upload file: $relative_file_path"
+            uploaded_files+=("$file")
+        else
+            log_info "Uploading file: $relative_file_path"
+            
+            # Prepare API call parameters
+            local filename=$(basename "$relative_file_path")
+            local dirname=$(dirname "$relative_file_path")
+            local lang_placeholder="{{lang}}"
+            local output_filename="${filename//$PTC_SOURCE_LOCALE/$lang_placeholder}"
+            
+            local output_file_path
+            if [[ "$dirname" == "." ]]; then
+                output_file_path="$output_filename"
+            else
+                output_file_path="$dirname/$output_filename"
+            fi
+            
+            # Extract additional_translation_files if using config file
+            local additional_files_json=""
+            if [[ -n "$PTC_CONFIG_FILE" ]]; then
+                additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$relative_file_path")
+            fi
+            
+            if make_ptc_api_call "$file" "$relative_file_path" "$output_file_path" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
+                uploaded_files+=("$file")
+                log_success "Upload completed: $relative_file_path"
+            else
+                log_error "Upload failed: $relative_file_path"
+            fi
+        fi
+    done
+    
+    if [[ ${#uploaded_files[@]} -eq 0 ]]; then
+        log_error "No files were uploaded successfully"
+        return 1
+    fi
+    
+    log_success "Successfully uploaded ${#uploaded_files[@]} file(s)"
+    return 0
+}
+
+# Function to perform only upload action with config file support
+perform_upload_action_with_config() {
+    local files=("$@")
+    local base_dir=$(get_base_directory)
+    local uploaded_files=()
+    
+    log_info "=== UPLOAD ACTION: Uploading all files ==="
+    for file in "${files[@]}"; do
+        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        
+        if [[ "$PTC_DRY_RUN" == "true" ]]; then
+            log_info "[DRY RUN] Would upload file: $relative_file_path"
+            uploaded_files+=("$file")
+        else
+            log_info "Uploading file: $relative_file_path"
+            
+            # Get output pattern from config for this file
+            local output_pattern
+            output_pattern=$(grep -A999 '^files:' "$PTC_CONFIG_FILE" | grep -A1 "^ *- file: *$relative_file_path" | grep '^ *output:' | sed 's/^ *output: *//' | head -1)
+            
+            if [[ -z "$output_pattern" ]]; then
+                # Fallback: generate output pattern automatically
+                local filename=$(basename "$relative_file_path")
+                local dirname=$(dirname "$relative_file_path")
+                local lang_placeholder="{{lang}}"
+                local output_filename="${filename//$PTC_SOURCE_LOCALE/$lang_placeholder}"
+                
+                if [[ "$dirname" == "." ]]; then
+                    output_pattern="$output_filename"
+                else
+                    output_pattern="$dirname/$output_filename"
+                fi
+                log_debug "Using generated output pattern: $output_pattern"
+            else
+                log_debug "Using config output pattern: $output_pattern"
+            fi
+            
+            # Extract additional_translation_files for this file
+            local additional_files_json=""
+            additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$relative_file_path")
+            
+            if make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
+                uploaded_files+=("$file")
+                log_success "Upload completed: $relative_file_path"
+            else
+                log_error "Upload failed: $relative_file_path"
+            fi
+        fi
+    done
+    
+    if [[ ${#uploaded_files[@]} -eq 0 ]]; then
+        log_error "No files were uploaded successfully"
+        return 1
+    fi
+    
+    log_success "Successfully uploaded ${#uploaded_files[@]} file(s)"
+    return 0
+}
+
+# Function to perform only status check action
+perform_status_action() {
+    local files=("$@")
+    local base_dir=$(get_base_directory)
+    local checked_files=()
+    
+    log_info "=== STATUS ACTION: Checking translation status for all files ==="
+    for file in "${files[@]}"; do
+        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        
+        if [[ "$PTC_DRY_RUN" == "true" ]]; then
+            log_info "[DRY RUN] Would check status for file: $relative_file_path"
+            checked_files+=("$file")
+        else
+            log_info "Checking status for file: $relative_file_path"
+            
+            if check_translation_status "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
+                log_success "Status check completed: $relative_file_path (Ready for download)"
+                checked_files+=("$file")
+            else
+                local status_result=$?
+                if [[ $status_result -eq 1 ]]; then
+                    log_warning "Status check failed or no translations found: $relative_file_path"
+                elif [[ $status_result -eq 2 ]]; then
+                    log_info "Translation still in progress: $relative_file_path"
+                fi
+                checked_files+=("$file")
+            fi
+        fi
+    done
+    
+    log_info "Status check completed for ${#checked_files[@]} file(s)"
+    return 0
+}
+
+# Function to perform only download action
+perform_download_action() {
+    local files=("$@")
+    local base_dir=$(get_base_directory)
+    local downloaded_files=()
+    local failed_files=()
+    
+    log_info "=== DOWNLOAD ACTION: Downloading completed translations for all files ==="
+    for file in "${files[@]}"; do
+        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        
+        if [[ "$PTC_DRY_RUN" == "true" ]]; then
+            log_info "[DRY RUN] Would download translations for file: $relative_file_path"
+            downloaded_files+=("$file")
+        else
+            log_info "Downloading translations for file: $relative_file_path"
+            
+            # First check if translations are ready
+            if check_translation_status "$relative_file_path" "$PTC_FILE_TAG_NAME" >/dev/null 2>&1; then
+                # Translations are ready, download them
+                if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir"; then
+                    downloaded_files+=("$file")
+                    log_success "Download completed: $relative_file_path"
+                else
+                    failed_files+=("$file")
+                    log_error "Download failed: $relative_file_path"
+                fi
+            else
+                local status_result=$?
+                if [[ $status_result -eq 1 ]]; then
+                    log_warning "No translations found or error occurred: $relative_file_path"
+                    failed_files+=("$file")
+                elif [[ $status_result -eq 2 ]]; then
+                    log_warning "Translations not ready yet: $relative_file_path"
+                    failed_files+=("$file")
+                fi
+            fi
+        fi
+    done
+    
+    log_info "=== DOWNLOAD RESULTS ==="
+    if [[ ${#downloaded_files[@]} -gt 0 ]]; then
+        log_success "Successfully downloaded ${#downloaded_files[@]} file(s)"
+        for file in "${downloaded_files[@]}"; do
+            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            log_success "  ✓ $relative_file_path"
+        done
+    fi
+    
+    if [[ ${#failed_files[@]} -gt 0 ]]; then
+        log_warning "Failed to download ${#failed_files[@]} file(s)"
+        for file in "${failed_files[@]}"; do
+            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            log_warning "  ✗ $relative_file_path"
+        done
+    fi
+    
+    # Return success if at least one file was downloaded successfully
+    if [[ ${#downloaded_files[@]} -gt 0 ]]; then
+        return 0
+    else
+        return 1
     fi
 }
 
@@ -1974,6 +2245,14 @@ main() {
                 ;;
             --monitor-max-attempts=*)
                 PTC_MONITOR_MAX_ATTEMPTS="${1#*=}"
+                shift
+                ;;
+            --action)
+                PTC_ACTION="$2"
+                shift 2
+                ;;
+            --action=*)
+                PTC_ACTION="${1#*=}"
                 shift
                 ;;
             -v|--verbose)
