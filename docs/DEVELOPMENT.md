@@ -11,7 +11,8 @@ ptc-cli-bash/
 │       ├── react-app.config     # For React applications
 │       └── java-app.config      # For Java applications
 ├── tests/                        # Testing
-│   ├── test-runner.sh           # Main test runner
+│   ├── test-runner.sh           # Main test runner (CLI invocation tests)
+│   ├── test-status-handling.sh  # Status parsing, polling and preflight
 │   └── fixtures/                # Test data (created automatically)
 └── docs/                         # Documentation
     └── DEVELOPMENT.md           # This guide
@@ -47,6 +48,7 @@ cd ptc-cli-bash
 # Set execution permissions
 chmod +x ptc-cli.sh
 chmod +x tests/test-runner.sh
+chmod +x tests/test-status-handling.sh
 ```
 
 ### Running Tests
@@ -54,10 +56,17 @@ chmod +x tests/test-runner.sh
 ```bash
 # Run all tests
 ./tests/test-runner.sh
+./tests/test-status-handling.sh
 
 # Test specific functionality
 ./ptc-cli.sh -s en -p '{lang}-copy.json' --dry-run --verbose
 ```
+
+`test-status-handling.sh` sources `ptc-cli.sh` and stubs `curl`, so it covers
+status parsing, polling and preflight without network access. It asserts on the
+number of requests made, not just the return code: the failure mode it guards
+against is a terminal state that keeps polling to the attempt limit, which looks
+like a timeout rather than an error.
 
 ### Debugging
 

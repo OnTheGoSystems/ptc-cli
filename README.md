@@ -10,7 +10,8 @@ Bash script for processing translation files through PTC (Private Translation Cl
 - 🛡️ Strict error handling for CI environments
 - 📝 Detailed logging with color highlighting
 - ⚡ Optimized for CI/CD usage
-- 🔄 Step-based processing (Upload → Process → Monitor → Download)
+- ✅ Preflight check: validates the token and reports balance before uploading
+- 🔄 Step-based processing (Preflight → Upload → Process → Monitor → Download)
 - 🎯 Isolated action support (upload, status, download)
 - 📊 Compact progress monitoring with status indicators
 - 🗂️ YAML configuration file support
@@ -85,6 +86,22 @@ chmod +x ptc-cli.sh
 - `-n, --dry-run` - Show what would be done without executing
 - `-h, --help` - Show help
 - `--version` - Show version
+
+### Preflight
+
+Every run (except `--dry-run`) starts with a preflight check that validates the
+API token and reports the account state in one line:
+
+```
+[SUCCESS] Preflight OK: source=en, plan=trial, balance=4200 trial words
+```
+
+It stops the run immediately, before any upload, only when PTC has definitively
+said the run cannot work: the token is missing, the token is rejected, or the
+subscription is inactive. Anything else — an unreachable API, a source locale
+that disagrees with the PTC project, a zero word balance — produces a warning
+and the run continues, so a brief API hiccup cannot fail a build that would
+otherwise have succeeded.
 
 ## Configuration File Format
 
