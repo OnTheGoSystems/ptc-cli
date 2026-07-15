@@ -57,6 +57,143 @@ log_debug() {
     fi
 }
 
+# JSON field readers. The API returns compact JSON today, but these tolerate
+# pretty-printed output and arbitrary whitespace around the separator so a
+# serializer or proxy change cannot silently break status parsing.
+# A missing key, or an explicit null, yields an empty string.
+json_string_field() {
+    local json="$1"
+    local key="$2"
+    local match
+    # ([^"\]|\\.)* keeps backslash-escaped quotes inside the value instead of
+    # ending the match at the first one.
+    match=$(printf '%s' "$json" | tr '\n' ' ' \
+        | grep -Eo "\"${key}\"[[:space:]]*:[[:space:]]*(\"([^\"\\\\]|\\\\.)*\"|null)" \
+        | head -n 1) || true
+    if [[ -z "$match" ]]; then
+        return 0
+    fi
+
+    local value
+    value=$(printf '%s' "$match" | sed -E "s/^\"${key}\"[[:space:]]*:[[:space:]]*//")
+
+    # Test for JSON null BEFORE unquoting, so that the *string* "null" - which
+    # the codebase treats as a real status - does not collapse to empty.
+    if [[ "$value" == "null" ]]; then
+        return 0
+    fi
+
+    printf '%s' "$value" | sed -E 's/^"(.*)"$/\1/'
+}
+
+json_number_field() {
+    local json="$1"
+    local key="$2"
+    local match
+    match=$(printf '%s' "$json" | tr '\n' ' ' \
+        | grep -Eo "\"${key}\"[[:space:]]*:[[:space:]]*-?[0-9]+(\.[0-9]+)?" \
+        | head -n 1) || true
+    if [[ -n "$match" ]]; then
+        printf '%s' "$match" | sed -E "s/^\"${key}\"[[:space:]]*:[[:space:]]*//"
+    fi
+}
+
+json_bool_field() {
+    local json="$1"
+    local key="$2"
+    local match
+    match=$(printf '%s' "$json" | tr '\n' ' ' \
+        | grep -Eo "\"${key}\"[[:space:]]*:[[:space:]]*(true|false)" \
+        | head -n 1) || true
+    if [[ -n "$match" ]]; then
+        printf '%s' "$match" | sed -E "s/^\"${key}\"[[:space:]]*:[[:space:]]*//"
+    fi
+}
+
+# Returns a nested object as raw JSON, so a caller can read a field from it
+# without colliding with a same-named key elsewhere in the document
+# (for example "iso", which appears in both source_language and languages[]).
+# Tolerates one level of nesting inside the object; a regex cannot balance
+# braces to arbitrary depth, so callers must treat "" as "could not read it"
+# rather than as "the key was absent".
+json_object_field() {
+    local json="$1"
+    local key="$2"
+    local match
+    match=$(printf '%s' "$json" | tr '\n' ' ' \
+        | grep -Eo "\"${key}\"[[:space:]]*:[[:space:]]*\{[^{}]*(\{[^{}]*\}[^{}]*)*\}" \
+        | head -n 1) || true
+    if [[ -n "$match" ]]; then
+        printf '%s' "$match" | sed -E "s/^\"${key}\"[[:space:]]*:[[:space:]]*//"
+    fi
+}
+
+# Reads a response header by name, case-insensitively. Takes the last match so
+# that a redirect's earlier header block cannot win.
+http_header_value() {
+    local header_file="$1"
+    local name="$2"
+    local match
+    match=$(grep -i "^${name}:" "$header_file" 2>/dev/null | tail -n 1) || true
+    if [[ -n "$match" ]]; then
+        printf '%s' "$match" | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r'
+    fi
+}
+
+# Statuses that will never turn into "completed", however long we poll.
+# Polling one of these to the attempt limit is what made failures look like
+# ~8-minute timeouts. These are the two terminal entries of the server's
+# STATUS_PRIORITY list (TranslationMemory::STATUS_PRIORITY =
+# failed, out_of_credit, queued, in_progress, completed), and both are reachable
+# on /api/v1 - "failed" wins first, since the server reports worst-status-wins.
+is_terminal_failure_status() {
+    case "$1" in
+        failed|out_of_credit)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Decides what a monitoring loop should do with one file's status, and explains
+# itself on the way out. Both step-based loops share this so a new status only
+# has to be classified once - the two loops previously carried byte-identical
+# copies of this logic, which is how the terminal case reached one caller and
+# not the other.
+# Returns: 0 = ready to download, 1 = give up on this file, 2 = keep polling.
+classify_monitored_status() {
+    local status="$1"
+    local relative_file_path="$2"
+
+    if [[ "$status" == "completed" ]]; then
+        return 0
+    fi
+
+    if is_terminal_failure_status "$status"; then
+        log_error "Translation failed for $relative_file_path (status: $status)"
+        return 1
+    fi
+
+    case "$status" in
+        error|not_found)
+            # Could be transient - the status endpoint 404s briefly after
+            # processing starts - so keep polling, but say so rather than
+            # looking indistinguishable from healthy progress.
+            log_warning "Status unavailable for $relative_file_path ($status); will retry"
+            ;;
+        draft)
+            # SourceFile#status reports "draft" when no original file is
+            # attached, so nothing will ever translate. Left pollable in case
+            # the attachment is still landing, but it must not pass for progress.
+            log_warning "No uploaded file behind $relative_file_path (status: draft); will retry"
+            ;;
+    esac
+
+    return 2
+}
+
 # Help function
 show_help() {
     local current_branch
@@ -741,6 +878,8 @@ perform_status_action() {
                     log_warning "Status check failed or no translations found: $relative_file_path"
                 elif [[ $status_result -eq 2 ]]; then
                     log_info "Translation still in progress: $relative_file_path"
+                elif [[ $status_result -eq 3 ]]; then
+                    log_error "Translation failed and will not complete: $relative_file_path"
                 fi
                 checked_files+=("$file")
             fi
@@ -785,6 +924,14 @@ perform_download_action() {
                     failed_files+=("$file")
                 elif [[ $status_result -eq 2 ]]; then
                     log_warning "Translations not ready yet: $relative_file_path"
+                    failed_files+=("$file")
+                elif [[ $status_result -eq 3 ]]; then
+                    log_error "Translation failed and will not complete: $relative_file_path"
+                    failed_files+=("$file")
+                else
+                    # Never silently drop a file: an unexpected code must still
+                    # land in a result list, or the run reports success for it.
+                    log_error "Unexpected status code $status_result for: $relative_file_path"
                     failed_files+=("$file")
                 fi
             fi
@@ -953,6 +1100,12 @@ process_files_in_steps() {
                 # Error occurred
                 failed_files+=("$file")
                 set_file_status "$file" "failed"
+            elif [[ $status_result -eq 3 ]]; then
+                # Terminal failure - stop polling this file, it cannot recover
+                local terminal_status=$(echo "$status_output" | cut -d'|' -f1)
+                log_error "Translation failed for $relative_file_path (status: $terminal_status)"
+                failed_files+=("$file")
+                set_file_status "$file" "$terminal_status"
             elif [[ $status_result -eq 2 ]]; then
                 # Still in progress - extract actual status
                 local actual_status=$(echo "$status_output" | cut -d'|' -f1)
@@ -1162,19 +1315,26 @@ process_files_in_steps_with_config() {
             local status=$(echo "$status_output" | cut -d'|' -f1)
             set_file_status "$relative_file_path" "$status"
             
-            if [[ "$status" == "completed" ]]; then
-                completed_files+=("$file")
-                # Download translations
-                if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir"; then
-                    log_debug "Downloaded translations for: $relative_file_path"
-                else
-                    log_warning "Failed to download translations for: $relative_file_path"
-                fi
-            elif [[ "$status" == "failed" ]]; then
-                failed_files+=("$file")
-            else
-                still_monitoring+=("$file")
-            fi
+            local file_action=0
+            classify_monitored_status "$status" "$relative_file_path" || file_action=$?
+
+            case $file_action in
+                0)
+                    completed_files+=("$file")
+                    # Download translations
+                    if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir"; then
+                        log_debug "Downloaded translations for: $relative_file_path"
+                    else
+                        log_warning "Failed to download translations for: $relative_file_path"
+                    fi
+                    ;;
+                1)
+                    failed_files+=("$file")
+                    ;;
+                *)
+                    still_monitoring+=("$file")
+                    ;;
+            esac
         done
         
         # Build status string
@@ -1356,19 +1516,26 @@ process_files_in_steps_with_outputs() {
             local status=$(echo "$status_output" | cut -d'|' -f1)
             set_file_status "$relative_file_path" "$status"
             
-            if [[ "$status" == "completed" ]]; then
-                completed_files+=("$file")
-                # Download translations
-                if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir"; then
-                    log_debug "Downloaded translations for: $relative_file_path"
-                else
-                    log_warning "Failed to download translations for: $relative_file_path"
-                fi
-            elif [[ "$status" == "failed" ]]; then
-                failed_files+=("$file")
-            else
-                still_monitoring+=("$file")
-            fi
+            local file_action=0
+            classify_monitored_status "$status" "$relative_file_path" || file_action=$?
+
+            case $file_action in
+                0)
+                    completed_files+=("$file")
+                    # Download translations
+                    if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir"; then
+                        log_debug "Downloaded translations for: $relative_file_path"
+                    else
+                        log_warning "Failed to download translations for: $relative_file_path"
+                    fi
+                    ;;
+                1)
+                    failed_files+=("$file")
+                    ;;
+                *)
+                    still_monitoring+=("$file")
+                    ;;
+            esac
         done
         
         # Build status string
@@ -1522,6 +1689,9 @@ process_single_file() {
                             log_info "You can check status manually with:"
                             log_info "  curl -H \"Authorization: Bearer \$TOKEN\" \"${PTC_API_URL}source_files/translation_status?file_path=$relative_file_path&file_tag_name=$PTC_FILE_TAG_NAME\""
                             ;;
+                        3)
+                            log_warning "Translation reached a terminal failure state and will not complete."
+                            ;;
                     esac
                 fi
             else
@@ -1529,6 +1699,143 @@ process_single_file() {
             fi
         fi
     fi
+}
+
+# Validates the token and reports account state before any work starts, so the
+# run fails in seconds with a specific reason instead of surfacing as a late,
+# generic upload error. Both endpoints used here sit outside the rate limiter
+# and the subscription gate, so they still answer when the account is in a bad
+# state - which is exactly when this needs to work.
+#
+# Aborts ONLY where the server has definitively said the run cannot work: no
+# token, a rejected token, or an inactive subscription. Everything else - an
+# unreachable API, a 5xx, a zero balance, a locale mismatch - warns and lets the
+# run proceed. Preflight adds a network call to a path that previously had none,
+# so a false abort here would break CI runs that used to succeed; the upload and
+# status calls still report their own failures.
+preflight_check() {
+    if [[ -z "$PTC_API_TOKEN" ]]; then
+        log_error "Preflight failed: no API token provided."
+        log_info "Set the PTC_API_TOKEN environment variable."
+        return 1
+    fi
+
+    local header_file
+    header_file=$(mktemp)
+
+    local response http_code body
+    response=$(curl -s -D "$header_file" -w "%{http_code}" \
+        -X GET \
+        -H "Authorization: Bearer $PTC_API_TOKEN" \
+        "${PTC_API_URL}languages" 2>/dev/null) || true
+    http_code="${response: -3}"
+    body="${response%???}"
+
+    log_debug "Preflight: GET ${PTC_API_URL}languages -> HTTP $http_code"
+    log_debug "Preflight languages body: $body"
+
+    case "$http_code" in
+        200)
+            ;;
+        401)
+            rm -f "$header_file"
+            log_error "Preflight failed: PTC rejected the API token (HTTP 401)."
+            log_info "The token is unknown or past its expiration date. Generate a new one in PTC."
+            return 1
+            ;;
+        *)
+            # Anything else - 5xx, a proxy hiccup, 429, or curl failing outright
+            # - is not proof that the run cannot work. Preflight is a new call on
+            # a path that used to have none, so it must not become a fresh single
+            # point of failure: warn and let the real work report its own errors.
+            rm -f "$header_file"
+            log_warning "Preflight: could not reach the PTC API (HTTP ${http_code:-none}); continuing."
+            log_info "Endpoint: ${PTC_API_URL}languages"
+            if [[ -n "$body" ]]; then
+                log_info "Server said: $body"
+            fi
+            return 0
+            ;;
+    esac
+
+    # The balance headers ride on every api/v1 response, so the languages call
+    # above already carries them - no separate request needed for the numbers.
+    local trial_balance prepaid_balance
+    trial_balance=$(http_header_value "$header_file" "X-PTC-TRIAL-BALANCE")
+    prepaid_balance=$(http_header_value "$header_file" "X-PTC-PREPAID-BALANCE")
+    rm -f "$header_file"
+
+    # Source locale check. The server translates from the project's configured
+    # source language regardless of what this run claims, so a mismatch means
+    # the wrong files are about to be uploaded.
+    local project_source
+    project_source=$(json_string_field "$(json_object_field "$body" "source_language")" "iso")
+
+    if [[ -n "$PTC_SOURCE_LOCALE" && -n "$project_source" && "$PTC_SOURCE_LOCALE" != "$project_source" ]]; then
+        log_warning "Source locale mismatch: this run uses '$PTC_SOURCE_LOCALE', but the PTC project's source language is '$project_source'."
+        log_warning "PTC will treat uploaded files as '$project_source'."
+    fi
+
+    # Plan and active state come from /balance.
+    # plan/active must be initialised: on bash 4.4+ a bare `local x` leaves the
+    # variable unset, and reading it under `set -u` is fatal - not catchable by
+    # the `if ! preflight_check` at the call site. (bash 3.2 yields "" instead,
+    # so this cannot be reproduced on macOS.)
+    local plan_response plan_code plan_body
+    local plan=""
+    local active=""
+    local sub_status=""
+    plan_response=$(curl -s -w "%{http_code}" \
+        -X GET \
+        -H "Authorization: Bearer $PTC_API_TOKEN" \
+        "${PTC_API_URL}balance" 2>/dev/null) || true
+    plan_code="${plan_response: -3}"
+    plan_body="${plan_response%???}"
+
+    log_debug "Preflight: GET ${PTC_API_URL}balance -> HTTP $plan_code"
+    log_debug "Preflight balance body: $plan_body"
+
+    if [[ "$plan_code" == "200" ]]; then
+        plan=$(json_string_field "$plan_body" "plan")
+        active=$(json_bool_field "$plan_body" "active")
+        sub_status=$(json_string_field "$plan_body" "status")
+
+        if [[ "$active" == "false" ]]; then
+            log_error "Preflight failed: the PTC subscription is not active (plan: ${plan:-unknown})."
+            log_info "Uploads will be rejected until the subscription is renewed."
+            return 1
+        fi
+    else
+        # Not fatal: the plan lookup is a nicety, the token is already proven.
+        log_warning "Preflight: could not read the subscription plan (HTTP $plan_code); continuing."
+    fi
+
+    # Which wallet pays depends on the plan, so report the relevant one.
+    local balance_note
+    if [[ "$sub_status" == "unlimited" ]]; then
+        # An unlimited subscription reports 0 in both wallets because it does
+        # not draw on them at all. Warning about a zero here would cry wolf on
+        # every run of a perfectly healthy account. (Confirmed against
+        # production: plan=pro, status=unlimited, active=true, both wallets 0.)
+        balance_note="unlimited"
+    elif [[ "$plan" == "trial" ]]; then
+        balance_note="${trial_balance:-unknown} trial words"
+        if [[ "$trial_balance" == "0" ]]; then
+            log_warning "Trial word balance is 0 - translations will not be produced until it is topped up."
+        fi
+    elif [[ -n "$plan" ]]; then
+        balance_note="${prepaid_balance:-unknown} prepaid words"
+        if [[ "$prepaid_balance" == "0" ]]; then
+            log_warning "Prepaid word balance is 0 - translations will not be produced until it is topped up."
+        fi
+    else
+        # Plan unknown, so report both wallets rather than guessing which one
+        # pays - and stay quiet about a zero in a wallet that may be unused.
+        balance_note="${trial_balance:-unknown} trial / ${prepaid_balance:-unknown} prepaid words"
+    fi
+
+    log_success "Preflight OK: source=${project_source:-unknown}, plan=${plan:-unknown}, balance=${balance_note}"
+    return 0
 }
 
 # Function to make API call to PTC
@@ -1784,17 +2091,27 @@ get_translation_status_quiet() {
     log_debug "Response Body: $response_body"
     
     if [[ "$http_code" == "200" ]]; then
-        # Parse status from response
-        local status=$(echo "$response_body" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "unknown")
-        
+        # Fields live under a "translation_status" wrapper; see the note in
+        # check_translation_status.
+        local status_scope
+        status_scope=$(json_object_field "$response_body" "translation_status")
+        status_scope="${status_scope:-$response_body}"
+
+        local status
+        status=$(json_string_field "$status_scope" "status")
+        # Null/absent status: no translation memory for the file yet.
+        status="${status:-pending}"
+
         log_debug "Parsed Status: $status"
-        
+
         # Output the status and response body for caller
         echo "$status|$response_body"
-        
+
         # Return status code based on completion
         if [[ "$status" == "completed" ]]; then
             return 0  # Ready for download
+        elif is_terminal_failure_status "$status"; then
+            return 3  # Terminal failure - further polling cannot help
         else
             return 2  # Still in progress
         fi
@@ -1847,16 +2164,36 @@ check_translation_status() {
     if [[ "$http_code" == "200" ]]; then
         log_success "Translation status retrieved successfully: $relative_file_path"
         log_debug "Status API response: $response_body"
-        
-        # Parse status from response
-        local status=$(echo "$response_body" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "unknown")
-        local completeness=$(echo "$response_body" | grep -o '"completeness":[0-9.]*' | cut -d':' -f2 2>/dev/null || echo "0")
-        
+
+        # The API nests the fields under a "translation_status" object
+        # (source_files/translation_status.json.jbuilder). Read that scope
+        # rather than the whole document, so a "status" added elsewhere in the
+        # response later cannot shadow this one. Fall back to a flat read.
+        local status_scope
+        status_scope=$(json_object_field "$response_body" "translation_status")
+        status_scope="${status_scope:-$response_body}"
+
+        local status
+        status=$(json_string_field "$status_scope" "status")
+        local completeness
+        completeness=$(json_number_field "$status_scope" "completeness")
+        completeness="${completeness:-0}"
+
+        # A null/absent status means no translation memory exists for the file
+        # yet. That is still pending, but say so rather than reporting it as an
+        # unnamed in-progress state.
+        if [[ -z "$status" ]]; then
+            log_info "Translation Status: pending (no translation memory yet)"
+            return 2
+        fi
+
         log_info "Translation Status: $status (${completeness}% complete)"
-        
+
         # Return status code based on completion
         if [[ "$status" == "completed" ]]; then
             return 0  # Ready for download
+        elif is_terminal_failure_status "$status"; then
+            return 3  # Terminal failure - further polling cannot help
         else
             return 2  # Still in progress
         fi
@@ -1934,6 +2271,15 @@ get_status_char() {
         "failed"|"error")
             echo -e "${RED}F${NC}"
             ;;
+        "out_of_credit")
+            echo -e "${RED}\$${NC}"
+            ;;
+        "pending")
+            echo -e "${YELLOW}.${NC}"
+            ;;
+        "draft")
+            echo -e "${YELLOW}D${NC}"
+            ;;
         "null"|"status_unknown"|"unknown"|*)
             echo -e "${YELLOW}U${NC}"
             ;;
@@ -1951,6 +2297,13 @@ monitor_translation_status() {
     log_info "Will check every ${wait_interval}s for up to ${max_attempts} attempts..."
     
     local attempt=1
+    local consecutive_errors=0
+    # The status endpoint can 404 briefly right after processing starts, before
+    # the translation record is visible. Tolerate a few of those in a row, but
+    # do not poll a persistently broken endpoint to the attempt limit - that is
+    # what made a hard error look like a timeout.
+    local max_consecutive_errors=3
+
     while [[ $attempt -le $max_attempts ]]; do
         # Add delay before each status check (except the first one)
         if [[ $attempt -gt 1 ]]; then
@@ -1958,32 +2311,58 @@ monitor_translation_status() {
             log_info "You can interrupt with Ctrl+C if needed"
             sleep "$wait_interval"
         fi
-        
+
         log_info "Status check attempt $attempt/$max_attempts..."
-        
-        # Check translation status
-        if check_translation_status "$relative_file_path" "$file_tag_name"; then
-            log_success "Translations are completed! Ready for download."
-            return 0
+
+        # Check translation status. The result must be captured from the call
+        # itself: an `if` whose condition is false and which has no `else`
+        # exits 0, so reading $? after the block always saw success and left
+        # every branch below unreachable.
+        local status_result=0
+        check_translation_status "$relative_file_path" "$file_tag_name" || status_result=$?
+
+        if [[ $status_result -ne 1 ]]; then
+            consecutive_errors=0
         fi
-        
-        local status_result=$?
-        if [[ $status_result -eq 1 ]]; then
-            # Error occurred
-            log_error "Failed to check translation status"
-            return 1
-        elif [[ $status_result -eq 2 ]]; then
-            # Still in progress
-            if [[ $attempt -eq $max_attempts ]]; then
-                log_warning "Reached maximum attempts ($max_attempts). Translations may still be in progress."
-                log_info "You can check status manually with:"
-                log_info "  curl -H \"Authorization: Bearer \$TOKEN\" \"${PTC_API_URL}source_files/translation_status?file_path=$relative_file_path&file_tag_name=$file_tag_name\""
-                return 2
-            fi
-            log_info "Translations still in progress."
+
+        case $status_result in
+            0)
+                log_success "Translations are completed! Ready for download."
+                return 0
+                ;;
+            1)
+                consecutive_errors=$((consecutive_errors + 1))
+                if [[ $consecutive_errors -ge $max_consecutive_errors ]]; then
+                    log_error "Failed to check translation status ($consecutive_errors consecutive errors)"
+                    return 1
+                fi
+                if [[ $attempt -eq $max_attempts ]]; then
+                    log_error "Failed to check translation status (attempt limit reached while erroring)"
+                    return 1
+                fi
+                log_warning "Status check failed (attempt $attempt); retrying"
+                attempt=$((attempt + 1))
+                continue
+                ;;
+            3)
+                # Terminal failure - polling cannot change the outcome
+                log_error "Translation failed for: $relative_file_path"
+                log_info "The translation reached a terminal state and will not complete."
+                log_info "Check the file in PTC, or re-upload it after resolving the cause."
+                return 3
+                ;;
+        esac
+
+        # Still in progress
+        if [[ $attempt -eq $max_attempts ]]; then
+            log_warning "Reached maximum attempts ($max_attempts). Translations may still be in progress."
+            log_info "You can check status manually with:"
+            log_info "  curl -H \"Authorization: Bearer \$TOKEN\" \"${PTC_API_URL}source_files/translation_status?file_path=$relative_file_path&file_tag_name=$file_tag_name\""
+            return 2
         fi
-        
-        ((attempt++))
+        log_info "Translations still in progress."
+
+        attempt=$((attempt + 1))
     done
     
     return 2  # Timeout
@@ -2287,11 +2666,14 @@ main() {
     
     # Main logic
     log_info "Starting $SCRIPT_NAME v$VERSION"
-    
+
     if [[ "$PTC_DRY_RUN" == "true" ]]; then
         log_info "Dry run mode enabled"
+        log_info "Skipping preflight (no API calls are made in dry run)"
+    elif ! preflight_check; then
+        exit 1
     fi
-    
+
     if ! process_files; then
         log_error "Error processing files"
         exit 1
