@@ -19,7 +19,33 @@ Bash script for processing translation files through PTC (Private Translation Cl
 
 ## Quick Start
 
-### Using Configuration File (Recommended)
+### Scaffold a config with `ptc init` (Recommended)
+
+Don't hand-write `.ptc-config.yml` — let the CLI detect it. `ptc init` scans your
+checkout (respecting `.gitignore` and an optional `.ptcignore`), sends the file
+**paths only** (never file contents) to the PTC `detect_config` endpoint, shows
+you what it found, and writes a ready-to-use config plus a CI snippet.
+
+```bash
+# Detect and scaffold (prompts before writing)
+./ptc-cli.sh init
+
+# Preview without touching disk
+./ptc-cli.sh init --dry-run --verbose
+
+# Non-interactive (CI), overwrite an existing config
+PTC_API_TOKEN=your-token ./ptc-cli.sh init --yes --force
+```
+
+The token is read from `PTC_API_TOKEN` (env-first) or `--api-token`. If the
+project layout isn't recognised, `init` writes a commented template you can fill
+in — it never hard-fails. Ignore extra paths by listing gitignore-style patterns
+in a `.ptcignore` file at the repo root.
+
+> **Note:** `detect_config` is currently on the QA environment. Until it reaches
+> production, point `--api-url` at the QA host.
+
+### Using a hand-written Configuration File
 
 ```bash
 # Create config file

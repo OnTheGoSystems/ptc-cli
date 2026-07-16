@@ -25,6 +25,11 @@ PTC_CONFIG_FILE=""
 PTC_PROJECT_DIR="$(pwd)"
 PTC_FILE_TAG_NAME=""
 PTC_API_URL="https://app.ptc.wpml.org/api/v1/"
+# Capture any inherited token BEFORE resetting, so `ptc init` can fall back to it
+# (env-first). The reset below is kept so the translate pipeline's precedence is
+# unchanged: there, a .ptc-config.yml api_token: still wins when no --api-token
+# is passed (parse_config_file only loads it while PTC_API_TOKEN is empty).
+PTC_ENV_API_TOKEN="${PTC_API_TOKEN:-}"
 PTC_API_TOKEN=""
 PTC_VERBOSE=false
 PTC_DRY_RUN=false
@@ -202,9 +207,15 @@ show_help() {
     echo -e "$SCRIPT_NAME v$VERSION - Private Translation Cloud CLI
 
 USAGE:
+    $SCRIPT_NAME init [OPTIONS]
     $SCRIPT_NAME [OPTIONS] --source-locale LOCALE --patterns PATTERN1,PATTERN2,...
     $SCRIPT_NAME [OPTIONS] --config-file CONFIG.yml
     $SCRIPT_NAME [OPTIONS] --action ACTION_NAME
+
+COMMANDS:
+    init                           Scaffold a .ptc-config.yml from your repository
+                                   (scans files, calls detect_config, writes config
+                                   + a CI snippet). See '$SCRIPT_NAME init --help'.
 
 OPTIONS:
     -s, --source-locale LOCALE     Source language (e.g.: en, de, fr)
@@ -250,6 +261,10 @@ CONFIG FILE FORMAT:
         output: admin/{{lang}}.json
 
 USAGE EXAMPLES:
+    # Scaffold a config for a new project:
+    $SCRIPT_NAME init
+    $SCRIPT_NAME init --dry-run --verbose
+
     # Using patterns (automatic file discovery):
     $SCRIPT_NAME -s en -p 'sample-{{lang}}.json'
     $SCRIPT_NAME -s en -p '{{lang}}/**/*.json,{{lang}}.properties' -d /path/to/project
@@ -2569,8 +2584,566 @@ cleanup() {
 # Signal handler
 trap cleanup EXIT INT TERM
 
+# ============================================================================
+# `ptc init` — scaffold .ptc-config.yml from POST /api/v1/detect_config
+# ============================================================================
+
+# Escapes a value so it can be embedded inside a JSON string literal. Only
+# backslash and double-quote need handling for file paths; control characters
+# do not occur in paths on any filesystem this runs on.
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+# Counts non-empty lines in a string (used for "N files" summaries). Avoids
+# `grep -c` so an empty string reports 0 rather than 1 for a trailing newline.
+_count_lines() {
+    local text="$1"
+    local count=0 line
+    [[ -z "$text" ]] && { printf '0'; return 0; }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] && count=$((count + 1))
+    done <<< "$text"
+    printf '%s' "$count"
+}
+
+# Emits each top-level element of the JSON array named KEY, one per line, with
+# interior newlines removed. Handles nested objects/arrays and quoted strings
+# (including backslash-escaped quotes). Empty output means the key is absent or
+# the array is empty. This is the one array-aware reader the status/config
+# parsers lack; detect_config's files[] with nested additional_translation_files
+# is deeper than anything json_object_field can reach, hence a real scanner.
+_json_array_elements() {
+    local json="$1"
+    local key="$2"
+    printf '%s' "$json" | awk -v key="$key" '
+    { s = s $0 }
+    END {
+        n = length(s)
+        pat = "\"" key "\""
+        ki = index(s, pat)
+        if (ki == 0) { exit }
+        i = ki + length(pat)
+        # Advance to the opening bracket; anything other than ":" or blanks
+        # between the key and "[" means this key is not an array.
+        while (i <= n && substr(s, i, 1) != "[") {
+            c = substr(s, i, 1)
+            if (c != ":" && c != " " && c != "\t") { exit }
+            i++
+        }
+        if (i > n) { exit }
+        i++                          # skip "["
+        depth = 0; instr = 0; esc = 0; buf = ""
+        while (i <= n) {
+            c = substr(s, i, 1)
+            if (instr) {
+                buf = buf c
+                if (esc) { esc = 0 }
+                else if (c == "\\") { esc = 1 }
+                else if (c == "\"") { instr = 0 }
+            } else if (c == "\"") {
+                instr = 1; buf = buf c
+            } else if (c == "{" || c == "[") {
+                depth++; buf = buf c
+            } else if (c == "}") {
+                depth--; buf = buf c
+            } else if (c == "]") {
+                if (depth == 0) {
+                    sub(/^[ \t]+/, "", buf); sub(/[ \t]+$/, "", buf)
+                    if (length(buf) > 0) { print buf }
+                    exit
+                }
+                depth--; buf = buf c
+            } else if (c == "," && depth == 0) {
+                sub(/^[ \t]+/, "", buf); sub(/[ \t]+$/, "", buf)
+                if (length(buf) > 0) { print buf }
+                buf = ""
+            } else {
+                buf = buf c
+            }
+            i++
+        }
+    }'
+}
+
+# Lists candidate paths for detection, relative to DIR. Prefers git so that
+# .gitignore is honoured for free (tracked + untracked-not-ignored); falls back
+# to a plain find when DIR is not a git work tree.
+collect_repo_files() {
+    local dir="$1"
+    # `|| true` keeps a partial listing usable: git ls-files or find can exit
+    # non-zero (e.g. an unreadable subdirectory), which under `set -o pipefail`
+    # would otherwise abort the caller's `file_list=$(...)` assignment.
+    if command -v git >/dev/null 2>&1 && git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        ( cd "$dir" && git ls-files --cached --others --exclude-standard 2>/dev/null ) || true
+    else
+        ( cd "$dir" && find . -type f -not -path '*/.git/*' 2>/dev/null | sed -E 's#^\./##' ) || true
+    fi
+}
+
+# True when PATH matches a single .ptcignore PATTERN. Pragmatic gitignore-ish
+# semantics (not a full implementation): trailing "/" = directory prefix; a
+# pattern containing "/" is globbed against the whole path; a bare name matches
+# any path component or basename glob. Bash `case` globs are intentionally
+# unquoted so the pattern applies.
+_path_matches_ignore() {
+    local path="$1"
+    local pat="$2"
+    case "$pat" in
+        */)
+            local p="${pat%/}"
+            case "$path" in
+                "$p"/*) return 0 ;;
+            esac
+            return 1
+            ;;
+        */*)
+            # shellcheck disable=SC2254
+            case "$path" in
+                $pat) return 0 ;;
+                $pat/*) return 0 ;;
+            esac
+            return 1
+            ;;
+        *)
+            local base="${path##*/}"
+            # shellcheck disable=SC2254
+            case "$base" in
+                $pat) return 0 ;;
+            esac
+            case "/$path/" in
+                *"/$pat/"*) return 0 ;;
+            esac
+            return 1
+            ;;
+    esac
+}
+
+# Reads newline-separated paths on stdin and drops any matched by DIR/.ptcignore.
+# With no .ptcignore it is a pass-through.
+filter_ptcignore() {
+    local dir="$1"
+    local ignore_file="$dir/.ptcignore"
+    if [[ ! -f "$ignore_file" ]]; then
+        cat
+        return 0
+    fi
+    local patterns=()
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"                                   # strip CR from CRLF files
+        line=$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+        [[ -z "$line" ]] && continue
+        case "$line" in \#*) continue ;; esac
+        patterns+=("$line")
+    done < "$ignore_file"
+
+    # A .ptcignore with only blanks/comments leaves no patterns. Expanding an
+    # empty "${patterns[@]}" under `set -u` is fatal on bash < 4.4, so short out.
+    if [[ ${#patterns[@]} -eq 0 ]]; then
+        cat
+        return 0
+    fi
+
+    local path keep pat
+    while IFS= read -r path || [[ -n "$path" ]]; do
+        [[ -z "$path" ]] && continue
+        keep=true
+        for pat in "${patterns[@]}"; do
+            if _path_matches_ignore "$path" "$pat"; then
+                keep=false
+                break
+            fi
+        done
+        [[ "$keep" == "true" ]] && printf '%s\n' "$path"
+    done
+    # The loop's last command is a `&&` that is false whenever the final path is
+    # ignored; without this the function returns 1 and, under `set -o pipefail`,
+    # aborts the `file_list=$(... | filter_ptcignore)` assignment in cmd_init.
+    return 0
+}
+
+# Reads newline-separated paths on stdin, prints {"file_paths":[...]}.
+build_detect_payload() {
+    local first=true path
+    printf '{"file_paths":['
+    while IFS= read -r path || [[ -n "$path" ]]; do
+        [[ -z "$path" ]] && continue
+        if [[ "$first" == "true" ]]; then first=false; else printf ','; fi
+        printf '"%s"' "$(_json_escape "$path")"
+    done
+    printf ']}'
+}
+
+# POSTs the payload to detect_config and echoes curl's raw "body+http_code"
+# response, so the caller splits it with the codebase's ${resp: -3}/${resp%???}
+# idiom. Isolated for testability: a stubbed curl feeds it a fixture.
+call_detect_config() {
+    local payload="$1"
+    local response
+    response=$(curl -s -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer $PTC_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        "${PTC_API_URL}detect_config" 2>/dev/null) || true
+    printf '%s' "$response"
+}
+
+# Renders the full .ptc-config.yml content for a detect_config BODY to stdout.
+# kind:"any" or an empty files[] takes the commented-template branch so init
+# never hard-fails on an unrecognised layout.
+render_ptc_config() {
+    local body="$1"
+    local kind source_locale files_elems
+    kind=$(json_string_field "$body" "kind")
+    source_locale=$(json_string_field "$body" "source_locale")
+    [[ -z "$source_locale" ]] && source_locale="en"
+    files_elems=$(_json_array_elements "$body" "files")
+
+    if [[ -z "$files_elems" || "$kind" == "any" ]]; then
+        _render_config_template "$source_locale" "$kind"
+    else
+        _render_config_detected "$source_locale" "$kind" "$files_elems"
+    fi
+}
+
+_render_config_detected() {
+    local source_locale="$1" kind="$2" files_elems="$3"
+    printf '# .ptc-config.yml — generated by `%s init`\n' "$SCRIPT_NAME"
+    [[ -n "$kind" ]] && printf '# Detected project kind: %s\n' "$kind"
+    printf '# Never commit an API token — pass it via PTC_API_TOKEN or --api-token.\n'
+    printf '\n'
+    printf 'source_locale: %s\n' "$source_locale"
+    printf '\n'
+    printf 'files:\n'
+    local elem file output addl_elems addl a_type a_path
+    while IFS= read -r elem || [[ -n "$elem" ]]; do
+        [[ -z "$elem" ]] && continue
+        file=$(json_string_field "$elem" "file")
+        [[ -z "$file" ]] && continue
+        output=$(json_string_field "$elem" "output")
+        printf '  - file: %s\n' "$file"
+        printf '    output: %s\n' "$output"
+        addl_elems=$(_json_array_elements "$elem" "additional_translation_files")
+        if [[ -n "$addl_elems" ]]; then
+            printf '    additional_translation_files:\n'
+            while IFS= read -r addl || [[ -n "$addl" ]]; do
+                [[ -z "$addl" ]] && continue
+                a_type=$(json_string_field "$addl" "type")
+                a_path=$(json_string_field "$addl" "path")
+                printf '      - type: %s\n' "$a_type"
+                printf '        path: %s\n' "$a_path"
+            done <<< "$addl_elems"
+        fi
+    done <<< "$files_elems"
+}
+
+_render_config_template() {
+    local source_locale="$1" kind="${2:-}"
+    printf '# .ptc-config.yml — generated by `%s init`\n' "$SCRIPT_NAME"
+    printf '# ptc init could not auto-detect translatable files in this project'
+    [[ -n "$kind" ]] && printf ' (kind: %s)' "$kind"
+    printf '.\n'
+    printf '# Fill in the files you want translated and uncomment the block below.\n'
+    printf '# Reference: https://github.com/OnTheGoSystems/ptc-cli#configuration-file-format\n'
+    printf '# Never commit an API token — pass it via PTC_API_TOKEN or --api-token.\n'
+    printf '\n'
+    printf 'source_locale: %s\n' "$source_locale"
+    printf '\n'
+    printf '# files:\n'
+    printf '#   - file: path/to/%s.json\n' "$source_locale"
+    printf '#     output: path/to/{{lang}}.json\n'
+}
+
+# Human-readable "what was detected" block, printed for confirmation before the
+# file is written. detect_config returns a single kind per repo, so the grouping
+# is kind + counts + the file mapping.
+print_detect_summary() {
+    local body="$1"
+    local kind source_locale files_elems locales_elems
+    kind=$(json_string_field "$body" "kind"); [[ -z "$kind" ]] && kind="any"
+    source_locale=$(json_string_field "$body" "source_locale")
+    files_elems=$(_json_array_elements "$body" "files")
+    locales_elems=$(_json_array_elements "$body" "available_locales")
+
+    local line locales="" elem file output
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        line=$(printf '%s' "$line" | sed -E 's/^"(.*)"$/\1/')
+        locales="${locales:+$locales, }$line"
+    done <<< "$locales_elems"
+
+    printf '\n'
+    printf 'Detected project configuration:\n'
+    printf '  kind:           %s\n' "$kind"
+    printf '  source_locale:  %s\n' "${source_locale:-<unknown>}"
+    printf '  target locales: %s\n' "${locales:-<none detected>}"
+    printf '  files (%s):\n' "$(_count_lines "$files_elems")"
+    while IFS= read -r elem || [[ -n "$elem" ]]; do
+        [[ -z "$elem" ]] && continue
+        file=$(json_string_field "$elem" "file")
+        output=$(json_string_field "$elem" "output")
+        printf '    %s -> %s\n' "$file" "$output"
+    done <<< "$files_elems"
+    printf '\n'
+}
+
+# Detects the CI system from the origin remote and on-disk markers.
+detect_ci_provider() {
+    local dir="$1"
+    local origin=""
+    if command -v git >/dev/null 2>&1; then
+        origin=$(git -C "$dir" config --get remote.origin.url 2>/dev/null || echo "")
+    fi
+    if [[ -d "$dir/.github" ]] || [[ "$origin" == *github.com* ]]; then
+        echo "github"
+    elif [[ -f "$dir/.gitlab-ci.yml" ]] || [[ "$origin" == *gitlab* ]]; then
+        echo "gitlab"
+    else
+        echo "unknown"
+    fi
+}
+
+render_ci_github() {
+    cat <<'EOF'
+name: PTC Translations
+on:
+  workflow_dispatch:
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run PTC CLI
+        env:
+          PTC_API_TOKEN: ${{ secrets.PTC_API_TOKEN }}
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/refs/heads/main/ptc-cli.sh -o ptc-cli.sh
+          chmod +x ptc-cli.sh
+          ./ptc-cli.sh --config-file .ptc-config.yml --verbose
+EOF
+}
+
+render_ci_gitlab() {
+    cat <<'EOF'
+ptc_translations:
+  stage: deploy
+  script:
+    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/refs/heads/main/ptc-cli.sh -o ptc-cli.sh
+    - chmod +x ptc-cli.sh
+    - ./ptc-cli.sh --config-file .ptc-config.yml --verbose
+  variables:
+    PTC_API_TOKEN: "$PTC_API_TOKEN"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+EOF
+}
+
+# Prints the CI snippet matching the detected provider (both, when unknown).
+print_ci_block() {
+    local dir="$1"
+    local provider
+    provider=$(detect_ci_provider "$dir")
+    printf '\n'
+    log_info "Store your token as a CI secret named PTC_API_TOKEN, then add this pipeline:"
+    case "$provider" in
+        github)
+            printf '\n# .github/workflows/ptc.yml\n'
+            render_ci_github
+            ;;
+        gitlab)
+            printf '\n# append to .gitlab-ci.yml\n'
+            render_ci_gitlab
+            ;;
+        *)
+            printf '\n# GitHub Actions — .github/workflows/ptc.yml:\n'
+            render_ci_github
+            printf '\n# GitLab CI — .gitlab-ci.yml:\n'
+            render_ci_gitlab
+            ;;
+    esac
+    printf '\n'
+}
+
+show_init_help() {
+    echo -e "$SCRIPT_NAME init - scaffold a .ptc-config.yml from your repository
+
+USAGE:
+    $SCRIPT_NAME init [OPTIONS]
+
+DESCRIPTION:
+    Scans the current checkout (respecting .gitignore and .ptcignore), sends the
+    file paths (paths only, no contents) to the PTC detect_config endpoint, and
+    writes a ready-to-use .ptc-config.yml plus a CI snippet. Unrecognised
+    layouts get a commented template instead of an error.
+
+OPTIONS:
+    --api-url URL          PTC API base URL (default: $PTC_API_URL)
+    --api-token TOKEN      API token (default: \$PTC_API_TOKEN environment variable)
+    -d, --project-dir DIR  Directory to scan and write into (default: current)
+    -f, --force            Overwrite an existing .ptc-config.yml
+    -y, --yes              Do not prompt for confirmation
+    -n, --dry-run          Print what would be written without touching disk
+    -v, --verbose          Verbose output
+    -h, --help             Show this help
+
+NOTE:
+    detect_config is currently on the QA environment. Until it reaches
+    production, point --api-url at the QA host."
+}
+
+# `ptc init` entry point.
+cmd_init() {
+    local force=false assume_yes=false
+    local project_dir="$PTC_PROJECT_DIR"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --api-url) PTC_API_URL="$2"; shift 2 ;;
+            --api-url=*) PTC_API_URL="${1#*=}"; shift ;;
+            --api-token) PTC_API_TOKEN="$2"; shift 2 ;;
+            --api-token=*) PTC_API_TOKEN="${1#*=}"; shift ;;
+            -d|--project-dir) project_dir="$2"; shift 2 ;;
+            --project-dir=*) project_dir="${1#*=}"; shift ;;
+            -f|--force) force=true; shift ;;
+            -y|--yes) assume_yes=true; shift ;;
+            -v|--verbose) PTC_VERBOSE=true; shift ;;
+            -n|--dry-run) PTC_DRY_RUN=true; shift ;;
+            -h|--help) show_init_help; return 0 ;;
+            *)
+                log_error "Unknown option for 'init': $1"
+                log_info "Run '$SCRIPT_NAME init --help' for usage."
+                return 1
+                ;;
+        esac
+    done
+
+    # env-first: fall back to an inherited PTC_API_TOKEN when no --api-token was
+    # given (the global was reset at startup, so use the captured copy).
+    if [[ -z "$PTC_API_TOKEN" ]]; then
+        PTC_API_TOKEN="$PTC_ENV_API_TOKEN"
+    fi
+
+    # The endpoint is formed as "${PTC_API_URL}detect_config", so a --api-url
+    # without a trailing slash would request ".../api/v1detect_config".
+    case "$PTC_API_URL" in
+        */) ;;
+        *) PTC_API_URL="${PTC_API_URL}/" ;;
+    esac
+
+    if [[ ! -d "$project_dir" ]]; then
+        log_error "Project directory not found: $project_dir"
+        return 1
+    fi
+
+    local config_path="$project_dir/.ptc-config.yml"
+
+    # Refuse to clobber an existing config unless forced; a dry run still previews.
+    if [[ -f "$config_path" && "$force" != "true" && "$PTC_DRY_RUN" != "true" ]]; then
+        log_error "$config_path already exists. Re-run with --force to overwrite."
+        return 1
+    fi
+
+    if [[ -z "$PTC_API_TOKEN" ]]; then
+        log_error "No API token provided. Set PTC_API_TOKEN or pass --api-token."
+        return 1
+    fi
+
+    log_info "Scanning $project_dir for translatable files..."
+    local file_list file_count
+    file_list=$(collect_repo_files "$project_dir" | filter_ptcignore "$project_dir")
+    file_count=$(_count_lines "$file_list")
+    log_debug "Collected $file_count candidate path(s)"
+
+    local body=""
+    if [[ "$file_count" -eq 0 ]]; then
+        log_warning "No files found to send for detection; writing a template config."
+    else
+        local payload response http_code
+        payload=$(printf '%s\n' "$file_list" | build_detect_payload)
+        log_debug "POST ${PTC_API_URL}detect_config with $file_count path(s)"
+        response=$(call_detect_config "$payload")
+        http_code="${response: -3}"
+        body="${response%???}"
+
+        case "$http_code" in
+            200) : ;;
+            422)
+                log_error "detect_config rejected the request (HTTP 422)."
+                log_debug "Response: $body"
+                return 1
+                ;;
+            401|403)
+                log_error "detect_config rejected the API token (HTTP $http_code)."
+                return 1
+                ;;
+            404)
+                log_error "detect_config is not available on this server (HTTP 404)."
+                log_info "This endpoint is currently on the QA environment; point --api-url at the QA host."
+                return 1
+                ;;
+            ""|000)
+                log_error "Could not reach the API at ${PTC_API_URL}detect_config."
+                return 1
+                ;;
+            *)
+                log_error "detect_config failed (HTTP $http_code)."
+                log_debug "Response: $body"
+                return 1
+                ;;
+        esac
+    fi
+
+    local yaml_content
+    if [[ -n "$body" ]]; then
+        print_detect_summary "$body"
+        yaml_content=$(render_ptc_config "$body")
+    else
+        yaml_content=$(render_ptc_config '{"kind":"any"}')
+    fi
+
+    if [[ "$PTC_DRY_RUN" == "true" ]]; then
+        log_info "Dry run: would write $config_path with:"
+        printf '%s\n' "$yaml_content"
+        print_ci_block "$project_dir"
+        return 0
+    fi
+
+    if [[ "$assume_yes" != "true" && -t 0 ]]; then
+        printf 'Write %s? [y/N] ' "$config_path" >&2
+        local reply=""
+        read -r reply || true
+        case "$reply" in
+            y|Y|yes|YES|Yes) ;;
+            *) log_info "Aborted; nothing was written."; return 0 ;;
+        esac
+    fi
+
+    printf '%s\n' "$yaml_content" > "$config_path"
+    log_success "Wrote $config_path"
+    print_ci_block "$project_dir"
+    return 0
+}
+
 # Main function
 main() {
+    # `init` is a subcommand, not a flag: it scaffolds a config and must run
+    # before the translate-pipeline validation (which requires a source locale
+    # and patterns/config that do not exist yet), so it short-circuits here.
+    if [[ "${1:-}" == "init" ]]; then
+        shift
+        cmd_init "$@"
+        exit $?
+    fi
+
     # Argument parsing
     while [[ $# -gt 0 ]]; do
         case $1 in
