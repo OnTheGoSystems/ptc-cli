@@ -13,6 +13,7 @@ ptc-cli-bash/
 ├── tests/                        # Testing
 │   ├── test-runner.sh           # Main test runner (CLI invocation tests)
 │   ├── test-status-handling.sh  # Status parsing, polling and preflight
+│   ├── test-init.sh             # `ptc init` detect_config scaffolder
 │   └── fixtures/                # Test data (created automatically)
 └── docs/                         # Documentation
     └── DEVELOPMENT.md           # This guide
@@ -57,6 +58,7 @@ chmod +x tests/test-status-handling.sh
 # Run all tests
 ./tests/test-runner.sh
 ./tests/test-status-handling.sh
+./tests/test-init.sh
 
 # Test specific functionality
 ./ptc-cli.sh -s en -p '{lang}-copy.json' --dry-run --verbose
