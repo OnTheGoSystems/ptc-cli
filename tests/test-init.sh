@@ -57,11 +57,13 @@ assert_not_contains() {
 # with ${response: -3} / ${response%???}.
 MOCK_DETECT_CODE="200"
 MOCK_DETECT_BODY=""
-# curl runs inside $( ), so the URL it saw is recorded to a file to survive the
+# curl runs inside $( ), so what it saw is recorded to files to survive the
 # subshell (same reason the status suite counts calls through a file).
 MOCK_URL_FILE=""
+MOCK_ARGS_FILE=""
 
 curl() {
+    [[ -n "$MOCK_ARGS_FILE" ]] && printf '%s\n' "$@" >> "$MOCK_ARGS_FILE"
     local url=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -313,9 +315,8 @@ test_cmd_init_404_gate() {
 test_cmd_init_missing_token() {
     echo "--- cmd_init requires a token"
 
-    local saved="$PTC_API_TOKEN" saved_env="$PTC_ENV_API_TOKEN"
-    PTC_API_TOKEN=""
-    PTC_ENV_API_TOKEN=""   # no --api-token and no inherited env token
+    local saved="$PTC_API_TOKEN"
+    PTC_API_TOKEN=""   # no --api-token and no inherited env token
     local dir out
     dir=$(mktemp -d)
     out=$(cmd_init --project-dir "$dir" --yes 2>&1 </dev/null)
@@ -324,18 +325,15 @@ test_cmd_init_missing_token() {
     assert_contains "missing token is explained" "$out" "No API token"
     rm -rf "$dir"
     PTC_API_TOKEN="$saved"
-    PTC_ENV_API_TOKEN="$saved_env"
 }
 
-# F1: init falls back to an inherited PTC_API_TOKEN (env-first) when no
-# --api-token is given.
-test_cmd_init_env_token_fallback() {
-    echo "--- cmd_init env-first token fallback"
+# F1: an inherited PTC_API_TOKEN (env-first) is used when no --api-token is given.
+test_cmd_init_env_token() {
+    echo "--- cmd_init uses the ambient PTC_API_TOKEN"
 
-    local saved="$PTC_API_TOKEN" saved_env="$PTC_ENV_API_TOKEN"
+    local saved="$PTC_API_TOKEN"
     MOCK_DETECT_BODY="$RAILS_BODY"; MOCK_DETECT_CODE="200"
-    PTC_API_TOKEN=""                 # nothing on the CLI
-    PTC_ENV_API_TOKEN="env-token"    # but the environment had one
+    PTC_API_TOKEN="env-token"   # as if inherited from the environment
 
     local dir
     dir=$(mktemp -d)
@@ -345,23 +343,36 @@ test_cmd_init_env_token_fallback() {
     assert_eq "succeeds using the inherited env token" "$rc" "0"
     rm -rf "$dir"
     PTC_API_TOKEN="$saved"
-    PTC_ENV_API_TOKEN="$saved_env"
 }
 
-# F1 (invariant preserved): the translate pipeline still lets a config-file
-# api_token win when PTC_API_TOKEN is empty (startup reset keeps that guard).
-test_config_token_precedence_preserved() {
-    echo "--- config api_token still overrides empty PTC_API_TOKEN"
+# F1 (regression): the startup line must NOT wipe an inherited PTC_API_TOKEN,
+# or the translate pipeline authenticates with an empty Bearer token. Sourced in
+# a fresh shell so the real startup sequence runs with the env var set.
+test_env_token_survives_startup() {
+    echo "--- inherited PTC_API_TOKEN survives startup (translate pipeline)"
 
-    local saved="$PTC_API_TOKEN"
+    local got
+    got=$(PTC_API_TOKEN="env-tok" bash -c "source '$CLI_UNDER_TEST' >/dev/null 2>&1; printf '%s' \"\$PTC_API_TOKEN\"")
+    assert_eq "env token is retained after sourcing" "$got" "env-tok"
+}
+
+# §6: the api_token: config key is deprecated. It must be ignored (never loaded
+# into PTC_API_TOKEN) and must produce a warning. parse_config_file runs in the
+# current shell (NOT a subshell) so the "not loaded" assertion can actually
+# observe a would-be mutation of PTC_API_TOKEN.
+test_config_api_token_deprecated() {
+    echo "--- config api_token is deprecated: ignored + warned"
+
+    local saved="$PTC_API_TOKEN" saved_locale="$PTC_SOURCE_LOCALE"
     PTC_API_TOKEN=""
-    local dir cfg
-    dir=$(mktemp -d); cfg="$dir/c.yml"
+    local dir cfg errfile
+    dir=$(mktemp -d); cfg="$dir/c.yml"; errfile=$(mktemp)
     printf 'source_locale: en\napi_token: from-config\nfiles:\n  - file: en.json\n    output: {{lang}}.json\n' > "$cfg"
-    parse_config_file "$cfg" >/dev/null 2>&1
-    assert_eq "config api_token loaded when env empty" "$PTC_API_TOKEN" "from-config"
-    rm -rf "$dir"
-    PTC_API_TOKEN="$saved"
+    parse_config_file "$cfg" >/dev/null 2>"$errfile"
+    assert_eq "config api_token is NOT loaded" "$PTC_API_TOKEN" ""
+    assert_contains "a deprecation warning is emitted" "$(cat "$errfile")" "deprecated 'api_token:'"
+    rm -rf "$dir"; rm -f "$errfile"
+    PTC_API_TOKEN="$saved"; PTC_SOURCE_LOCALE="$saved_locale"
 }
 
 # F2: a .ptcignore whose alphabetically-last path is ignored must not abort the
@@ -403,6 +414,27 @@ test_cmd_init_url_normalization() {
     PTC_API_URL="$saved_url"
 }
 
+# §5: every API request carries a versioned User-Agent (via the ptc_curl wrapper).
+test_user_agent_header() {
+    echo "--- requests send a versioned User-Agent"
+
+    PTC_API_TOKEN="test-token"
+    MOCK_DETECT_BODY="$RAILS_BODY"; MOCK_DETECT_CODE="200"
+    MOCK_ARGS_FILE=$(mktemp)
+
+    local dir
+    dir=$(mktemp -d)
+    printf '{}' > "$dir/en.yml"
+    cmd_init --project-dir "$dir" --api-token test-token --yes >/dev/null 2>&1 </dev/null
+
+    local args
+    args=$(cat "$MOCK_ARGS_FILE")
+    assert_contains "User-Agent header is present" "$args" "User-Agent: ptc-cli/"
+    assert_contains "User-Agent carries the version" "$args" "User-Agent: $PTC_USER_AGENT"
+    rm -rf "$dir"; rm -f "$MOCK_ARGS_FILE"
+    MOCK_ARGS_FILE=""
+}
+
 main() {
     echo "PTC CLI - init (detect_config) tests"
     echo
@@ -419,10 +451,12 @@ main() {
     test_cmd_init_422
     test_cmd_init_404_gate
     test_cmd_init_missing_token
-    test_cmd_init_env_token_fallback
-    test_config_token_precedence_preserved
+    test_cmd_init_env_token
+    test_env_token_survives_startup
+    test_config_api_token_deprecated
     test_ptcignore_last_path_ignored
     test_cmd_init_url_normalization
+    test_user_agent_header
 
     echo
     echo "Test results:"

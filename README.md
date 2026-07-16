@@ -65,8 +65,9 @@ files:
         path: languages/plugin-{{lang}}.po
 EOF
 
-# Process translations with token from command line
-./ptc-cli.sh --config-file .ptc-config.yml --api-token="$PTC_API_TOKEN"
+# Process translations (the token is read from the PTC_API_TOKEN env var)
+export PTC_API_TOKEN=your-token
+./ptc-cli.sh --config-file .ptc-config.yml
 ```
 
 ### Using Patterns
@@ -78,13 +79,13 @@ Convenient for processing multiple files when the file or path to it contains a 
 chmod +x ptc-cli.sh
 
 # Find files for English language by pattern
-./ptc-cli.sh --source-locale en --patterns 'sample-{{lang}}.json' --api-token=your-token
+./ptc-cli.sh --source-locale en --patterns 'sample-{{lang}}.json'
 
 # Find files in subdirectories
 ./ptc-cli.sh --source-locale en --patterns '{{lang}}/**/*.json' --api-url=https://app.ptc.wpml.org/api/v1/
 
 # Multiple patterns
-./ptc-cli.sh -s en -p 'sample-{{lang}}.json,{{lang}}-*.properties' --api-token=your-token
+./ptc-cli.sh -s en -p 'sample-{{lang}}.json,{{lang}}-*.properties'
 ```
 
 ## Usage
@@ -102,7 +103,7 @@ chmod +x ptc-cli.sh
 
 **API Configuration:**
 - `--api-url URL` - PTC API base URL (default: https://app.ptc.wpml.org/api/v1/)
-- `--api-token TOKEN` - API authentication token
+- `--api-token TOKEN` - API token override (prefer the `PTC_API_TOKEN` env var)
 - `--monitor-interval SECONDS` - Status check interval (default: 5)
 - `--monitor-max-attempts COUNT` - Maximum monitoring attempts (default: 100)
 
@@ -112,6 +113,22 @@ chmod +x ptc-cli.sh
 - `-n, --dry-run` - Show what would be done without executing
 - `-h, --help` - Show help
 - `--version` - Show version
+
+### Authentication
+
+Provide your API token through the `PTC_API_TOKEN` environment variable:
+
+```bash
+export PTC_API_TOKEN=your-token
+./ptc-cli.sh --config-file .ptc-config.yml
+```
+
+In CI, set it as a masked secret named `PTC_API_TOKEN` (see the CI examples
+below). The `--api-token` flag still works as an override, but keeping the token
+in the environment avoids leaking it into shell history and process listings.
+
+> **Deprecated:** the `api_token:` config-file key is no longer read — a token in
+> a committed file is a leak. If present, the CLI warns and ignores it.
 
 ### Preflight
 
@@ -138,8 +155,8 @@ The YAML configuration file supports full project setup:
 source_locale: en
 file_tag_name: main
 api_url: https://app.ptc.wpml.org/api/v1/
-# api_token: NEVER store API tokens in config files committed to repository!
-# Use --api-token parameter or PTC_API_TOKEN environment variable instead
+# NOTE: the api_token: key is deprecated and ignored. Never store a token in a
+# committed file — provide it via the PTC_API_TOKEN environment variable.
 
 # Monitoring settings (optional)
 monitor_interval: 5
@@ -181,7 +198,7 @@ files:
 ./ptc-cli.sh -c config.yml --dry-run --verbose
 
 # Override specific settings
-./ptc-cli.sh -c config.yml --api-token=different-token --file-tag-name=feature-branch
+./ptc-cli.sh -c config.yml --file-tag-name=feature-branch
 
 # Isolated actions
 ./ptc-cli.sh -c config.yml --action upload                   # Only upload files
@@ -192,24 +209,24 @@ files:
 **With params:**
 ```bash
 # Basic usage
-./ptc-cli.sh -s en -p 'sample-{{lang}}.json' --api-token=your-token
+./ptc-cli.sh -s en -p 'sample-{{lang}}.json'
 
 # Search in specific directory
 ./ptc-cli.sh -s de -p '{{lang}}/**/*.json' -d /path/to/project
 
 # Dry run with verbose output
-./ptc-cli.sh -s en -p '{{lang}}/*.json' --verbose --dry-run --api-token=your-token
+./ptc-cli.sh -s en -p '{{lang}}/*.json' --verbose --dry-run
 
 # Multiple patterns
-./ptc-cli.sh -s en -p 'i18n/{{lang}}/app.json,locales/{{lang}}/*.properties' --api-token=your-token
+./ptc-cli.sh -s en -p 'i18n/{{lang}}/app.json,locales/{{lang}}/*.properties'
 
 # WordPress WPSite example
-./ptc-cli.sh -s en -p 'languages/wpsite.pot' -t main --api-token=your-token
+./ptc-cli.sh -s en -p 'languages/wpsite.pot' -t main
 
 # Isolated actions with patterns
-./ptc-cli.sh -s en -p 'sample-{{lang}}.json' --action upload --api-token=your-token
-./ptc-cli.sh -s en -p 'sample-{{lang}}.json' --action status --verbose --api-token=your-token
-./ptc-cli.sh -s en -p 'sample-{{lang}}.json' --action download --api-token=your-token
+./ptc-cli.sh -s en -p 'sample-{{lang}}.json' --action upload
+./ptc-cli.sh -s en -p 'sample-{{lang}}.json' --action status --verbose
+./ptc-cli.sh -s en -p 'sample-{{lang}}.json' --action download
 ```
 
 ## Processing Workflow
@@ -269,6 +286,32 @@ During monitoring, you'll see compact status indicators (Each letter for one fil
 
 ## CI/CD Usage
 
+### Pinning the CLI version
+
+Pipelines download the script from a **pinned release tag**, not a moving branch,
+so a push to `main` can never change what your build runs:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.0/ptc-cli.sh -o ptc-cli.sh
+```
+
+Use `v1.0.0` to pin an exact release, or the floating `v1` tag to pick up
+backward-compatible updates automatically. The `ptc init` command scaffolds the
+pinned URL for you.
+
+**Verify the download** against the SHA256 checksum published on the
+[release page](https://github.com/OnTheGoSystems/ptc-cli/releases):
+
+```bash
+# macOS
+shasum -a 256 ptc-cli.sh
+# Linux
+sha256sum ptc-cli.sh
+```
+
+Each request the CLI makes carries a `User-Agent: ptc-cli/<version>` header, so
+the server can attribute traffic to a specific release.
+
 ### GitHub Actions
 
 Add PTC_API_TOKEN to the repository secrets (Settings -> Secrets and variables -> Actions -> New repository secret).
@@ -292,7 +335,7 @@ jobs:
       
       - name: Setup PTC CLI
         run: |
-          curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/refs/heads/main/ptc-cli.sh -o ptc-cli.sh
+          curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.0/ptc-cli.sh -o ptc-cli.sh
           chmod +x ptc-cli.sh
       
       - name: Process translations with PTC CLI
@@ -301,7 +344,6 @@ jobs:
         run: |
           ./ptc-cli.sh \
             --config-file .ptc/config.yml \
-            --api-token ${{ secrets.PTC_API_TOKEN }} \
             --verbose
       
       - name: Clean up temporary files
@@ -347,7 +389,7 @@ process_translations:
   stage: deploy
   script:
     - chmod +x ptc-cli.sh
-    - ./ptc-cli.sh -c config.yml --api-token="$PTC_API_TOKEN" -v
+    - ./ptc-cli.sh -c config.yml -v
   variables:
     PTC_API_TOKEN: "$CI_PTC_API_TOKEN"
   only:
