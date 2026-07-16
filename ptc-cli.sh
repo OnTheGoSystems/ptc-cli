@@ -9,6 +9,7 @@ set -euo pipefail  # Strict mode: exit on errors, undefined variables and pipe e
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly VERSION="1.0.0"
+readonly PTC_USER_AGENT="ptc-cli/${VERSION}"
 
 # Colors for output
 readonly RED='\033[0;31m'
@@ -25,12 +26,11 @@ PTC_CONFIG_FILE=""
 PTC_PROJECT_DIR="$(pwd)"
 PTC_FILE_TAG_NAME=""
 PTC_API_URL="https://app.ptc.wpml.org/api/v1/"
-# Capture any inherited token BEFORE resetting, so `ptc init` can fall back to it
-# (env-first). The reset below is kept so the translate pipeline's precedence is
-# unchanged: there, a .ptc-config.yml api_token: still wins when no --api-token
-# is passed (parse_config_file only loads it while PTC_API_TOKEN is empty).
-PTC_ENV_API_TOKEN="${PTC_API_TOKEN:-}"
-PTC_API_TOKEN=""
+# The API token is env-first: an inherited PTC_API_TOKEN is honoured across every
+# command, and --api-token overrides it. The api_token: config key is deprecated
+# and ignored (ci18-7251 §6), so there is nothing else to reconcile — do NOT reset
+# this to "", or the translate pipeline would lose the env token.
+PTC_API_TOKEN="${PTC_API_TOKEN:-}"
 PTC_VERBOSE=false
 PTC_DRY_RUN=false
 PTC_MONITOR_INTERVAL=5   # seconds between status checks
@@ -60,6 +60,13 @@ log_debug() {
     if [[ "$PTC_VERBOSE" == "true" ]]; then
         echo -e "${BLUE}[DEBUG]${NC} $*" >&2
     fi
+}
+
+# All PTC API requests go through this wrapper so every call carries a versioned
+# User-Agent (ptc-cli/<VERSION>). It forwards to the real curl - which the test
+# suites stub - so the header rides along as an ordinary -H the stubs already skip.
+ptc_curl() {
+    curl -H "User-Agent: $PTC_USER_AGENT" "$@"
 }
 
 # JSON field readers. The API returns compact JSON today, but these tolerate
@@ -224,7 +231,7 @@ OPTIONS:
     -t, --file-tag-name TAG        File tag name/branch name (default: ${GREEN}$current_branch${NC})
     -d, --project-dir DIR          Project directory (default: current)
     --api-url URL                  PTC API base URL (default: https://app.ptc.wpml.org/api/v1/)
-    --api-token TOKEN              PTC API authentication token
+    --api-token TOKEN              API token override (prefer the PTC_API_TOKEN env var)
     --monitor-interval SECONDS     Seconds between status checks (default: 5)
     --monitor-max-attempts COUNT   Maximum status check attempts (default: 100)
     --action ACTION                Perform isolated action: upload, status, download
@@ -246,8 +253,9 @@ CONFIG FILE FORMAT:
     source_locale: en
     file_tag_name: main
     api_url: https://app.ptc.wpml.org/api/v1/
-    api_token: your-token-here
-    
+    # Do NOT put api_token here - it is deprecated and ignored.
+    # Provide the token via the PTC_API_TOKEN environment variable.
+
     files:
       - file: src/locales/en.json
         output: src/locales/{{lang}}.json
@@ -527,13 +535,12 @@ parse_config_file() {
         fi
     fi
     
-    if [[ -z "$PTC_API_TOKEN" ]]; then
-        local config_api_token
-        config_api_token=$(grep '^api_token:' "$config_file" 2>/dev/null | sed 's/^api_token: *//' | sed 's/ *$//')
-        if [[ -n "$config_api_token" ]]; then
-            PTC_API_TOKEN="$config_api_token"
-            log_debug "Loaded api_token from config"
-        fi
+    # The api_token: config key is deprecated (ci18-7251 §6): a token in a
+    # committed file is a leak waiting to happen. Warn whenever the key is present
+    # (even with an empty value) and ignore it; the token must come from the
+    # PTC_API_TOKEN environment variable or --api-token.
+    if grep -q '^api_token:' "$config_file" 2>/dev/null; then
+        log_warning "Ignoring deprecated 'api_token:' in $config_file. Set the PTC_API_TOKEN environment variable (or pass --api-token) instead."
     fi
     
     # Validate files section exists
@@ -1739,7 +1746,7 @@ preflight_check() {
     header_file=$(mktemp)
 
     local response http_code body
-    response=$(curl -s -D "$header_file" -w "%{http_code}" \
+    response=$(ptc_curl -s -D "$header_file" -w "%{http_code}" \
         -X GET \
         -H "Authorization: Bearer $PTC_API_TOKEN" \
         "${PTC_API_URL}languages" 2>/dev/null) || true
@@ -1800,7 +1807,7 @@ preflight_check() {
     local plan=""
     local active=""
     local sub_status=""
-    plan_response=$(curl -s -w "%{http_code}" \
+    plan_response=$(ptc_curl -s -w "%{http_code}" \
         -X GET \
         -H "Authorization: Bearer $PTC_API_TOKEN" \
         "${PTC_API_URL}balance" 2>/dev/null) || true
@@ -1935,7 +1942,7 @@ EOF
                 log_info "  \"$api_url\""
             fi
             
-            response=$(curl -s -w "%{http_code}" \
+            response=$(ptc_curl -s -w "%{http_code}" \
                 -X POST \
                 -H "Authorization: Bearer $PTC_API_TOKEN" \
                 -H "Content-Type: application/json" \
@@ -1952,7 +1959,7 @@ EOF
                 log_info "  -F \"file=@$absolute_file_path\" \\"
                 log_info "  \"$api_url\""
             fi
-            response=$(curl -s -w "%{http_code}" \
+            response=$(ptc_curl -s -w "%{http_code}" \
                 -X POST \
                 -H "Authorization: Bearer $PTC_API_TOKEN" \
                 -F "file_path=$relative_file_path" \
@@ -1975,13 +1982,13 @@ EOF
 EOF
 )
             
-            response=$(curl -s -w "%{http_code}" \
+            response=$(ptc_curl -s -w "%{http_code}" \
                 -X POST \
                 -H "Content-Type: application/json" \
                 -d "$json_payload" \
                 "$api_url" 2>/dev/null)
         else
-            response=$(curl -s -w "%{http_code}" \
+            response=$(ptc_curl -s -w "%{http_code}" \
                 -X POST \
                 -F "file_path=$relative_file_path" \
                 -F "output_file_path=$output_file_path" \
@@ -2040,7 +2047,7 @@ start_processing() {
     # Make multipart/form-data request using curl
     local response
     if [[ -n "$PTC_API_TOKEN" ]]; then
-        response=$(curl -s -w "%{http_code}" \
+        response=$(ptc_curl -s -w "%{http_code}" \
             -X PUT \
             -H "Authorization: Bearer $PTC_API_TOKEN" \
             -F "file_path=$relative_file_path" \
@@ -2089,7 +2096,7 @@ get_translation_status_quiet() {
     
     local response
     if [[ -n "$PTC_API_TOKEN" ]]; then
-        response=$(curl -s -w "%{http_code}" \
+        response=$(ptc_curl -s -w "%{http_code}" \
             -X GET \
             -H "Authorization: Bearer $PTC_API_TOKEN" \
             "$full_url" 2>/dev/null)
@@ -2164,7 +2171,7 @@ check_translation_status() {
     
     local response
     if [[ -n "$PTC_API_TOKEN" ]]; then
-        response=$(curl -s -w "%{http_code}" \
+        response=$(ptc_curl -s -w "%{http_code}" \
             -X GET \
             -H "Authorization: Bearer $PTC_API_TOKEN" \
             "$full_url" 2>/dev/null)
@@ -2427,7 +2434,7 @@ download_translations() {
             log_info "Starting download from API..."
         fi
         log_debug "Starting curl download with token: ${PTC_API_TOKEN:0:10}..."
-        http_code=$(curl -s -w "%{http_code}" \
+        http_code=$(ptc_curl -s -w "%{http_code}" \
             -X GET \
             -H "Authorization: Bearer $PTC_API_TOKEN" \
             -o "$temp_zip" \
@@ -2784,7 +2791,7 @@ build_detect_payload() {
 call_detect_config() {
     local payload="$1"
     local response
-    response=$(curl -s -w "%{http_code}" \
+    response=$(ptc_curl -s -w "%{http_code}" \
         -X POST \
         -H "Authorization: Bearer $PTC_API_TOKEN" \
         -H "Content-Type: application/json" \
@@ -2815,7 +2822,7 @@ _render_config_detected() {
     local source_locale="$1" kind="$2" files_elems="$3"
     printf '# .ptc-config.yml — generated by `%s init`\n' "$SCRIPT_NAME"
     [[ -n "$kind" ]] && printf '# Detected project kind: %s\n' "$kind"
-    printf '# Never commit an API token — pass it via PTC_API_TOKEN or --api-token.\n'
+    printf '# Never commit an API token — provide it via the PTC_API_TOKEN environment variable.\n'
     printf '\n'
     printf 'source_locale: %s\n' "$source_locale"
     printf '\n'
@@ -2850,7 +2857,7 @@ _render_config_template() {
     printf '.\n'
     printf '# Fill in the files you want translated and uncomment the block below.\n'
     printf '# Reference: https://github.com/OnTheGoSystems/ptc-cli#configuration-file-format\n'
-    printf '# Never commit an API token — pass it via PTC_API_TOKEN or --api-token.\n'
+    printf '# Never commit an API token — provide it via the PTC_API_TOKEN environment variable.\n'
     printf '\n'
     printf 'source_locale: %s\n' "$source_locale"
     printf '\n'
@@ -2926,7 +2933,7 @@ jobs:
         env:
           PTC_API_TOKEN: ${{ secrets.PTC_API_TOKEN }}
         run: |
-          curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/refs/heads/main/ptc-cli.sh -o ptc-cli.sh
+          curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.0/ptc-cli.sh -o ptc-cli.sh
           chmod +x ptc-cli.sh
           ./ptc-cli.sh --config-file .ptc-config.yml --verbose
 EOF
@@ -2937,7 +2944,7 @@ render_ci_gitlab() {
 ptc_translations:
   stage: deploy
   script:
-    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/refs/heads/main/ptc-cli.sh -o ptc-cli.sh
+    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.0/ptc-cli.sh -o ptc-cli.sh
     - chmod +x ptc-cli.sh
     - ./ptc-cli.sh --config-file .ptc-config.yml --verbose
   variables:
@@ -3025,12 +3032,6 @@ cmd_init() {
                 ;;
         esac
     done
-
-    # env-first: fall back to an inherited PTC_API_TOKEN when no --api-token was
-    # given (the global was reset at startup, so use the captured copy).
-    if [[ -z "$PTC_API_TOKEN" ]]; then
-        PTC_API_TOKEN="$PTC_ENV_API_TOKEN"
-    fi
 
     # The endpoint is formed as "${PTC_API_URL}detect_config", so a --api-url
     # without a trailing slash would request ".../api/v1detect_config".
