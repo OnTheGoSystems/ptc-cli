@@ -3198,6 +3198,18 @@ main() {
 
     # Argument parsing
     while [[ $# -gt 0 ]]; do
+        # A value-taking option with no value left would read an unbound "$2"
+        # and, under `set -u`, abort with a raw bash error. Fail cleanly instead.
+        # (The "--opt=value" forms carry their value in $1 and are exempt.)
+        case "$1" in
+            -s|--source-locale|-p|--patterns|-c|--config-file|-t|--file-tag-name|-d|--project-dir|--api-url|--api-token|--monitor-interval|--monitor-max-attempts|--action)
+                if [[ $# -lt 2 ]]; then
+                    log_error "Option '$1' requires a value."
+                    echo "Use --help for help"
+                    exit 1
+                fi
+                ;;
+        esac
         case $1 in
             -s|--source-locale)
                 PTC_SOURCE_LOCALE="$2"
