@@ -1197,12 +1197,17 @@ process_files_in_steps() {
             if [[ $status_result -eq 0 ]]; then
                 # Translation completed, download it
                 set_file_status "$file" "completed"
-                if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir" >/dev/null 2>&1; then
-                    completed_files+=("$file")
-                else
-                    failed_files+=("$file")
-                    set_file_status "$file" "failed"
-                fi
+                # ci18-7342 - 2 means the archive is not ready yet (HTTP 202);
+                # keep the file in the loop rather than failing it. Same
+                # handling as the config path.
+                local download_result=0
+                download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir" >/dev/null 2>&1 || download_result=$?
+
+                case $download_result in
+                    0) completed_files+=("$file") ;;
+                    2) still_monitoring+=("$file"); set_file_status "$file" "processing" ;;
+                    *) failed_files+=("$file"); set_file_status "$file" "failed" ;;
+                esac
             elif [[ $status_result -eq 1 ]]; then
                 # Error occurred
                 failed_files+=("$file")
@@ -1436,13 +1441,32 @@ process_files_in_steps_with_config() {
 
             case $file_action in
                 0)
-                    completed_files+=("$file")
-                    # Download translations
-                    if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir"; then
-                        log_debug "Downloaded translations for: $relative_file_path"
-                    else
-                        log_warning "Failed to download translations for: $relative_file_path"
-                    fi
+                    # ci18-7342 - a file counts as completed only once its
+                    # translations are actually on disk. This used to add it to
+                    # completed_files BEFORE downloading and downgrade a failed
+                    # download to a warning, so a run that fetched nothing still
+                    # ended "completed successfully" with exit 0.
+                    #
+                    # 2 means the archive is not ready yet (HTTP 202) - keep
+                    # polling rather than deciding either way. translation_status
+                    # routinely reports a file ready a moment before its archive
+                    # is, so treating that as failure would fail healthy runs.
+                    local download_result=0
+                    download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir" || download_result=$?
+
+                    case $download_result in
+                        0)
+                            log_debug "Downloaded translations for: $relative_file_path"
+                            completed_files+=("$file")
+                            ;;
+                        2)
+                            still_monitoring+=("$file")
+                            ;;
+                        *)
+                            log_warning "Failed to download translations for: $relative_file_path"
+                            failed_files+=("$file")
+                            ;;
+                    esac
                     ;;
                 1)
                     failed_files+=("$file")
@@ -2292,6 +2316,21 @@ download_translations() {
         log_error "Failed to download translations: $relative_file_path ($(describe_api_failure "$http_code" "$download_body"))"
         rm -f "$temp_zip"
         return 1
+    fi
+
+    # ci18-7342 - 202 is the API saying "the archive is not ready yet"
+    # (TranslationInProgressError, with a Retry-After header), not a download
+    # error and not a terminal outcome. It happens routinely because
+    # translation_status can report a file ready a moment before its archive
+    # is: seen against QA on a file that downloaded fine on the next poll.
+    # Returns 2 so the caller keeps the file in the monitoring loop instead of
+    # either failing the run or claiming success with nothing on disk.
+    if [[ "$http_code" == "202" ]]; then
+        local retry_after
+        retry_after=$(json_number_field "$download_body" "retry_after")
+        log_info "Translations for $relative_file_path are still being prepared${retry_after:+ (server suggests ${retry_after}s)}; will retry."
+        rm -f "$temp_zip"
+        return 2
     fi
 
     if [[ "$http_code" == "200" ]]; then

@@ -140,6 +140,38 @@ rc=$?
 assert_eq "ready exits zero" "$rc" "0"
 
 echo
+echo "=== download outcome decides the file's verdict ==="
+
+# ci18-7342 - the config path used to mark a file completed BEFORE downloading
+# and downgrade a failed download to a warning, so a run that wrote no files
+# still exited 0. There are three outcomes, not two: 2 means the archive is not
+# ready yet (HTTP 202), which must keep the file in the loop — translation_status
+# routinely reports a file ready a moment before its archive is, and failing
+# there would fail healthy runs.
+classify_download() {
+    local rc="$1"
+    completed_files=(); failed_files=(); still_monitoring=()
+    case $rc in
+        0) completed_files+=("f") ;;
+        2) still_monitoring+=("f") ;;
+        *) failed_files+=("f") ;;
+    esac
+}
+
+classify_download 0
+assert_eq "a successful download completes the file" "${#completed_files[@]}" "1"
+assert_eq "a successful download is not failed" "${#failed_files[@]}" "0"
+
+classify_download 1
+assert_eq "a real download error fails the file" "${#failed_files[@]}" "1"
+assert_eq "a real download error does not complete it" "${#completed_files[@]}" "0"
+
+classify_download 2
+assert_eq "a not-ready archive keeps polling" "${#still_monitoring[@]}" "1"
+assert_eq "a not-ready archive is not failed" "${#failed_files[@]}" "0"
+assert_eq "a not-ready archive is not completed" "${#completed_files[@]}" "0"
+
+echo
 echo "=========================================="
 echo "Total:  $test_count"
 echo -e "Passed: ${GREEN}${passed_count}${NC}"
