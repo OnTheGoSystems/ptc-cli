@@ -580,6 +580,33 @@ parse_config_file() {
         fi
     fi
     
+    # ci18-7342 - the README has always documented these two as config keys, but
+    # nothing read them: they were flags only. In CI that made the polling
+    # ceiling (100 x 5s ~ 8.3 min) unreachable, because the GitHub action and the
+    # GitLab component pass neither flag - a big project timed out and, with the
+    # old exit handling, still went green. Flags still win over the config.
+    if [[ "$PTC_MONITOR_INTERVAL" == "5" ]]; then
+        local config_monitor_interval
+        config_monitor_interval=$(grep '^monitor_interval:' "$config_file" 2>/dev/null | sed 's/^monitor_interval: *//' | sed 's/ *$//')
+        if [[ "$config_monitor_interval" =~ ^[0-9]+$ ]] && [[ "$config_monitor_interval" -gt 0 ]]; then
+            PTC_MONITOR_INTERVAL="$config_monitor_interval"
+            log_debug "Loaded monitor_interval from config: $PTC_MONITOR_INTERVAL"
+        elif [[ -n "$config_monitor_interval" ]]; then
+            log_warning "Ignoring invalid 'monitor_interval: $config_monitor_interval' in $config_file (expected a positive integer)."
+        fi
+    fi
+
+    if [[ "$PTC_MONITOR_MAX_ATTEMPTS" == "100" ]]; then
+        local config_monitor_attempts
+        config_monitor_attempts=$(grep '^monitor_max_attempts:' "$config_file" 2>/dev/null | sed 's/^monitor_max_attempts: *//' | sed 's/ *$//')
+        if [[ "$config_monitor_attempts" =~ ^[0-9]+$ ]] && [[ "$config_monitor_attempts" -gt 0 ]]; then
+            PTC_MONITOR_MAX_ATTEMPTS="$config_monitor_attempts"
+            log_debug "Loaded monitor_max_attempts from config: $PTC_MONITOR_MAX_ATTEMPTS"
+        elif [[ -n "$config_monitor_attempts" ]]; then
+            log_warning "Ignoring invalid 'monitor_max_attempts: $config_monitor_attempts' in $config_file (expected a positive integer)."
+        fi
+    fi
+
     # The api_token: config key is deprecated (ci18-7251 §6): a token in a
     # committed file is a leak waiting to happen. Warn whenever the key is present
     # (even with an empty value) and ignore it; the token must come from the
@@ -925,6 +952,7 @@ perform_status_action() {
     local files=("$@")
     local base_dir=$(get_base_directory)
     local checked_files=()
+    local problem_files=()
     
     log_info "=== STATUS ACTION: Checking translation status for all files ==="
     for file in "${files[@]}"; do
@@ -943,17 +971,29 @@ perform_status_action() {
                 local status_result=$?
                 if [[ $status_result -eq 1 ]]; then
                     log_warning "Status check failed or no translations found: $relative_file_path"
+                    problem_files+=("$file")
                 elif [[ $status_result -eq 2 ]]; then
                     log_info "Translation still in progress: $relative_file_path"
                 elif [[ $status_result -eq 3 ]]; then
                     log_error "Translation failed and will not complete: $relative_file_path"
+                    problem_files+=("$file")
                 fi
                 checked_files+=("$file")
             fi
         fi
     done
-    
+
     log_info "Status check completed for ${#checked_files[@]} file(s)"
+
+    # ci18-7342 - "still in progress" is a legitimate answer and stays exit 0,
+    # but a terminal failure or an unreadable status must not. This used to
+    # return 0 unconditionally, so a gate built on `--action status` passed
+    # even when the translation had definitively failed.
+    if [[ ${#problem_files[@]} -gt 0 ]]; then
+        log_error "Status check found ${#problem_files[@]} file(s) that failed or could not be read"
+        return 1
+    fi
+
     return 0
 }
 
@@ -1243,14 +1283,23 @@ process_files_in_steps() {
         done
     fi
     
-    # Return success if at least one file completed successfully
+    # ci18-7342 - a partial run is not a success. This used to return 0 as soon
+    # as ONE file completed, so nine failures out of ten still exited green and
+    # the pipeline reported a translation run that never happened. Anything
+    # failed or still unfinished is a non-zero exit; CI decides what to do with
+    # it. Exit codes are documented in the README under "Exit codes".
+    if [[ ${#failed_files[@]} -gt 0 || ${#monitoring_files[@]} -gt 0 ]]; then
+        log_error "Run incomplete: ${#completed_files[@]} completed, ${#failed_files[@]} failed, ${#monitoring_files[@]} unfinished"
+        return 1
+    fi
+
     if [[ ${#completed_files[@]} -gt 0 ]]; then
         log_success "Step-based processing completed successfully"
         return 0
-    else
-        log_error "No files completed successfully"
-        return 1
     fi
+
+    log_error "No files completed successfully"
+    return 1
 }
 
 # Function to process files in steps with config file support (for --config-file mode)
@@ -1464,14 +1513,23 @@ process_files_in_steps_with_config() {
         done
     fi
     
-    # Return success if at least one file completed successfully
+    # ci18-7342 - a partial run is not a success. This used to return 0 as soon
+    # as ONE file completed, so nine failures out of ten still exited green and
+    # the pipeline reported a translation run that never happened. Anything
+    # failed or still unfinished is a non-zero exit; CI decides what to do with
+    # it. Exit codes are documented in the README under "Exit codes".
+    if [[ ${#failed_files[@]} -gt 0 || ${#monitoring_files[@]} -gt 0 ]]; then
+        log_error "Run incomplete: ${#completed_files[@]} completed, ${#failed_files[@]} failed, ${#monitoring_files[@]} unfinished"
+        return 1
+    fi
+
     if [[ ${#completed_files[@]} -gt 0 ]]; then
         log_success "Step-based processing completed successfully"
         return 0
-    else
-        log_error "No files completed successfully"
-        return 1
     fi
+
+    log_error "No files completed successfully"
+    return 1
 }
 
 # Function to process files in steps with explicit output files (for --files mode)
@@ -1665,14 +1723,23 @@ process_files_in_steps_with_outputs() {
         done
     fi
     
-    # Return success if at least one file completed successfully
+    # ci18-7342 - a partial run is not a success. This used to return 0 as soon
+    # as ONE file completed, so nine failures out of ten still exited green and
+    # the pipeline reported a translation run that never happened. Anything
+    # failed or still unfinished is a non-zero exit; CI decides what to do with
+    # it. Exit codes are documented in the README under "Exit codes".
+    if [[ ${#failed_files[@]} -gt 0 || ${#monitoring_files[@]} -gt 0 ]]; then
+        log_error "Run incomplete: ${#completed_files[@]} completed, ${#failed_files[@]} failed, ${#monitoring_files[@]} unfinished"
+        return 1
+    fi
+
     if [[ ${#completed_files[@]} -gt 0 ]]; then
         log_success "Step-based processing completed successfully"
         return 0
-    else
-        log_error "No files completed successfully"
-        return 1
     fi
+
+    log_error "No files completed successfully"
+    return 1
 }
 
 # Function to process a single file
