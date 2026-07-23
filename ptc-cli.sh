@@ -122,6 +122,51 @@ json_bool_field() {
     fi
 }
 
+# ci18-7342 - a rejected request reaches us in one of two shapes, depending on
+# which server build answers:
+#
+#   older: HTTP 200  + {"success":false,"message":"Unprocessable Entity","code":422,...}
+#   newer: HTTP 422  + the same body
+#
+# Trusting the status alone reads the first shape as success. That is how a
+# rejected `process` call used to print "processing started successfully" and
+# leave CI green with no translations, and how `download` used to save the JSON
+# error body as a .zip and try to unpack it. Production and staging will not
+# flip on the same day, so the CLI has to read both the same way - the body is
+# the authority when it disagrees with the status.
+#
+# Returns 0 (true, in shell terms) when the response is a failure.
+response_indicates_failure() {
+    local http_code="$1" body="${2:-}"
+
+    # Anything outside 2xx is a failure regardless of what the body claims.
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        return 0
+    fi
+
+    # A 2xx that carries an explicit "success": false is the older shape.
+    [[ "$(json_bool_field "$body" "success")" == "false" ]]
+}
+
+# Human-readable reason for a rejected response, for the log line that follows.
+# The API answers with a numeric code array (`"errors":[1]`) and no prose, so
+# there is a limit to how specific this can be - surface what there is rather
+# than dropping it.
+describe_api_failure() {
+    local http_code="$1" body="${2:-}"
+    local message codes
+
+    message=$(json_string_field "$body" "message")
+    codes=$(printf '%s' "$body" | tr '\n' ' ' \
+        | grep -Eo '"errors"[[:space:]]*:[[:space:]]*\[[^]]*\]' \
+        | head -n 1 | sed -E 's/^"errors"[[:space:]]*:[[:space:]]*//') || true
+
+    local description="HTTP $http_code"
+    [[ -n "$message" ]] && description="$description: $message"
+    [[ -n "$codes" ]] && description="$description (error codes: $codes)"
+    printf '%s' "$description"
+}
+
 # Returns a nested object as raw JSON, so a caller can read a field from it
 # without colliding with a same-named key elsewhere in the document
 # (for example "iso", which appears in both source_language and languages[]).
@@ -535,6 +580,33 @@ parse_config_file() {
         fi
     fi
     
+    # ci18-7342 - the README has always documented these two as config keys, but
+    # nothing read them: they were flags only. In CI that made the polling
+    # ceiling (100 x 5s ~ 8.3 min) unreachable, because the GitHub action and the
+    # GitLab component pass neither flag - a big project timed out and, with the
+    # old exit handling, still went green. Flags still win over the config.
+    if [[ "$PTC_MONITOR_INTERVAL" == "5" ]]; then
+        local config_monitor_interval
+        config_monitor_interval=$(grep '^monitor_interval:' "$config_file" 2>/dev/null | sed 's/^monitor_interval: *//' | sed 's/ *$//')
+        if [[ "$config_monitor_interval" =~ ^[0-9]+$ ]] && [[ "$config_monitor_interval" -gt 0 ]]; then
+            PTC_MONITOR_INTERVAL="$config_monitor_interval"
+            log_debug "Loaded monitor_interval from config: $PTC_MONITOR_INTERVAL"
+        elif [[ -n "$config_monitor_interval" ]]; then
+            log_warning "Ignoring invalid 'monitor_interval: $config_monitor_interval' in $config_file (expected a positive integer)."
+        fi
+    fi
+
+    if [[ "$PTC_MONITOR_MAX_ATTEMPTS" == "100" ]]; then
+        local config_monitor_attempts
+        config_monitor_attempts=$(grep '^monitor_max_attempts:' "$config_file" 2>/dev/null | sed 's/^monitor_max_attempts: *//' | sed 's/ *$//')
+        if [[ "$config_monitor_attempts" =~ ^[0-9]+$ ]] && [[ "$config_monitor_attempts" -gt 0 ]]; then
+            PTC_MONITOR_MAX_ATTEMPTS="$config_monitor_attempts"
+            log_debug "Loaded monitor_max_attempts from config: $PTC_MONITOR_MAX_ATTEMPTS"
+        elif [[ -n "$config_monitor_attempts" ]]; then
+            log_warning "Ignoring invalid 'monitor_max_attempts: $config_monitor_attempts' in $config_file (expected a positive integer)."
+        fi
+    fi
+
     # The api_token: config key is deprecated (ci18-7251 §6): a token in a
     # committed file is a leak waiting to happen. Warn whenever the key is present
     # (even with an empty value) and ignore it; the token must come from the
@@ -880,6 +952,7 @@ perform_status_action() {
     local files=("$@")
     local base_dir=$(get_base_directory)
     local checked_files=()
+    local problem_files=()
     
     log_info "=== STATUS ACTION: Checking translation status for all files ==="
     for file in "${files[@]}"; do
@@ -898,17 +971,29 @@ perform_status_action() {
                 local status_result=$?
                 if [[ $status_result -eq 1 ]]; then
                     log_warning "Status check failed or no translations found: $relative_file_path"
+                    problem_files+=("$file")
                 elif [[ $status_result -eq 2 ]]; then
                     log_info "Translation still in progress: $relative_file_path"
                 elif [[ $status_result -eq 3 ]]; then
                     log_error "Translation failed and will not complete: $relative_file_path"
+                    problem_files+=("$file")
                 fi
                 checked_files+=("$file")
             fi
         fi
     done
-    
+
     log_info "Status check completed for ${#checked_files[@]} file(s)"
+
+    # ci18-7342 - "still in progress" is a legitimate answer and stays exit 0,
+    # but a terminal failure or an unreadable status must not. This used to
+    # return 0 unconditionally, so a gate built on `--action status` passed
+    # even when the translation had definitively failed.
+    if [[ ${#problem_files[@]} -gt 0 ]]; then
+        log_error "Status check found ${#problem_files[@]} file(s) that failed or could not be read"
+        return 1
+    fi
+
     return 0
 }
 
@@ -1198,14 +1283,23 @@ process_files_in_steps() {
         done
     fi
     
-    # Return success if at least one file completed successfully
+    # ci18-7342 - a partial run is not a success. This used to return 0 as soon
+    # as ONE file completed, so nine failures out of ten still exited green and
+    # the pipeline reported a translation run that never happened. Anything
+    # failed or still unfinished is a non-zero exit; CI decides what to do with
+    # it. Exit codes are documented in the README under "Exit codes".
+    if [[ ${#failed_files[@]} -gt 0 || ${#monitoring_files[@]} -gt 0 ]]; then
+        log_error "Run incomplete: ${#completed_files[@]} completed, ${#failed_files[@]} failed, ${#monitoring_files[@]} unfinished"
+        return 1
+    fi
+
     if [[ ${#completed_files[@]} -gt 0 ]]; then
         log_success "Step-based processing completed successfully"
         return 0
-    else
-        log_error "No files completed successfully"
-        return 1
     fi
+
+    log_error "No files completed successfully"
+    return 1
 }
 
 # Function to process files in steps with config file support (for --config-file mode)
@@ -1419,308 +1513,23 @@ process_files_in_steps_with_config() {
         done
     fi
     
-    # Return success if at least one file completed successfully
+    # ci18-7342 - a partial run is not a success. This used to return 0 as soon
+    # as ONE file completed, so nine failures out of ten still exited green and
+    # the pipeline reported a translation run that never happened. Anything
+    # failed or still unfinished is a non-zero exit; CI decides what to do with
+    # it. Exit codes are documented in the README under "Exit codes".
+    if [[ ${#failed_files[@]} -gt 0 || ${#monitoring_files[@]} -gt 0 ]]; then
+        log_error "Run incomplete: ${#completed_files[@]} completed, ${#failed_files[@]} failed, ${#monitoring_files[@]} unfinished"
+        return 1
+    fi
+
     if [[ ${#completed_files[@]} -gt 0 ]]; then
         log_success "Step-based processing completed successfully"
         return 0
-    else
-        log_error "No files completed successfully"
-        return 1
     fi
-}
 
-# Function to process files in steps with explicit output files (for --files mode)
-process_files_in_steps_with_outputs() {
-    local files=("$@")
-    local base_dir=$(get_base_directory)
-    local uploaded_files=()
-    local processed_files=()
-    
-    # Parse output files array
-    local -a output_files_array
-    IFS=',' read -ra output_files_array <<< "$PTC_OUTPUT_FILE_PATHS"
-    
-    # Step 1: Upload all files
-    log_info "=== STEP 1: Uploading all files ==="
-    for i in "${!files[@]}"; do
-        local file="${files[$i]}"
-        local output_pattern="${output_files_array[$i]}"
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
-        
-        if [[ "$PTC_DRY_RUN" == "true" ]]; then
-            log_info "[DRY RUN] Would upload file: $relative_file_path with output: $output_pattern"
-            uploaded_files+=("$file")
-        else
-            log_info "Uploading file: $relative_file_path with output: $output_pattern"
-            
-            if make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" ""; then
-                uploaded_files+=("$file")
-                log_success "Upload completed: $relative_file_path"
-            else
-                log_error "Upload failed: $relative_file_path"
-            fi
-        fi
-    done
-    
-    if [[ ${#uploaded_files[@]} -eq 0 ]]; then
-        log_error "No files were uploaded successfully"
-        return 1
-    fi
-    
-    log_info "Successfully uploaded ${#uploaded_files[@]} file(s)"
-    
-    # Step 2: Start processing for all uploaded files
-    log_info "=== STEP 2: Starting processing for all uploaded files ==="
-    for file in "${uploaded_files[@]}"; do
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
-        
-        if [[ "$PTC_DRY_RUN" == "true" ]]; then
-            log_info "[DRY RUN] Would start processing: $relative_file_path"
-            processed_files+=("$file")
-        else
-            log_info "Starting processing: $relative_file_path"
-            
-            if start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
-                processed_files+=("$file")
-                log_success "Processing started: $relative_file_path"
-            else
-                log_error "Processing failed to start: $relative_file_path"
-            fi
-        fi
-    done
-    
-    if [[ ${#processed_files[@]} -eq 0 ]]; then
-        log_error "No files were processed successfully"
-        return 1
-    fi
-    
-    log_info "Successfully started processing for ${#processed_files[@]} file(s)"
-    
-    # Step 3: Monitor and download all processed files
-    log_info "=== STEP 3: Monitoring and downloading translations ==="
-    
-    if [[ "$PTC_DRY_RUN" == "true" ]]; then
-        for file in "${processed_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
-            log_info "[DRY RUN] Would monitor and download: $relative_file_path"
-        done
-        log_success "Step-based processing completed successfully"
-        return 0
-    fi
-    
-    # Initialize file status tracking
-    local file_status_keys=()
-    local file_status_values=()
-    local monitoring_files=("${processed_files[@]}")
-    local completed_files=()
-    local failed_files=()
-    local round=1
-    
-    # Initialize all files as unknown status
-    for file in "${monitoring_files[@]}"; do
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
-        set_file_status "$relative_file_path" "unknown"
-    done
-    
-    log_info ""
-    log_info "Starting translation monitoring..."
-    
-    # Monitoring loop
-    while [[ ${#monitoring_files[@]} -gt 0 ]] && [[ $round -le $PTC_MONITOR_MAX_ATTEMPTS ]]; do
-        local still_monitoring=()
-        
-        for file in "${monitoring_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
-            
-            # Get current status
-            local status_output
-            status_output=$(get_translation_status_quiet "$relative_file_path" "$PTC_FILE_TAG_NAME")
-            local status=$(echo "$status_output" | cut -d'|' -f1)
-            set_file_status "$relative_file_path" "$status"
-            
-            local file_action=0
-            classify_monitored_status "$status" "$relative_file_path" || file_action=$?
-
-            case $file_action in
-                0)
-                    completed_files+=("$file")
-                    # Download translations
-                    if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir"; then
-                        log_debug "Downloaded translations for: $relative_file_path"
-                    else
-                        log_warning "Failed to download translations for: $relative_file_path"
-                    fi
-                    ;;
-                1)
-                    failed_files+=("$file")
-                    ;;
-                *)
-                    still_monitoring+=("$file")
-                    ;;
-            esac
-        done
-        
-        # Build status string
-        local status_string=""
-        for file in "${monitoring_files[@]}"; do
-            local relative_file_path_status=$(get_relative_path "$file" "$base_dir")
-            local file_status
-            file_status=$(get_file_status "$relative_file_path_status")
-            local status_char
-            status_char=$(get_status_char "$file_status")
-            status_string="${status_string}${status_char}"
-        done
-        
-        # Display compact status
-        display_file_status "${#completed_files[@]}" "${#monitoring_files[@]}" "$round" "$PTC_MONITOR_MAX_ATTEMPTS" "$status_string"
-        
-        # Update monitoring array for next round
-        if [[ ${#still_monitoring[@]} -gt 0 ]]; then
-            monitoring_files=("${still_monitoring[@]}")
-        else
-            monitoring_files=()
-        fi
-        
-        # Wait before next round if files are still being monitored
-        if [[ ${#monitoring_files[@]} -gt 0 ]] && [[ $round -lt $PTC_MONITOR_MAX_ATTEMPTS ]]; then
-            sleep "$PTC_MONITOR_INTERVAL"
-        fi
-        
-        ((round++))
-    done
-    
-    # Final newline after compact status
-    echo
-    
-    # Report final results
-    log_info "=== FINAL RESULTS ==="
-    log_success "Completed files: ${#completed_files[@]}"
-    if [[ ${#completed_files[@]} -gt 0 ]]; then
-        for file in "${completed_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
-            log_success "  ✓ $relative_file_path"
-        done
-    fi
-    
-    if [[ ${#failed_files[@]} -gt 0 ]]; then
-        log_error "Failed files: ${#failed_files[@]}"
-        for file in "${failed_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
-            log_error "  ✗ $relative_file_path"
-        done
-    fi
-    
-    if [[ ${#monitoring_files[@]} -gt 0 ]]; then
-        log_warning "Timed out files: ${#monitoring_files[@]}"
-        for file in "${monitoring_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
-            log_warning "  ⏱ $relative_file_path"
-            log_info "  You can check status manually with:"
-            log_info "    curl -H \"Authorization: Bearer \$TOKEN\" \"${PTC_API_URL}source_files/translation_status?file_path=$relative_file_path&file_tag_name=$PTC_FILE_TAG_NAME\""
-        done
-    fi
-    
-    # Return success if at least one file completed successfully
-    if [[ ${#completed_files[@]} -gt 0 ]]; then
-        log_success "Step-based processing completed successfully"
-        return 0
-    else
-        log_error "No files completed successfully"
-        return 1
-    fi
-}
-
-# Function to process a single file
-process_single_file() {
-    local file="$1"
-    
-    # Get base directory and relative paths
-    local base_dir=$(get_base_directory)
-    local relative_file_path=$(get_relative_path "$file" "$base_dir")
-    
-    if [[ "$PTC_DRY_RUN" == "true" ]]; then
-        log_info "[DRY RUN] Processing file: $relative_file_path"
-        log_debug "[DRY RUN] File tag name: $PTC_FILE_TAG_NAME"
-        log_debug "[DRY RUN] Base directory: $base_dir"
-        
-        # Generate output pattern for dry run display
-        local filename=$(basename "$relative_file_path")
-        local dirname=$(dirname "$relative_file_path")
-        local lang_placeholder="{{lang}}"
-        local output_filename="${filename//$PTC_SOURCE_LOCALE/$lang_placeholder}"
-        
-        if [[ "$dirname" == "." ]]; then
-            local output_pattern="$output_filename"
-        else
-            local output_pattern="$dirname/$output_filename"
-        fi
-        
-        log_debug "[DRY RUN] Output pattern: $output_pattern"
-        log_info "[DRY RUN] Would upload file to PTC API"
-        log_info "[DRY RUN] Would start file processing"
-        log_info "[DRY RUN] Would monitor translation status"
-        log_info "[DRY RUN] Would download and unpack translations if ready"
-    else
-        log_info "Processing file: $relative_file_path"
-        log_debug "File tag name: $PTC_FILE_TAG_NAME"
-        log_debug "Base directory: $base_dir"
-        
-        # Prepare API call parameters using relative paths
-        local filename=$(basename "$relative_file_path")
-        local dirname=$(dirname "$relative_file_path")
-        local lang_placeholder="{{lang}}"
-        local output_filename="${filename//$PTC_SOURCE_LOCALE/$lang_placeholder}"
-        
-        local output_file_path
-        if [[ "$dirname" == "." ]]; then
-            output_file_path="$output_filename"
-        else
-            output_file_path="$dirname/$output_filename"
-        fi
-        
-        log_debug "Making API call to PTC..."
-        log_debug "  file_path: $relative_file_path"
-        log_debug "  output_file_path: $output_file_path" 
-        log_debug "  file_tag_name: $PTC_FILE_TAG_NAME"
-        
-        # Make API call to PTC with relative paths
-        if make_ptc_api_call "$file" "$relative_file_path" "$output_file_path" "$PTC_FILE_TAG_NAME" ""; then
-            # After successful upload, start file processing
-            log_info "Starting file processing..."
-            
-            if start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
-                # After successful processing start, monitor translation status until completion
-                log_info "Starting translation monitoring..."
-                
-                if monitor_translation_status "$relative_file_path" "$PTC_FILE_TAG_NAME" "$PTC_MONITOR_MAX_ATTEMPTS" "$PTC_MONITOR_INTERVAL"; then
-                    # Translations completed, download them
-                    log_info "Downloading completed translations..."
-                    if download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir"; then
-                        log_success "Translation workflow completed successfully"
-                    else
-                        log_warning "Download failed, but translations are ready"
-                    fi
-                else
-                    local monitor_result=$?
-                    case $monitor_result in
-                        1)
-                            log_warning "Translation status monitoring failed, but file processing was successful"
-                            ;;
-                        2)
-                            log_warning "Translation monitoring timed out. Translations may still be in progress."
-                            log_info "You can check status manually with:"
-                            log_info "  curl -H \"Authorization: Bearer \$TOKEN\" \"${PTC_API_URL}source_files/translation_status?file_path=$relative_file_path&file_tag_name=$PTC_FILE_TAG_NAME\""
-                            ;;
-                        3)
-                            log_warning "Translation reached a terminal failure state and will not complete."
-                            ;;
-                    esac
-                fi
-            else
-                log_warning "File processing failed, but file upload was successful"
-            fi
-        fi
-    fi
+    log_error "No files completed successfully"
+    return 1
 }
 
 # Validates the token and reports account state before any work starts, so the
@@ -2001,7 +1810,9 @@ EOF
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
-    if [[ "$http_code" == "201" ]]; then
+    # A 201 that still carries "success": false is a rejected upload dressed as
+    # a created one - the content-validation path answers that way (ci18-7342).
+    if [[ "$http_code" == "201" ]] && ! response_indicates_failure "$http_code" "$response_body"; then
         log_success "File uploaded successfully: $relative_file_path"
         if [[ "$PTC_VERBOSE" == "true" ]]; then
             log_info "=== API RESPONSE ==="
@@ -2013,7 +1824,7 @@ EOF
         fi
         log_debug "API response: $response_body"
     else
-        log_error "Failed to upload file: $relative_file_path (HTTP $http_code)"
+        log_error "Failed to upload file: $relative_file_path ($(describe_api_failure "$http_code" "$response_body"))"
         if [[ "$PTC_VERBOSE" == "true" ]]; then
             log_info "=== API ERROR RESPONSE ==="
             log_info "HTTP Status: $http_code"
@@ -2062,15 +1873,15 @@ start_processing() {
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
-    if [[ "$http_code" == "200" ]]; then
-        log_success "File processing started successfully: $relative_file_path"
-        log_debug "Process API response: $response_body"
-        return 0
-    else
-        log_error "Failed to start file processing: $relative_file_path (HTTP $http_code)"
+    if response_indicates_failure "$http_code" "$response_body"; then
+        log_error "Failed to start file processing: $relative_file_path ($(describe_api_failure "$http_code" "$response_body"))"
         log_debug "Process API response: $response_body"
         return 1
     fi
+
+    log_success "File processing started successfully: $relative_file_path"
+    log_debug "Process API response: $response_body"
+    return 0
 }
 
 # Function to get translation status quietly (for compact monitoring)
@@ -2112,6 +1923,13 @@ get_translation_status_quiet() {
     log_debug "HTTP Code: $http_code"
     log_debug "Response Body: $response_body"
     
+    # A rejected status query answers 200-with-"success":false on older servers
+    # (ci18-7342); without this it parses as an absent status and polls on.
+    if [[ "$http_code" == "200" ]] && response_indicates_failure "$http_code" "$response_body"; then
+        log_debug "Status query rejected: $(describe_api_failure "$http_code" "$response_body")"
+        return 1
+    fi
+
     if [[ "$http_code" == "200" ]]; then
         # Fields live under a "translation_status" wrapper; see the note in
         # check_translation_status.
@@ -2183,6 +2001,13 @@ check_translation_status() {
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
+    # Same two-shape rejection as elsewhere (ci18-7342): do not report a
+    # rejected query as a retrieved status.
+    if [[ "$http_code" == "200" ]] && response_indicates_failure "$http_code" "$response_body"; then
+        log_error "Failed to check translation status: $relative_file_path ($(describe_api_failure "$http_code" "$response_body"))"
+        return 1
+    fi
+
     if [[ "$http_code" == "200" ]]; then
         log_success "Translation status retrieved successfully: $relative_file_path"
         log_debug "Status API response: $response_body"
@@ -2455,9 +2280,23 @@ download_translations() {
         return 1
     fi
     
+    # curl wrote the body straight to $temp_zip, so on the older server shape a
+    # rejected download lands here as a 200 whose "zip" is really the JSON error
+    # envelope. Read the file back before trusting the status (ci18-7342).
+    local download_body=""
+    if [[ -f "$temp_zip" ]] && [[ "$(head -c 1 "$temp_zip" 2>/dev/null)" == "{" ]]; then
+        download_body=$(head -c 4096 "$temp_zip" 2>/dev/null)
+    fi
+
+    if response_indicates_failure "$http_code" "$download_body"; then
+        log_error "Failed to download translations: $relative_file_path ($(describe_api_failure "$http_code" "$download_body"))"
+        rm -f "$temp_zip"
+        return 1
+    fi
+
     if [[ "$http_code" == "200" ]]; then
         log_success "Translations downloaded successfully: $relative_file_path"
-        
+
         # Unpack ZIP and place files in correct directory structure
         if command -v unzip >/dev/null 2>&1; then
             # Get directory where the original file is located

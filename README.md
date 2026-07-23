@@ -284,6 +284,21 @@ During monitoring, you'll see compact status indicators (Each letter for one fil
 - 🔴 `F` - Failed
 - 🟡 `U` - Unknown
 
+### Exit codes
+
+The exit code is the CI-facing verdict, so it reports what actually happened rather than whether the script reached the end.
+
+| Code | Meaning |
+|------|---------|
+| `0` | Every file completed. For `--action status`, every file is either ready or still translating. |
+| `1` | Something did not complete: a file failed, a file was still unfinished when monitoring ran out, no files were found, the API rejected a request, or the arguments were invalid. |
+
+**A partial run is a failure.** If ten files are submitted and one fails, the exit code is `1`. The summary lines above it list what completed, what failed and what was left unfinished, so the log says which is which.
+
+**A timeout is a failure too.** Files still translating when `monitor_max_attempts` runs out are reported as unfinished and the run exits `1`. Raise `monitor_max_attempts` / `monitor_interval` (see [Configuration File Format](#configuration-file-format)) for projects that need longer than the default ~8 minutes.
+
+`--action status` is the exception worth knowing: a translation still in progress is a legitimate answer and exits `0`. Only a terminal failure, or a status that could not be read at all, exits `1`.
+
 ## CI/CD Usage
 
 ### Pinning the CLI version

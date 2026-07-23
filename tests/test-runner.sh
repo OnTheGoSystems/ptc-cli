@@ -162,29 +162,13 @@ test_wordpress_theme_pattern() {
     "$PTC_CLI" -s en -p 'languages/themes/wpsite-theme/{{lang}}_US.po' -d "$FIXTURES_DIR" --dry-run >/dev/null 2>&1
 }
 
-# Test: specific files with output file paths
-test_files_with_outputs() {
-    "$PTC_CLI" -s en -f 'sample-en.json,locales/de/common.json' -o 'sample-{{lang}}.json,locales/{{lang}}/common.json' -d "$FIXTURES_DIR" --dry-run >/dev/null 2>&1
-}
 
-# Test: error when files specified without output file paths
-test_files_without_outputs() {
-    ! "$PTC_CLI" -s en -f 'sample-en.json' -d "$FIXTURES_DIR" --dry-run >/dev/null 2>&1
-}
 
-# Test: error when files count doesn't match output file paths count
-test_files_count_mismatch() {
-    ! "$PTC_CLI" -s en -f 'sample-en.json,locales/de/common.json' -o 'sample-{{lang}}.json' -d "$FIXTURES_DIR" --dry-run >/dev/null 2>&1
-}
 
-# Test: error when both patterns and files are specified
-test_patterns_and_files_together() {
-    ! "$PTC_CLI" -s en -p 'sample-{{lang}}.json' -f 'sample-en.json' -o 'sample-{{lang}}.json' -d "$FIXTURES_DIR" --dry-run >/dev/null 2>&1
-}
 
-# Test: file not found error
+# Test: no file matches the pattern
 test_file_not_found() {
-    ! "$PTC_CLI" -s en -f 'nonexistent.json' -o 'nonexistent-{{lang}}.json' -d "$FIXTURES_DIR" --dry-run >/dev/null 2>&1
+    ! "$PTC_CLI" -s en -p 'nonexistent-{{lang}}.json' -d "$FIXTURES_DIR" --dry-run >/dev/null 2>&1
 }
 
 # Main function
@@ -215,11 +199,7 @@ main() {
     run_test "WordPress theme pattern" test_wordpress_theme_pattern
     run_test "Auto-detect file tag name" test_auto_detect_tag
     run_test "Explicit file tag name" test_explicit_tag
-    run_test "Files with output file paths" test_files_with_outputs
-    run_test "Files without output file paths (should fail)" test_files_without_outputs
-    run_test "Files count mismatch (should fail)" test_files_count_mismatch
-    run_test "Patterns and files together (should fail)" test_patterns_and_files_together
-    run_test "File not found (should fail)" test_file_not_found
+    run_test "No file matches the pattern (should fail)" test_file_not_found
     run_test "Missing files" test_missing_files
     
     # Cleanup
