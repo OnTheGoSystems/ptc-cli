@@ -122,6 +122,51 @@ json_bool_field() {
     fi
 }
 
+# ci18-7342 - a rejected request reaches us in one of two shapes, depending on
+# which server build answers:
+#
+#   older: HTTP 200  + {"success":false,"message":"Unprocessable Entity","code":422,...}
+#   newer: HTTP 422  + the same body
+#
+# Trusting the status alone reads the first shape as success. That is how a
+# rejected `process` call used to print "processing started successfully" and
+# leave CI green with no translations, and how `download` used to save the JSON
+# error body as a .zip and try to unpack it. Production and staging will not
+# flip on the same day, so the CLI has to read both the same way - the body is
+# the authority when it disagrees with the status.
+#
+# Returns 0 (true, in shell terms) when the response is a failure.
+response_indicates_failure() {
+    local http_code="$1" body="${2:-}"
+
+    # Anything outside 2xx is a failure regardless of what the body claims.
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        return 0
+    fi
+
+    # A 2xx that carries an explicit "success": false is the older shape.
+    [[ "$(json_bool_field "$body" "success")" == "false" ]]
+}
+
+# Human-readable reason for a rejected response, for the log line that follows.
+# The API answers with a numeric code array (`"errors":[1]`) and no prose, so
+# there is a limit to how specific this can be - surface what there is rather
+# than dropping it.
+describe_api_failure() {
+    local http_code="$1" body="${2:-}"
+    local message codes
+
+    message=$(json_string_field "$body" "message")
+    codes=$(printf '%s' "$body" | tr '\n' ' ' \
+        | grep -Eo '"errors"[[:space:]]*:[[:space:]]*\[[^]]*\]' \
+        | head -n 1 | sed -E 's/^"errors"[[:space:]]*:[[:space:]]*//') || true
+
+    local description="HTTP $http_code"
+    [[ -n "$message" ]] && description="$description: $message"
+    [[ -n "$codes" ]] && description="$description (error codes: $codes)"
+    printf '%s' "$description"
+}
+
 # Returns a nested object as raw JSON, so a caller can read a field from it
 # without colliding with a same-named key elsewhere in the document
 # (for example "iso", which appears in both source_language and languages[]).
@@ -2001,7 +2046,9 @@ EOF
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
-    if [[ "$http_code" == "201" ]]; then
+    # A 201 that still carries "success": false is a rejected upload dressed as
+    # a created one - the content-validation path answers that way (ci18-7342).
+    if [[ "$http_code" == "201" ]] && ! response_indicates_failure "$http_code" "$response_body"; then
         log_success "File uploaded successfully: $relative_file_path"
         if [[ "$PTC_VERBOSE" == "true" ]]; then
             log_info "=== API RESPONSE ==="
@@ -2013,7 +2060,7 @@ EOF
         fi
         log_debug "API response: $response_body"
     else
-        log_error "Failed to upload file: $relative_file_path (HTTP $http_code)"
+        log_error "Failed to upload file: $relative_file_path ($(describe_api_failure "$http_code" "$response_body"))"
         if [[ "$PTC_VERBOSE" == "true" ]]; then
             log_info "=== API ERROR RESPONSE ==="
             log_info "HTTP Status: $http_code"
@@ -2062,15 +2109,15 @@ start_processing() {
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
-    if [[ "$http_code" == "200" ]]; then
-        log_success "File processing started successfully: $relative_file_path"
-        log_debug "Process API response: $response_body"
-        return 0
-    else
-        log_error "Failed to start file processing: $relative_file_path (HTTP $http_code)"
+    if response_indicates_failure "$http_code" "$response_body"; then
+        log_error "Failed to start file processing: $relative_file_path ($(describe_api_failure "$http_code" "$response_body"))"
         log_debug "Process API response: $response_body"
         return 1
     fi
+
+    log_success "File processing started successfully: $relative_file_path"
+    log_debug "Process API response: $response_body"
+    return 0
 }
 
 # Function to get translation status quietly (for compact monitoring)
@@ -2112,6 +2159,13 @@ get_translation_status_quiet() {
     log_debug "HTTP Code: $http_code"
     log_debug "Response Body: $response_body"
     
+    # A rejected status query answers 200-with-"success":false on older servers
+    # (ci18-7342); without this it parses as an absent status and polls on.
+    if [[ "$http_code" == "200" ]] && response_indicates_failure "$http_code" "$response_body"; then
+        log_debug "Status query rejected: $(describe_api_failure "$http_code" "$response_body")"
+        return 1
+    fi
+
     if [[ "$http_code" == "200" ]]; then
         # Fields live under a "translation_status" wrapper; see the note in
         # check_translation_status.
@@ -2183,6 +2237,13 @@ check_translation_status() {
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
+    # Same two-shape rejection as elsewhere (ci18-7342): do not report a
+    # rejected query as a retrieved status.
+    if [[ "$http_code" == "200" ]] && response_indicates_failure "$http_code" "$response_body"; then
+        log_error "Failed to check translation status: $relative_file_path ($(describe_api_failure "$http_code" "$response_body"))"
+        return 1
+    fi
+
     if [[ "$http_code" == "200" ]]; then
         log_success "Translation status retrieved successfully: $relative_file_path"
         log_debug "Status API response: $response_body"
@@ -2455,9 +2516,23 @@ download_translations() {
         return 1
     fi
     
+    # curl wrote the body straight to $temp_zip, so on the older server shape a
+    # rejected download lands here as a 200 whose "zip" is really the JSON error
+    # envelope. Read the file back before trusting the status (ci18-7342).
+    local download_body=""
+    if [[ -f "$temp_zip" ]] && [[ "$(head -c 1 "$temp_zip" 2>/dev/null)" == "{" ]]; then
+        download_body=$(head -c 4096 "$temp_zip" 2>/dev/null)
+    fi
+
+    if response_indicates_failure "$http_code" "$download_body"; then
+        log_error "Failed to download translations: $relative_file_path ($(describe_api_failure "$http_code" "$download_body"))"
+        rm -f "$temp_zip"
+        return 1
+    fi
+
     if [[ "$http_code" == "200" ]]; then
         log_success "Translations downloaded successfully: $relative_file_path"
-        
+
         # Unpack ZIP and place files in correct directory structure
         if command -v unzip >/dev/null 2>&1; then
             # Get directory where the original file is located
