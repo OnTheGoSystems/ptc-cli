@@ -2669,12 +2669,29 @@ build_detect_payload() {
 call_detect_config() {
     local payload="$1"
     local response
-    response=$(ptc_curl -s -w "%{http_code}" \
-        -X POST \
-        -H "Authorization: Bearer $PTC_API_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d "$payload" \
-        "${PTC_API_URL}detect_config" 2>/dev/null) || true
+    # ci18-7276 - only send Authorization when a token exists. detect_config is
+    # anonymous, so an empty "Bearer " header is pointless and, on a stricter
+    # proxy, could be rejected as a malformed credential.
+    #
+    # An empty "${auth[@]}" under `set -u` is fatal on bash < 4.4 (macOS ships
+    # 3.2), so this only names the array when it is non-empty - same guard the
+    # pattern loop above uses.
+    local -a auth=()
+    [[ -n "$PTC_API_TOKEN" ]] && auth=(-H "Authorization: Bearer $PTC_API_TOKEN")
+    if [[ ${#auth[@]} -gt 0 ]]; then
+        response=$(ptc_curl -s -w "%{http_code}" \
+            -X POST \
+            "${auth[@]}" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "${PTC_API_URL}detect_config" 2>/dev/null) || true
+    else
+        response=$(ptc_curl -s -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "${PTC_API_URL}detect_config" 2>/dev/null) || true
+    fi
     printf '%s' "$response"
 }
 
@@ -2931,9 +2948,14 @@ cmd_init() {
         return 1
     fi
 
+    # ci18-7276 - `ptc init` no longer requires a token. detect_config is
+    # anonymous (ci18-7275), and config generation is the step a developer runs
+    # BEFORE they have a token - so demanding one here blocked the exact
+    # first-use path it exists to serve, including trial orgs that cannot mint a
+    # token at all. A token, if present, is still forwarded (harmless; the
+    # endpoint ignores it), so a token-in-env run is unchanged.
     if [[ -z "$PTC_API_TOKEN" ]]; then
-        log_error "No API token provided. Set PTC_API_TOKEN or pass --api-token."
-        return 1
+        log_debug "No API token set; detect_config is anonymous, continuing without one."
     fi
 
     log_info "Scanning $project_dir for translatable files..."
