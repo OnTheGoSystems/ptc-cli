@@ -2810,42 +2810,45 @@ detect_ci_provider() {
     fi
 }
 
+# ci18-7254 - the snippet runs through ptc-action rather than curling the CLI
+# itself. The action SHA-pins ptc-cli and third-party actions, ships the right
+# runner image, and is loop-safe (stable PR branch + a [skip translations]
+# guard) - none of which a hand-rolled curl step gets for free. This is the same
+# recipe the in-product token screen prints (ci18-7253), so the CLI, the product
+# and the action README no longer drift. The CLI stays usable on its own - see
+# the standalone note print_ci_block adds below.
 render_ci_github() {
     cat <<'EOF'
 name: PTC Translations
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
   translate:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
-      - uses: actions/checkout@v4
-      - name: Run PTC CLI
-        env:
-          PTC_API_TOKEN: ${{ secrets.PTC_API_TOKEN }}
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.0/ptc-cli.sh -o ptc-cli.sh
-          chmod +x ptc-cli.sh
-          ./ptc-cli.sh --config-file .ptc-config.yml --verbose
+      - uses: actions/checkout@v7
+      - uses: OnTheGoSystems/ptc-action@v1
+        with:
+          api-token: ${{ secrets.PTC_API_TOKEN }}
+          config-file: .ptc-config.yml
+          create-pr: true
 EOF
 }
 
 render_ci_gitlab() {
     cat <<'EOF'
-ptc_translations:
-  stage: deploy
-  script:
-    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.0/ptc-cli.sh -o ptc-cli.sh
-    - chmod +x ptc-cli.sh
-    - ./ptc-cli.sh --config-file .ptc-config.yml --verbose
-  variables:
-    PTC_API_TOKEN: "$PTC_API_TOKEN"
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "web"
+include:
+  - component: $CI_SERVER_FQDN/OnTheGoSystems/ptc-action/translate@1
+    inputs:
+      config-file: .ptc-config.yml
+      open-mr: 'true'
 EOF
 }
 
@@ -2868,10 +2871,15 @@ print_ci_block() {
         *)
             printf '\n# GitHub Actions — .github/workflows/ptc.yml:\n'
             render_ci_github
-            printf '\n# GitLab CI — .gitlab-ci.yml:\n'
+            printf '\n# GitLab CI — .gitlab-ci.yml (store PTC_API_TOKEN as a masked CI/CD variable):\n'
             render_ci_gitlab
             ;;
     esac
+    # The action/component is the maintained path - it pins ptc-cli by checksum,
+    # brings its own runner image and is loop-safe. The CLI still runs on its
+    # own for any other CI, a cron, or a local check; wrap this in any step:
+    printf '\n# Prefer the action/component above. To run the CLI directly instead:\n'
+    printf '#   ./ptc-cli.sh --config-file .ptc-config.yml\n'
     printf '\n'
 }
 
