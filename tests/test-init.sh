@@ -368,6 +368,30 @@ test_env_token_survives_startup() {
     assert_eq "env token is retained after sourcing" "$got" "env-tok"
 }
 
+# ci18-7254: the CI snippets run through ptc-action, not a hand-rolled curl of
+# the CLI. Guards against a regression back to a floating tag / old version /
+# a GitLab job with no runner image.
+test_ci_snippets_use_action() {
+    echo "--- CI snippets run through ptc-action"
+
+    local gh gl block
+    gh=$(render_ci_github)
+    gl=$(render_ci_gitlab)
+    block=$(print_ci_block "$(mktemp -d)")
+
+    assert_contains "github uses the action" "$gh" "uses: OnTheGoSystems/ptc-action@v1"
+    assert_contains "github checkout is v7" "$gh" "actions/checkout@v7"
+    assert_contains "github passes the config file" "$gh" "config-file: .ptc-config.yml"
+    assert_not_contains "github does not curl the raw CLI" "$gh" "raw.githubusercontent"
+    assert_not_contains "github does not pin an old checkout" "$gh" "checkout@v4"
+
+    assert_contains "gitlab includes the component" "$gl" "OnTheGoSystems/ptc-action/translate@1"
+    assert_not_contains "gitlab does not curl the raw CLI" "$gl" "raw.githubusercontent"
+
+    # The standalone path is still offered, so the CLI does not depend on the action.
+    assert_contains "standalone CLI usage is still shown" "$block" "./ptc-cli.sh --config-file .ptc-config.yml"
+}
+
 # §6: the api_token: config key is deprecated. It must be ignored (never loaded
 # into PTC_API_TOKEN) and must produce a warning. parse_config_file runs in the
 # current shell (NOT a subshell) so the "not loaded" assertion can actually
@@ -465,6 +489,7 @@ main() {
     test_cmd_init_no_token
     test_cmd_init_env_token
     test_env_token_survives_startup
+    test_ci_snippets_use_action
     test_config_api_token_deprecated
     test_ptcignore_last_path_ignored
     test_cmd_init_url_normalization
