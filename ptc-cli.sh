@@ -8,7 +8,7 @@ set -euo pipefail  # Strict mode: exit on errors, undefined variables and pipe e
 # Constants
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly VERSION="1.0.1"
+readonly VERSION="1.0.2"
 readonly PTC_USER_AGENT="ptc-cli/${VERSION}"
 
 # Colors for output
