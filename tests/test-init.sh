@@ -312,18 +312,30 @@ test_cmd_init_404_gate() {
     rm -rf "$dir"
 }
 
-test_cmd_init_missing_token() {
-    echo "--- cmd_init requires a token"
+test_cmd_init_no_token() {
+    echo "--- cmd_init works without a token (ci18-7276)"
 
     local saved="$PTC_API_TOKEN"
+    MOCK_DETECT_BODY="$RAILS_BODY"; MOCK_DETECT_CODE="200"
     PTC_API_TOKEN=""   # no --api-token and no inherited env token
-    local dir out
+
+    local dir args
     dir=$(mktemp -d)
-    out=$(cmd_init --project-dir "$dir" --yes 2>&1 </dev/null)
+    printf '{}' > "$dir/en.yml"
+    args=$(mktemp)
+    MOCK_ARGS_FILE="$args" cmd_init --project-dir "$dir" --yes >/dev/null 2>&1 </dev/null
     local rc=$?
-    assert_eq "missing token returns non-zero" "$rc" "1"
-    assert_contains "missing token is explained" "$out" "No API token"
-    rm -rf "$dir"
+    assert_eq "detect_config is anonymous, so init succeeds with no token" "$rc" "0"
+    assert_eq "the config is written" "$([[ -f "$dir/.ptc-config.yml" ]] && echo yes)" "yes"
+    # detect_config must not carry an empty Bearer credential.
+    if grep -q "Authorization: Bearer *$" "$args" 2>/dev/null; then
+        fail "no empty Authorization header is sent without a token"
+    else
+        pass "no empty Authorization header is sent without a token"
+    fi
+
+    MOCK_ARGS_FILE=""
+    rm -rf "$dir" "$args"
     PTC_API_TOKEN="$saved"
 }
 
@@ -450,7 +462,7 @@ main() {
     test_cmd_init_refuses_overwrite
     test_cmd_init_422
     test_cmd_init_404_gate
-    test_cmd_init_missing_token
+    test_cmd_init_no_token
     test_cmd_init_env_token
     test_env_token_survives_startup
     test_config_api_token_deprecated
