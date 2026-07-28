@@ -2842,13 +2842,49 @@ jobs:
 EOF
 }
 
+# GitLab resolves `include: component:` only against its OWN instance - the
+# $CI_SERVER_FQDN in a component address is always the customer's server. A
+# component we publish on one GitLab is therefore unreachable from gitlab.com
+# or from any self-hosted instance, so the component address was a recipe that
+# could never resolve for a customer. This prints the job inline instead: same
+# loop-safe rules and same stable ptc/translations branch as the component, no
+# cross-instance dependency. The CLI is pinned to this script's own version tag
+# so the snippet is reproducible; add a sha256sum check if you want the same
+# checksum guarantee the GitHub action gets from vendoring.
 render_ci_gitlab() {
-    cat <<'EOF'
-include:
-  - component: $CI_SERVER_FQDN/OnTheGoSystems/ptc-action/translate@1
-    inputs:
-      config-file: .ptc-config.yml
-      open-mr: 'true'
+    cat <<EOF
+ptc-translate:
+  stage: deploy
+  image: alpine:3.22
+  # Loop-safe twice over: the job only runs on a push to the default branch (the
+  # translation push targets ptc/translations, so it cannot retrigger this job),
+  # and the commit carries [skip ci] - the only skip token GitLab honours. The
+  # GitHub-side convention this recipe used before means nothing to GitLab.
+  rules:
+    - if: '\$CI_PIPELINE_SOURCE == "push" && \$CI_COMMIT_BRANCH == \$CI_DEFAULT_BRANCH'
+  before_script:
+    - apk add --no-cache bash curl git jq
+  script:
+    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v${VERSION}/ptc-cli.sh -o ptc-cli.sh
+    - chmod +x ptc-cli.sh
+    - ./ptc-cli.sh --config-file .ptc-config.yml
+    # Pushing needs a token that may write to the repository. CI_JOB_TOKEN can,
+    # but ONLY if a maintainer turns on Settings > CI/CD > Job token permissions
+    # > "Allow Git push requests to the repository" (GitLab 18.4+, off by
+    # default). Otherwise set PTC_GIT_PUSH_TOKEN to a project access token with
+    # the write_repository scope, as a masked CI/CD variable.
+    - |
+      if ! git diff --quiet; then
+        git config user.email "ci@ptc"
+        git config user.name "PTC Translate"
+        git checkout -B ptc/translations
+        git add -A
+        git commit -m "chore(i18n): update translations via PTC [skip ci]"
+        git push -o merge_request.create \\
+                 -o merge_request.target="\$CI_DEFAULT_BRANCH" \\
+                 -o merge_request.title="Update translations from PTC" \\
+                 -f "https://gitlab-ci-token:\${PTC_GIT_PUSH_TOKEN:-\$CI_JOB_TOKEN}@\${CI_SERVER_HOST}/\${CI_PROJECT_PATH}.git" HEAD:ptc/translations
+      fi
 EOF
 }
 
@@ -2878,7 +2914,7 @@ print_ci_block() {
     # The action/component is the maintained path - it pins ptc-cli by checksum,
     # brings its own runner image and is loop-safe. The CLI still runs on its
     # own for any other CI, a cron, or a local check; wrap this in any step:
-    printf '\n# Prefer the action/component above. To run the CLI directly instead:\n'
+    printf '\n# Prefer the pipeline above. To run the CLI directly instead:\n'
     printf '#   ./ptc-cli.sh --config-file .ptc-config.yml\n'
     printf '\n'
 }
