@@ -397,10 +397,16 @@ test_ci_snippets_use_action() {
     assert_not_contains "gitlab does not float the CLI on main" "$gl" "ptc-cli/main/ptc-cli.sh"
     assert_contains "gitlab brings its own runner image" "$gl" "image: alpine:"
     assert_contains "gitlab installs bash for the CLI" "$gl" "apk add --no-cache bash"
-    assert_contains "gitlab guards the loop" "$gl" '[skip translations]'
+    # [skip ci] is the only skip token GitLab actually honours - [skip
+    # translations] is a GitHub-side convention and means nothing here.
+    assert_contains "gitlab guards the loop with a real skip token" "$gl" '[skip ci]'
+    assert_not_contains "gitlab does not rely on a token GitLab ignores" "$gl" '[skip translations]'
     assert_contains "gitlab only runs on the default branch" "$gl" 'CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     assert_contains "gitlab reuses one stable MR branch" "$gl" "HEAD:ptc/translations"
     assert_contains "gitlab opens the MR via push options" "$gl" "merge_request.create"
+    # CI_JOB_TOKEN may not push unless a maintainer opts in (GitLab 18.4+, off
+    # by default), so the recipe must accept a write_repository token instead.
+    assert_contains "gitlab allows a push token override" "$gl" 'PTC_GIT_PUSH_TOKEN:-$CI_JOB_TOKEN'
 
     # The standalone path is still offered, so the CLI does not depend on the action.
     assert_contains "standalone CLI usage is still shown" "$block" "./ptc-cli.sh --config-file .ptc-config.yml"

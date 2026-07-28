@@ -2856,26 +2856,34 @@ render_ci_gitlab() {
 ptc-translate:
   stage: deploy
   image: alpine:3.22
-  # Loop-safe: only a push to the default branch, and never a translation commit.
+  # Loop-safe twice over: the job only runs on a push to the default branch (the
+  # translation push targets ptc/translations, so it cannot retrigger this job),
+  # and the commit carries [skip ci] - the only skip token GitLab honours. The
+  # GitHub-side convention this recipe used before means nothing to GitLab.
   rules:
-    - if: '\$CI_PIPELINE_SOURCE == "push" && \$CI_COMMIT_BRANCH == \$CI_DEFAULT_BRANCH && \$CI_COMMIT_MESSAGE !~ /\[skip translations\]/'
+    - if: '\$CI_PIPELINE_SOURCE == "push" && \$CI_COMMIT_BRANCH == \$CI_DEFAULT_BRANCH'
   before_script:
     - apk add --no-cache bash curl git jq
   script:
     - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v${VERSION}/ptc-cli.sh -o ptc-cli.sh
     - chmod +x ptc-cli.sh
     - ./ptc-cli.sh --config-file .ptc-config.yml
+    # Pushing needs a token that may write to the repository. CI_JOB_TOKEN can,
+    # but ONLY if a maintainer turns on Settings > CI/CD > Job token permissions
+    # > "Allow Git push requests to the repository" (GitLab 18.4+, off by
+    # default). Otherwise set PTC_GIT_PUSH_TOKEN to a project access token with
+    # the write_repository scope, as a masked CI/CD variable.
     - |
       if ! git diff --quiet; then
         git config user.email "ci@ptc"
         git config user.name "PTC Translate"
         git checkout -B ptc/translations
         git add -A
-        git commit -m "chore(i18n): update translations via PTC [skip translations]"
+        git commit -m "chore(i18n): update translations via PTC [skip ci]"
         git push -o merge_request.create \\
                  -o merge_request.target="\$CI_DEFAULT_BRANCH" \\
                  -o merge_request.title="Update translations from PTC" \\
-                 -f "https://gitlab-ci-token:\${CI_JOB_TOKEN}@\${CI_SERVER_HOST}/\${CI_PROJECT_PATH}.git" HEAD:ptc/translations
+                 -f "https://gitlab-ci-token:\${PTC_GIT_PUSH_TOKEN:-\$CI_JOB_TOKEN}@\${CI_SERVER_HOST}/\${CI_PROJECT_PATH}.git" HEAD:ptc/translations
       fi
 EOF
 }
