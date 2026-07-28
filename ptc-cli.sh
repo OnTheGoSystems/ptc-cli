@@ -2273,8 +2273,14 @@ download_translations() {
     log_debug "Tag name: $file_tag_name"
     log_debug "Base directory: $base_dir"
     
-    # Create temporary file for download
-    local temp_zip=$(mktemp /tmp/ptc_translations_XXXXXX.zip)
+    # Create temporary file for download.
+    #
+    # No .zip suffix in the template: busybox mktemp (alpine, and therefore
+    # every GitLab job that uses the image we recommend) rejects anything
+    # after the XXXXXX and exits 1 with "Invalid argument". GNU mktemp allows
+    # it, which is why this only ever failed outside GitHub runners. unzip
+    # identifies the archive by content, so the name costs nothing.
+    local temp_zip=$(mktemp /tmp/ptc_translations_XXXXXX)
     log_debug "Created temporary ZIP file: $temp_zip"
     
     local http_code
