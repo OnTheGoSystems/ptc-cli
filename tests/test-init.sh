@@ -368,11 +368,13 @@ test_env_token_survives_startup() {
     assert_eq "env token is retained after sourcing" "$got" "env-tok"
 }
 
-# ci18-7254: the CI snippets run through ptc-action, not a hand-rolled curl of
-# the CLI. Guards against a regression back to a floating tag / old version /
-# a GitLab job with no runner image.
+# ci18-7254: the GitHub snippet runs through ptc-action rather than a
+# hand-rolled curl of the CLI. GitLab cannot - see render_ci_gitlab - so it
+# gets the equivalent job inline. Guards against a regression back to a
+# floating tag / old version / a GitLab job with no runner image, and against
+# reintroducing a component address no customer instance can resolve.
 test_ci_snippets_use_action() {
-    echo "--- CI snippets run through ptc-action"
+    echo "--- CI snippets: action on GitHub, inline job on GitLab"
 
     local gh gl block
     gh=$(render_ci_github)
@@ -385,8 +387,20 @@ test_ci_snippets_use_action() {
     assert_not_contains "github does not curl the raw CLI" "$gh" "raw.githubusercontent"
     assert_not_contains "github does not pin an old checkout" "$gh" "checkout@v4"
 
-    assert_contains "gitlab includes the component" "$gl" "OnTheGoSystems/ptc-action/translate@1"
-    assert_not_contains "gitlab does not curl the raw CLI" "$gl" "raw.githubusercontent"
+    # GitLab gets the job inline: a `component:` address resolves only against
+    # the customer's own GitLab instance, so ours can never be reached from
+    # gitlab.com or a self-hosted server. Inline keeps every guarantee the
+    # component had - runner image, loop-safe rules, stable branch - and drops
+    # the one thing that could not work.
+    assert_not_contains "gitlab does not use an unreachable component" "$gl" "component:"
+    assert_contains "gitlab pins the CLI to this version's tag" "$gl" "ptc-cli/v${VERSION}/ptc-cli.sh"
+    assert_not_contains "gitlab does not float the CLI on main" "$gl" "ptc-cli/main/ptc-cli.sh"
+    assert_contains "gitlab brings its own runner image" "$gl" "image: alpine:"
+    assert_contains "gitlab installs bash for the CLI" "$gl" "apk add --no-cache bash"
+    assert_contains "gitlab guards the loop" "$gl" '[skip translations]'
+    assert_contains "gitlab only runs on the default branch" "$gl" 'CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    assert_contains "gitlab reuses one stable MR branch" "$gl" "HEAD:ptc/translations"
+    assert_contains "gitlab opens the MR via push options" "$gl" "merge_request.create"
 
     # The standalone path is still offered, so the CLI does not depend on the action.
     assert_contains "standalone CLI usage is still shown" "$block" "./ptc-cli.sh --config-file .ptc-config.yml"
