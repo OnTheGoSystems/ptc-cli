@@ -66,7 +66,82 @@ log_debug() {
 # User-Agent (ptc-cli/<VERSION>). It forwards to the real curl - which the test
 # suites stub - so the header rides along as an ordinary -H the stubs already skip.
 ptc_curl() {
-    curl -H "User-Agent: $PTC_USER_AGENT" "$@"
+    # PTC_HEADER_DUMP lets a caller read response headers without every call
+    # site having to thread a -D through its own curl invocation. Only the
+    # rate-limit retry sets it; everything else runs exactly as before.
+    if [[ -n "${PTC_HEADER_DUMP:-}" ]]; then
+        curl -H "User-Agent: $PTC_USER_AGENT" -D "$PTC_HEADER_DUMP" "$@"
+    else
+        curl -H "User-Agent: $PTC_USER_AGENT" "$@"
+    fi
+}
+
+# --- rate limiting -----------------------------------------------------------
+# create + process + bulk share ONE bucket of PTC_RATE_LIMIT_HINT requests per
+# minute, and a run spends two of them per file, so any project past a handful
+# of files meets a 429 partway through. Failing there is the worst outcome
+# available: the files uploaded before it are already registered and the words
+# may already be paid for, so the run must wait rather than abort.
+readonly PTC_RATE_LIMIT_MAX_RETRIES=5
+readonly PTC_RATE_LIMIT_BASE_DELAY=15
+readonly PTC_RATE_LIMIT_MAX_DELAY=60
+# Internal signal between a request function and the retry wrapper. It never
+# reaches the shell: the wrapper turns it into 0 (recovered) or 1 (gave up).
+readonly PTC_RATE_LIMITED=8
+
+# Seconds to wait before attempt N. Honours Retry-After when the server sends
+# one; PTC does not today (checked 2026-08-04), so the fallback walks towards
+# the one-minute window the limit is measured over.
+rate_limit_delay() {
+    local attempt="$1" header_file="${2:-}"
+    local retry_after=""
+
+    if [[ -n "$header_file" && -f "$header_file" ]]; then
+        retry_after=$(grep -i '^retry-after:' "$header_file" 2>/dev/null \
+            | tail -n 1 | tr -d '\r' \
+            | sed -E 's/^[Rr]etry-[Aa]fter:[[:space:]]*//')
+    fi
+
+    if [[ "$retry_after" =~ ^[0-9]+$ ]] && (( retry_after > 0 )); then
+        (( retry_after > 300 )) && retry_after=300   # a bad header must not hang the job
+        printf '%s' "$retry_after"
+        return 0
+    fi
+
+    local delay=$(( PTC_RATE_LIMIT_BASE_DELAY * attempt ))
+    (( delay > PTC_RATE_LIMIT_MAX_DELAY )) && delay=$PTC_RATE_LIMIT_MAX_DELAY
+    printf '%s' "$delay"
+}
+
+# Runs a request function, waiting out HTTP 429 instead of failing on it.
+# The function must return PTC_RATE_LIMITED to ask for a retry; any other exit
+# status is passed straight through, so non-429 failures still fail fast.
+call_with_rate_limit_retry() {
+    local attempt=1 delay rc header_dump=""
+
+    header_dump=$(mktemp "${TMPDIR:-/tmp}/ptc-headers.XXXXXX" 2>/dev/null) || header_dump=""
+
+    while :; do
+        PTC_HEADER_DUMP="$header_dump" "$@"
+        rc=$?
+
+        if (( rc != PTC_RATE_LIMITED )); then
+            [[ -n "$header_dump" ]] && rm -f "$header_dump"
+            return $rc
+        fi
+
+        if (( attempt > PTC_RATE_LIMIT_MAX_RETRIES )); then
+            [[ -n "$header_dump" ]] && rm -f "$header_dump"
+            log_error "PTC is still rate limiting after $PTC_RATE_LIMIT_MAX_RETRIES retries; giving up."
+            log_info "The limit is per organization, so another job or a teammate may be sending requests too."
+            return 1
+        fi
+
+        delay=$(rate_limit_delay "$attempt" "$header_dump")
+        log_warning "PTC rate limit reached (HTTP 429). Waiting ${delay}s, then retry ${attempt} of ${PTC_RATE_LIMIT_MAX_RETRIES}."
+        sleep "$delay"
+        attempt=$(( attempt + 1 ))
+    done
 }
 
 # JSON field readers. The API returns compact JSON today, but these tolerate
@@ -154,15 +229,26 @@ response_indicates_failure() {
 # than dropping it.
 describe_api_failure() {
     local http_code="$1" body="${2:-}"
-    local message codes
+    local message error codes
 
     message=$(json_string_field "$body" "message")
+    # Several endpoints answer with a plain {"error": "..."} instead of the
+    # {"message", "errors"} envelope - source_files#create and #process among
+    # them. Reading only "message" turned those into a bare "HTTP 422" in the
+    # CI log, which is the one place the reason was needed.
+    error=$(json_string_field "$body" "error")
     codes=$(printf '%s' "$body" | tr '\n' ' ' \
         | grep -Eo '"errors"[[:space:]]*:[[:space:]]*\[[^]]*\]' \
         | head -n 1 | sed -E 's/^"errors"[[:space:]]*:[[:space:]]*//') || true
 
     local description="HTTP $http_code"
-    [[ -n "$message" ]] && description="$description: $message"
+    if [[ -n "$message" ]]; then
+        description="$description: $message"
+        # Both keys present and different: keep each, they say different things.
+        [[ -n "$error" && "$error" != "$message" ]] && description="$description ($error)"
+    elif [[ -n "$error" ]]; then
+        description="$description: $error"
+    fi
     [[ -n "$codes" ]] && description="$description (error codes: $codes)"
     printf '%s' "$description"
 }
@@ -870,7 +956,7 @@ perform_upload_action() {
                 additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$relative_file_path")
             fi
             
-            if make_ptc_api_call "$file" "$relative_file_path" "$output_file_path" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
+            if call_with_rate_limit_retry make_ptc_api_call "$file" "$relative_file_path" "$output_file_path" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
                 uploaded_files+=("$file")
                 log_success "Upload completed: $relative_file_path"
             else
@@ -929,7 +1015,7 @@ perform_upload_action_with_config() {
             local additional_files_json=""
             additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$relative_file_path")
             
-            if make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
+            if call_with_rate_limit_retry make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
                 uploaded_files+=("$file")
                 log_success "Upload completed: $relative_file_path"
             else
@@ -1107,7 +1193,7 @@ process_files_in_steps() {
                 additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$relative_file_path")
             fi
             
-            if make_ptc_api_call "$file" "$relative_file_path" "$output_file_path" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
+            if call_with_rate_limit_retry make_ptc_api_call "$file" "$relative_file_path" "$output_file_path" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
                 uploaded_files+=("$file")
                 log_success "Upload completed: $relative_file_path"
             else
@@ -1134,7 +1220,7 @@ process_files_in_steps() {
         else
             log_info "Starting processing: $relative_file_path"
             
-            if start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
+            if call_with_rate_limit_retry start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
                 processed_files+=("$file")
                 log_success "Processing started: $relative_file_path"
             else
@@ -1351,7 +1437,7 @@ process_files_in_steps_with_config() {
             local additional_files_json=""
             additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$relative_file_path")
             
-            if make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
+            if call_with_rate_limit_retry make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
                 uploaded_files+=("$file")
                 log_success "Upload completed: $relative_file_path"
             else
@@ -1378,7 +1464,7 @@ process_files_in_steps_with_config() {
         else
             log_info "Starting processing: $relative_file_path"
             
-            if start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
+            if call_with_rate_limit_retry start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
                 processed_files+=("$file")
                 log_success "Processing started: $relative_file_path"
             else
@@ -1834,6 +1920,12 @@ EOF
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
+    # Ask the caller to wait and try again rather than reporting a failed
+    # upload: nothing was uploaded, so this file is still worth retrying.
+    if [[ "$http_code" == "429" ]]; then
+        return $PTC_RATE_LIMITED
+    fi
+
     # A 201 that still carries "success": false is a rejected upload dressed as
     # a created one - the content-validation path answers that way (ci18-7342).
     if [[ "$http_code" == "201" ]] && ! response_indicates_failure "$http_code" "$response_body"; then
@@ -1897,6 +1989,12 @@ start_processing() {
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
+    # Same bucket as the upload above, so the same treatment: the file is
+    # uploaded but not yet processing, and only a retry can finish the job.
+    if [[ "$http_code" == "429" ]]; then
+        return $PTC_RATE_LIMITED
+    fi
+
     if response_indicates_failure "$http_code" "$response_body"; then
         log_error "Failed to start file processing: $relative_file_path ($(describe_api_failure "$http_code" "$response_body"))"
         log_debug "Process API response: $response_body"
