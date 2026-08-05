@@ -1813,19 +1813,14 @@ make_ptc_api_call() {
     
     log_debug "Uploading file to PTC API: $api_url"
     
-    # Prepare headers for authentication
-    local auth_header=""
+    # Log the auth posture; each curl invocation below inlines its own headers.
     if [[ -n "$PTC_API_TOKEN" ]]; then
-        auth_header="-H \"Authorization: Bearer $PTC_API_TOKEN\""
         log_debug "Using API token for authentication"
     else
         log_warning "No API token provided, request may fail"
     fi
-    
-    # Prepare additional curl parameters
-    local additional_curl_params=""
+
     if [[ -n "$additional_files_json" ]]; then
-        additional_curl_params="-F \"additional_translation_files=$additional_files_json\""
         log_debug "Including additional_translation_files: $additional_files_json"
     fi
 
