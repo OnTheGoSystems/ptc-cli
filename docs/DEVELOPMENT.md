@@ -14,6 +14,9 @@ ptc-cli-bash/
 │   ├── test-runner.sh           # Main test runner (CLI invocation tests)
 │   ├── test-status-handling.sh  # Status parsing, polling and preflight
 │   ├── test-init.sh             # `ptc init` detect_config scaffolder
+│   ├── test-exit-codes.sh       # Exit codes the CLI reports to CI
+│   ├── test-error-shapes.sh     # Both shapes of a rejected API response
+│   ├── test-rate-limit.sh       # 429 backoff and failure descriptions
 │   └── fixtures/                # Test data (created automatically)
 └── docs/                         # Documentation
     └── DEVELOPMENT.md           # This guide
@@ -55,10 +58,16 @@ chmod +x tests/test-status-handling.sh
 ### Running Tests
 
 ```bash
-# Run all tests
+# Run all tests — each file is its own suite, none of them runs the others
+for suite in tests/test-*.sh; do echo "== $suite"; bash "$suite" || break; done
+
+# Or one at a time
 ./tests/test-runner.sh
 ./tests/test-status-handling.sh
 ./tests/test-init.sh
+./tests/test-exit-codes.sh
+./tests/test-error-shapes.sh
+./tests/test-rate-limit.sh
 
 # Test specific functionality
 ./ptc-cli.sh -s en -p '{lang}-copy.json' --dry-run --verbose
