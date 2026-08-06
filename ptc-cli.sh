@@ -2962,7 +2962,11 @@ ptc-translate:
   rules:
     - if: '\$CI_PIPELINE_SOURCE == "push" && \$CI_COMMIT_BRANCH == \$CI_DEFAULT_BRANCH'
   before_script:
-    - apk add --no-cache bash curl git jq
+    # jq is never invoked by the CLI. unzip is - it unpacks the downloaded
+    # translations; alpine already provides it as a busybox applet, so it is
+    # named here only to keep the job working if the image is ever changed.
+    # git is needed by the push step below, not by the CLI.
+    - apk add --no-cache bash curl git unzip
   script:
     - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v${VERSION}/ptc-cli.sh -o ptc-cli.sh
     - chmod +x ptc-cli.sh
@@ -3041,8 +3045,8 @@ OPTIONS:
     -h, --help             Show this help
 
 NOTE:
-    detect_config is currently on the QA environment. Until it reaches
-    production, point --api-url at the QA host."
+    detect_config is anonymous — init needs no API token. A token is only
+    required later, to upload and translate."
 }
 
 # `ptc init` entry point.
@@ -3131,7 +3135,7 @@ cmd_init() {
                 ;;
             404)
                 log_error "detect_config is not available on this server (HTTP 404)."
-                log_info "This endpoint is currently on the QA environment; point --api-url at the QA host."
+                log_info "Check --api-url. The endpoint is live on the default host; a self-hosted instance may predate it."
                 return 1
                 ;;
             ""|000)
