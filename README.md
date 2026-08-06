@@ -1,5 +1,7 @@
 # PTC CLI - Private Translation Cloud CLI
 
+[![Self-test](https://github.com/OnTheGoSystems/ptc-cli/actions/workflows/test.yml/badge.svg)](https://github.com/OnTheGoSystems/ptc-cli/actions/workflows/test.yml)
+
 Bash script for processing translation files through PTC (Private Translation Cloud) API with support for various project configurations.
 
 [Sample repositories](https://github.com/OnTheGoSystems/ptc-cli/wiki/Sample-repositories)
