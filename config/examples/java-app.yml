@@ -1,0 +1,15 @@
+# Configuration for a Java application
+# Usage: ./ptc-cli.sh --config-file config/examples/java-app.yml
+#
+# The token is never written here — provide it via the PTC_API_TOKEN
+# environment variable.
+
+source_locale: en
+file_tag_name: develop
+
+files:
+  - file: src/main/resources/i18n/messages_en.properties
+    output: src/main/resources/i18n/messages_{{lang}}.properties
+
+  - file: src/main/resources/i18n/errors_en.properties
+    output: src/main/resources/i18n/errors_{{lang}}.properties

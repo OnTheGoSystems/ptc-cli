@@ -34,16 +34,14 @@ you what it found, and writes a ready-to-use config plus a CI snippet.
 ./ptc-cli.sh init --dry-run --verbose
 
 # Non-interactive (CI), overwrite an existing config
-PTC_API_TOKEN=your-token ./ptc-cli.sh init --yes --force
+./ptc-cli.sh init --yes --force
 ```
 
-The token is read from `PTC_API_TOKEN` (env-first) or `--api-token`. If the
-project layout isn't recognised, `init` writes a commented template you can fill
-in — it never hard-fails. Ignore extra paths by listing gitignore-style patterns
-in a `.ptcignore` file at the repo root.
-
-> **Note:** `detect_config` is currently on the QA environment. Until it reaches
-> production, point `--api-url` at the QA host.
+`init` needs no API token — `detect_config` is anonymous. A token is required
+only later, to upload and translate. If the project layout isn't recognised,
+`init` writes a commented template you can fill in — it never hard-fails. Ignore
+extra paths by listing gitignore-style patterns in a `.ptcignore` file at the
+repo root.
 
 ### Using a hand-written Configuration File
 
@@ -113,6 +111,12 @@ chmod +x ptc-cli.sh
 - `-n, --dry-run` - Show what would be done without executing
 - `-h, --help` - Show help
 - `--version` - Show version
+
+**Writing option values.** Every option above takes its value as a separate
+argument (`--file-tag-name my-branch`). The `--flag=value` form works only for
+`--api-url`, `--api-token`, `--monitor-interval`, `--monitor-max-attempts` and
+`--action`; anywhere else it is reported as an unknown option. (`init` accepts
+`=` for `--api-url`, `--api-token` and `--project-dir`.)
 
 ### Authentication
 
@@ -197,8 +201,8 @@ files:
 # Dry run to see what would happen
 ./ptc-cli.sh -c config.yml --dry-run --verbose
 
-# Override specific settings
-./ptc-cli.sh -c config.yml --file-tag-name=feature-branch
+# Override specific settings (short flags take a separate argument, not --flag=value)
+./ptc-cli.sh -c config.yml --file-tag-name feature-branch
 
 # Isolated actions
 ./ptc-cli.sh -c config.yml --action upload                   # Only upload files
@@ -307,12 +311,12 @@ Pipelines download the script from a **pinned release tag**, not a moving branch
 so a push to `main` can never change what your build runs:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.0/ptc-cli.sh -o ptc-cli.sh
+curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.3/ptc-cli.sh -o ptc-cli.sh
 ```
 
-Use `v1.0.0` to pin an exact release, or the floating `v1` tag to pick up
-backward-compatible updates automatically. The `ptc init` command scaffolds the
-pinned URL for you.
+Use an exact release tag such as `v1.0.3` to pin, or the floating `v1` tag to
+pick up backward-compatible updates automatically. `ptc init` scaffolds the
+pinned URL for you, at the version of the CLI that printed it.
 
 **Verify the download** against the SHA256 checksum published on the
 [release page](https://github.com/OnTheGoSystems/ptc-cli/releases):
@@ -332,61 +336,34 @@ the server can attribute traffic to a specific release.
 Add PTC_API_TOKEN to the repository secrets (Settings -> Secrets and variables -> Actions -> New repository secret).
 Ensure to turn on the "Allow GitHub Actions to create and approve pull requests" permission in the repository settings (Settings -> Actions -> General -> Workflow permissions).
 
+This is what `ptc init` writes for you. It runs the CLI through
+[`ptc-action`](https://github.com/OnTheGoSystems/ptc-action), which vendors a
+pinned copy of this script, so there is nothing to download at job time:
+
 ```yaml
-name: Process Translation Files
+name: PTC Translations
 on:
-  workflow_dispatch: # Manual trigger
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  process-translations:
+  translate:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Setup PTC CLI
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.0/ptc-cli.sh -o ptc-cli.sh
-          chmod +x ptc-cli.sh
-      
-      - name: Process translations with PTC CLI
-        env:
-          PTC_API_TOKEN: ${{ secrets.PTC_API_TOKEN }}
-        run: |
-          ./ptc-cli.sh \
-            --config-file .ptc/config.yml \
-            --verbose
-      
-      - name: Clean up temporary files
-        run: |
-          rm -f ptc-cli.sh
-      
-      - name: Create Pull Request with translations
-        if: success()
-        uses: peter-evans/create-pull-request@v5
+      - uses: actions/checkout@v7
+      - uses: OnTheGoSystems/ptc-action@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "🌐 Update translations via PTC CLI"
-          title: "🌐 Update translations from PTC"
-          body: |
-            ## 🌐 Translation Update
-            
-            This PR contains new translations processed by PTC CLI.
-            
-            **Triggered by:** ${{ github.event_name }}
-            **Branch:** ${{ github.ref_name }}
-            **Commit:** ${{ github.sha }}
-            
-            ---
-            *Auto-generated by GitHub Actions*
-          delete-branch: true
+          api-token: ${{ secrets.PTC_API_TOKEN }}
+          config-file: .ptc-config.yml
+          create-pr: true
 ```
 
-Sample `.ptc/config.yml` file:
+Sample `.ptc-config.yml` file:
 
 ```yaml
 source_locale: en
@@ -399,18 +376,45 @@ files:
 
 ### GitLab CI
 
+There is no GitLab component to include: `include: component:` is resolved by
+your own GitLab instance, so a component published anywhere else is unreachable.
+`ptc init` prints this self-contained job instead:
+
 ```yaml
-process_translations:
+ptc-translate:
   stage: deploy
+  image: alpine:3.22
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  before_script:
+    - apk add --no-cache bash curl git unzip
   script:
+    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.3/ptc-cli.sh -o ptc-cli.sh
     - chmod +x ptc-cli.sh
-    - ./ptc-cli.sh -c config.yml -v
-  variables:
-    PTC_API_TOKEN: "$CI_PTC_API_TOKEN"
-  only:
-    - merge_requests
-    - main
+    - ./ptc-cli.sh --config-file .ptc-config.yml
+    - |
+      if ! git diff --quiet; then
+        git config user.email "ci@ptc"
+        git config user.name "PTC Translate"
+        git checkout -B ptc/translations
+        git add -A
+        git commit -m "chore(i18n): update translations via PTC [skip ci]"
+        git push -o merge_request.create \
+                 -o merge_request.target="$CI_DEFAULT_BRANCH" \
+                 -o merge_request.title="Update translations from PTC" \
+                 -f "https://gitlab-ci-token:${PTC_GIT_PUSH_TOKEN:-$CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:ptc/translations
+      fi
 ```
+
+Store `PTC_API_TOKEN` as a **masked** CI/CD variable. The push needs a token
+that may write to the repository: `CI_JOB_TOKEN` can, but only if a maintainer
+enables Settings -> CI/CD -> Job token permissions -> "Allow Git push requests
+to the repository" (GitLab 18.4+, off by default). Otherwise set
+`PTC_GIT_PUSH_TOKEN` to a project access token with the `write_repository`
+scope, also masked.
+
+Loop-safe twice over: the job runs only on a push to the default branch, and the
+translation push targets `ptc/translations`, which cannot re-trigger it.
 
 ### Additional Translation Files
 
@@ -434,14 +438,14 @@ files:
 **Common Issues:**
 
 1. **HTTP 401 Unauthorized**
-   ```bash
+   ```text
    [ERROR] Failed to upload file: example.json (HTTP 401)
    ```
    - Check your API token
    - Verify token has correct permissions
 
 2. **HTTP 403 Forbidden**
-   ```bash
+   ```text
    [ERROR] Failed to upload file: example.json (HTTP 403)
    ```
    - Check your API token
@@ -449,15 +453,15 @@ files:
    - Verify token has correct permissions
 
 3. **Files not found**
-   ```bash
+   ```text
    [ERROR] No files found for pattern: {{lang}}.json
    ```
    - Check file paths in config
    - Verify source locale matches your files
    - Use `--verbose` to see search details
 
-5. **Translation timeout**
-   ```bash
+4. **Translation timeout**
+   ```text
    [WARNING] Timed out files: 1
    ```
    - Increase `--monitor-max-attempts`

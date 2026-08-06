@@ -7,9 +7,12 @@ ptc-cli-bash/
 ├── ptc-cli.sh                    # Main executable script
 ├── README.md                     # Main documentation
 ├── config/                       # Configurations
-│   └── examples/                # Configuration examples
-│       ├── react-app.config     # For React applications
-│       └── java-app.config      # For Java applications
+│   └── examples/                # Configuration examples (all valid YAML)
+│       ├── full-config.yml      # Every supported option
+│       ├── react-app.yml        # For React applications
+│       ├── java-app.yml         # For Java applications
+│       ├── wordpress-wpsite.yml # For WordPress sites and plugins
+│       └── config.local.yml.example  # Uncommitted local config
 ├── tests/                        # Testing
 │   ├── test-runner.sh           # Main test runner (CLI invocation tests)
 │   ├── test-status-handling.sh  # Status parsing, polling and preflight
@@ -17,6 +20,7 @@ ptc-cli-bash/
 │   ├── test-exit-codes.sh       # Exit codes the CLI reports to CI
 │   ├── test-error-shapes.sh     # Both shapes of a rejected API response
 │   ├── test-rate-limit.sh       # 429 backoff and failure descriptions
+│   ├── test-config-examples.sh  # Every config/examples/* fed to the parser
 │   └── fixtures/                # Test data (created automatically)
 └── docs/                         # Documentation
     └── DEVELOPMENT.md           # This guide

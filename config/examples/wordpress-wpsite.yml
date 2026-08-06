@@ -1,0 +1,23 @@
+# Configuration for a WordPress site or plugin
+# Usage: ./ptc-cli.sh --config-file config/examples/wordpress-wpsite.yml
+#
+# The token is never written here — provide it via the PTC_API_TOKEN
+# environment variable.
+#
+# WordPress expects locale codes like de_DE or fr_FR rather than bare de / fr.
+# Whatever {{lang}} expands to comes from the locales configured on the PTC
+# project, so set those up to match the names WordPress loads.
+
+source_locale: en
+file_tag_name: main
+
+files:
+  - file: languages/wpsite.pot
+    output: languages/wpsite-{{lang}}.po
+    # WordPress loads .mo at runtime and .json for block editor strings, so ask
+    # PTC to emit them alongside the .po.
+    additional_translation_files:
+      - type: mo
+        path: languages/wpsite-{{lang}}.mo
+      - type: json
+        path: languages/wpsite-{{lang}}.json
