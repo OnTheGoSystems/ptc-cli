@@ -3,7 +3,7 @@
 ## Project Structure
 
 ```
-ptc-cli-bash/
+ptc-cli/
 ├── ptc-cli.sh                    # Main executable script
 ├── README.md                     # Main documentation
 ├── config/                       # Configurations
@@ -50,8 +50,8 @@ ptc-cli-bash/
 
 ```bash
 # Clone project
-git clone <repository-url>
-cd ptc-cli-bash
+git clone https://github.com/OnTheGoSystems/ptc-cli.git
+cd ptc-cli
 
 # Set execution permissions
 chmod +x ptc-cli.sh
@@ -72,10 +72,27 @@ for suite in tests/test-*.sh; do echo "== $suite"; bash "$suite" || break; done
 ./tests/test-exit-codes.sh
 ./tests/test-error-shapes.sh
 ./tests/test-rate-limit.sh
+./tests/test-config-examples.sh
 
-# Test specific functionality
-./ptc-cli.sh -s en -p '{lang}-copy.json' --dry-run --verbose
+# Test specific functionality ({{lang}} is the placeholder; a single-brace one is taken literally)
+./ptc-cli.sh -s en -p '{{lang}}-copy.json' --dry-run --verbose
 ```
+
+The whole set is offline — four suites stub `curl`, the rest only use
+`--dry-run`, which skips preflight — and finishes in about four seconds.
+
+### CI
+
+`.github/workflows/test.yml` runs every suite on push and on pull request
+(ci18-7417). Two things worth knowing about it:
+
+- It runs the suites **twice**: on `ubuntu-latest` with current bash, and on
+  `macos-latest` with `/bin/bash`, which is still 3.2.57. The CLI targets 3.2 on
+  purpose, and current bash quietly accepts syntax 3.2 rejects — so a
+  contributor on Linux cannot see that break without this.
+- It checks that every fenced block in `README.md` is what it claims to be: a
+  `yaml` block must parse, a `bash` block must survive `bash -n`. Blocks that
+  show CLI output belong in `text`. This is the ci18-7398 defect class.
 
 `test-status-handling.sh` sources `ptc-cli.sh` and stubs `curl`, so it covers
 status parsing, polling and preflight without network access. It asserts on the
@@ -88,13 +105,13 @@ like a timeout rather than an error.
 Enable verbose mode for debugging:
 
 ```bash
-./ptc-cli.sh -s en -p '{lang}/**/*.json' --verbose --dry-run
+./ptc-cli.sh -s en -p '{{lang}}/**/*.json' --verbose --dry-run
 ```
 
 For additional bash debugging you can use:
 
 ```bash
-bash -x ./ptc-cli.sh -s en -p '{lang}-copy.json' --dry-run
+bash -x ./ptc-cli.sh -s en -p '{{lang}}-copy.json' --dry-run
 ```
 
 ## Adding New Features
@@ -109,7 +126,7 @@ bash -x ./ptc-cli.sh -s en -p '{lang}-copy.json' --dry-run
 
 Example of adding `--timeout` option:
 
-```bash
+```text
 # In variables section
 TIMEOUT=300
 

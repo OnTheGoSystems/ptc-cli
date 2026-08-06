@@ -1,0 +1,169 @@
+name: Self-test
+
+# ci18-7417. This repository ships a script customers download by tag, the
+# recipes the product prints, and the copy ptc-action vendors and republishes
+# as @v1 — so a broken main becomes a release, and a release becomes what every
+# customer's pipeline fetches. The suites below already existed and took four
+# seconds; nothing ran them.
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+jobs:
+  suites:
+    name: suites on ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS still ships bash 3.2.57 and the CLI targets it on purpose, so
+          # it is not a nice-to-have: current bash accepts syntax 3.2 rejects,
+          # and a contributor on Linux cannot see the difference.
+          - os: macos-latest
+            label: bash 3.2 (macOS)
+            bash_bin: /bin/bash
+          - os: ubuntu-latest
+            label: current bash (Linux)
+            bash_bin: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: bash under test
+        env:
+          BASH_BIN: ${{ matrix.bash_bin }}
+        run: |
+          "$BASH_BIN" --version | head -1
+
+      - name: ptc-cli.sh parses
+        env:
+          BASH_BIN: ${{ matrix.bash_bin }}
+        run: |
+          "$BASH_BIN" -n ptc-cli.sh
+
+      - name: every suite
+        env:
+          BASH_BIN: ${{ matrix.bash_bin }}
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          suites=(tests/test-*.sh)
+          if [ ${#suites[@]} -eq 0 ]; then
+            echo "::error::no suites found — tests/test-*.sh matched nothing"
+            exit 1
+          fi
+          failed=0
+          for suite in "${suites[@]}"; do
+            echo "::group::$suite"
+            if "$BASH_BIN" "$suite"; then
+              echo "$suite OK"
+            else
+              failed=1
+              echo "::error file=$suite::$suite failed"
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+
+  checks:
+    name: repository checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: --version agrees with VERSION
+        run: |
+          set -euo pipefail
+          declared=$(grep -m1 -oE 'readonly VERSION="[^"]+"' ptc-cli.sh | cut -d'"' -f2)
+          printed=$(./ptc-cli.sh --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          echo "declared=$declared printed=$printed"
+          test "$declared" = "$printed"
+
+      - name: config examples are all YAML the parser accepts
+        run: |
+          set -euo pipefail
+          # tests/test-config-examples.sh proves they parse; this only guards
+          # against the extension that started ci18-7398 coming back.
+          if compgen -G 'config/examples/*.config' > /dev/null; then
+            echo "::error::config/examples/*.config is back — these are YAML, not KEY=VALUE"
+            exit 1
+          fi
+          echo "no .config files — OK"
+
+      - name: every fenced block is what it claims to be
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY'
+          import glob, os, re, subprocess, sys, tempfile, yaml
+
+          # ci18-7398: the README shipped a bash example that exited 1 on
+          # copy-paste and two CI blocks that could not run. A block tagged
+          # `yaml` must parse as YAML and one tagged `bash` must at least be
+          # syntactically valid — output samples and fragments belong in `text`.
+          bad = []
+          total = 0
+          for path in ['README.md'] + sorted(glob.glob('docs/*.md')):
+              blocks = re.findall(r'```(\w+)\n(.*?)```', open(path).read(), re.S)
+              total += len(blocks)
+              for i, (lang, body) in enumerate(blocks, 1):
+                  first = body.splitlines()[0][:60] if body.strip() else '(empty)'
+                  if lang == 'yaml':
+                      try:
+                          docs = list(yaml.safe_load_all(body))
+                          assert docs and docs[0], 'parsed to nothing'
+                      except Exception as e:
+                          bad.append(f'{path} block {i} (yaml, {first!r}): {e}')
+                  elif lang == 'bash':
+                      with tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False) as f:
+                          f.write(body)
+                          tmp = f.name
+                      r = subprocess.run(['bash', '-n', tmp], capture_output=True, text=True)
+                      os.unlink(tmp)
+                      if r.returncode:
+                          bad.append(f'{path} block {i} (bash, {first!r}): {r.stderr.strip()}')
+
+          if not total:
+              sys.exit('no fenced blocks found at all — check the parser')
+          if bad:
+              sys.exit('blocks that do not run as written:\n  ' + '\n  '.join(bad))
+          print(f'{total} fenced blocks OK')
+          PY
+
+      - name: only {{lang}} is used as the placeholder
+        run: |
+          set -euo pipefail
+          # substitute_pattern expands {{lang}} only; a single-brace {lang} is
+          # taken literally and produces a path nobody has (ci18-7398).
+          if grep -rnE '(^|[^{])\{lang\}([^}]|$)' README.md docs/ config/examples/ 2>/dev/null; then
+            echo "::error::single-brace {lang} found — only {{lang}} is substituted"
+            exit 1
+          fi
+          echo "no single-brace placeholders — OK"
+
+  links:
+    name: README and wiki links (advisory)
+    runs-on: ubuntu-latest
+    # Advisory: a dead link is a real defect, but an upstream hiccup must not
+    # turn main red. Read the log when this is yellow.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: every link resolves
+        run: |
+          set -uo pipefail
+          bad=0
+          # Skip anything holding a shell variable — those are templates, not URLs.
+          for url in $(grep -ohE 'https?://[^)"`< ]+' README.md docs/*.md | sed 's/[.,]$//' | grep -v '\$' | sort -u); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 20 "$url" || echo 000)
+            printf '%-76s %s\n' "$url" "$code"
+            case "$code" in
+              2*|3*) ;;
+              # The API base answers 404 by design; it is a base URL, not a page.
+              404) case "$url" in */api/v1/) ;; *) bad=1 ;; esac ;;
+              *) bad=1 ;;
+            esac
+          done
+          exit "$bad"
