@@ -28,7 +28,7 @@ PTC_FILE_TAG_NAME=""
 PTC_API_URL="https://app.ptc.wpml.org/api/v1/"
 # The API token is env-first: an inherited PTC_API_TOKEN is honoured across every
 # command, and --api-token overrides it. The api_token: config key is deprecated
-# and ignored (ci18-7251 §6), so there is nothing else to reconcile — do NOT reset
+# and ignored, so there is nothing else to reconcile — do NOT reset
 # this to "", or the translate pipeline would lose the env token.
 PTC_API_TOKEN="${PTC_API_TOKEN:-}"
 PTC_VERBOSE=false
@@ -197,7 +197,7 @@ json_bool_field() {
     fi
 }
 
-# ci18-7342 - a rejected request reaches us in one of two shapes, depending on
+# A rejected request reaches us in one of two shapes, depending on
 # which server build answers:
 #
 #   older: HTTP 200  + {"success":false,"message":"Unprocessable Entity","code":422,...}
@@ -206,7 +206,7 @@ json_bool_field() {
 # Trusting the status alone reads the first shape as success. That is how a
 # rejected `process` call used to print "processing started successfully" and
 # leave CI green with no translations, and how `download` used to save the JSON
-# error body as a .zip and try to unpack it. Production and staging will not
+# error body as a .zip and try to unpack it. Deployments will not
 # flip on the same day, so the CLI has to read both the same way - the body is
 # the authority when it disagrees with the status.
 #
@@ -666,7 +666,7 @@ parse_config_file() {
         fi
     fi
     
-    # ci18-7342 - the README has always documented these two as config keys, but
+    # The README has always documented these two as config keys, but
     # nothing read them: they were flags only. In CI that made the polling
     # ceiling (100 x 5s ~ 8.3 min) unreachable, because the GitHub action and the
     # GitLab component pass neither flag - a big project timed out and, with the
@@ -693,7 +693,7 @@ parse_config_file() {
         fi
     fi
 
-    # The api_token: config key is deprecated (ci18-7251 §6): a token in a
+    # The api_token: config key is deprecated: a token in a
     # committed file is a leak waiting to happen. Warn whenever the key is present
     # (even with an empty value) and ignore it; the token must come from the
     # PTC_API_TOKEN environment variable or --api-token.
@@ -1071,7 +1071,7 @@ perform_status_action() {
 
     log_info "Status check completed for ${#checked_files[@]} file(s)"
 
-    # ci18-7342 - "still in progress" is a legitimate answer and stays exit 0,
+    # "still in progress" is a legitimate answer and stays exit 0,
     # but a terminal failure or an unreadable status must not. This used to
     # return 0 unconditionally, so a gate built on `--action status` passed
     # even when the translation had definitively failed.
@@ -1283,7 +1283,7 @@ process_files_in_steps() {
             if [[ $status_result -eq 0 ]]; then
                 # Translation completed, download it
                 set_file_status "$file" "completed"
-                # ci18-7342 - 2 means the archive is not ready yet (HTTP 202);
+                # 2 means the archive is not ready yet (HTTP 202);
                 # keep the file in the loop rather than failing it. Same
                 # handling as the config path.
                 local download_result=0
@@ -1374,7 +1374,7 @@ process_files_in_steps() {
         done
     fi
     
-    # ci18-7342 - a partial run is not a success. This used to return 0 as soon
+    # A partial run is not a success. This used to return 0 as soon
     # as ONE file completed, so nine failures out of ten still exited green and
     # the pipeline reported a translation run that never happened. Anything
     # failed or still unfinished is a non-zero exit; CI decides what to do with
@@ -1527,7 +1527,7 @@ process_files_in_steps_with_config() {
 
             case $file_action in
                 0)
-                    # ci18-7342 - a file counts as completed only once its
+                    # A file counts as completed only once its
                     # translations are actually on disk. This used to add it to
                     # completed_files BEFORE downloading and downgrade a failed
                     # download to a warning, so a run that fetched nothing still
@@ -1623,7 +1623,7 @@ process_files_in_steps_with_config() {
         done
     fi
     
-    # ci18-7342 - a partial run is not a success. This used to return 0 as soon
+    # A partial run is not a success. This used to return 0 as soon
     # as ONE file completed, so nine failures out of ten still exited green and
     # the pipeline reported a translation run that never happened. Anything
     # failed or still unfinished is a non-zero exit; CI decides what to do with
@@ -1922,7 +1922,7 @@ EOF
     fi
 
     # A 201 that still carries "success": false is a rejected upload dressed as
-    # a created one - the content-validation path answers that way (ci18-7342).
+    # a created one - the content-validation path answers that way.
     if [[ "$http_code" == "201" ]] && ! response_indicates_failure "$http_code" "$response_body"; then
         log_success "File uploaded successfully: $relative_file_path"
         if [[ "$PTC_VERBOSE" == "true" ]]; then
@@ -2041,7 +2041,7 @@ get_translation_status_quiet() {
     log_debug "Response Body: $response_body"
     
     # A rejected status query answers 200-with-"success":false on older servers
-    # (ci18-7342); without this it parses as an absent status and polls on.
+    # without this it parses as an absent status and polls on.
     if [[ "$http_code" == "200" ]] && response_indicates_failure "$http_code" "$response_body"; then
         log_debug "Status query rejected: $(describe_api_failure "$http_code" "$response_body")"
         return 1
@@ -2118,7 +2118,7 @@ check_translation_status() {
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
-    # Same two-shape rejection as elsewhere (ci18-7342): do not report a
+    # Same two-shape rejection as elsewhere: do not report a
     # rejected query as a retrieved status.
     if [[ "$http_code" == "200" ]] && response_indicates_failure "$http_code" "$response_body"; then
         log_error "Failed to check translation status: $relative_file_path ($(describe_api_failure "$http_code" "$response_body"))"
@@ -2405,7 +2405,7 @@ download_translations() {
     
     # curl wrote the body straight to $temp_zip, so on the older server shape a
     # rejected download lands here as a 200 whose "zip" is really the JSON error
-    # envelope. Read the file back before trusting the status (ci18-7342).
+    # envelope. Read the file back before trusting the status.
     local download_body=""
     if [[ -f "$temp_zip" ]] && [[ "$(head -c 1 "$temp_zip" 2>/dev/null)" == "{" ]]; then
         download_body=$(head -c 4096 "$temp_zip" 2>/dev/null)
@@ -2417,7 +2417,7 @@ download_translations() {
         return 1
     fi
 
-    # ci18-7342 - 202 is the API saying "the archive is not ready yet"
+    # 202 is the API saying "the archive is not ready yet"
     # (TranslationInProgressError, with a Retry-After header), not a download
     # error and not a terminal outcome. It happens routinely because
     # translation_status can report a file ready a moment before its archive
@@ -2768,7 +2768,7 @@ build_detect_payload() {
 call_detect_config() {
     local payload="$1"
     local response
-    # ci18-7276 - only send Authorization when a token exists. detect_config is
+    # Only send Authorization when a token exists. detect_config is
     # anonymous, so an empty "Bearer " header is pointless and, on a stricter
     # proxy, could be rejected as a malformed credential.
     #
@@ -2909,11 +2909,11 @@ detect_ci_provider() {
     fi
 }
 
-# ci18-7254 - the snippet runs through ptc-action rather than curling the CLI
+# The snippet runs through ptc-action rather than curling the CLI
 # itself. The action SHA-pins ptc-cli and third-party actions, ships the right
 # runner image, and is loop-safe (stable PR branch + a [skip translations]
 # guard) - none of which a hand-rolled curl step gets for free. This is the same
-# recipe the in-product token screen prints (ci18-7253), so the CLI, the product
+# recipe the product prints, so the CLI, the product
 # and the action README no longer drift. The CLI stays usable on its own - see
 # the standalone note print_ci_block adds below.
 render_ci_github() {
@@ -2962,7 +2962,11 @@ ptc-translate:
   rules:
     - if: '\$CI_PIPELINE_SOURCE == "push" && \$CI_COMMIT_BRANCH == \$CI_DEFAULT_BRANCH'
   before_script:
-    - apk add --no-cache bash curl git jq
+    # jq is never invoked by the CLI. unzip is - it unpacks the downloaded
+    # translations; alpine already provides it as a busybox applet, so it is
+    # named here only to keep the job working if the image is ever changed.
+    # git is needed by the push step below, not by the CLI.
+    - apk add --no-cache bash curl git unzip
   script:
     - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v${VERSION}/ptc-cli.sh -o ptc-cli.sh
     - chmod +x ptc-cli.sh
@@ -3041,8 +3045,8 @@ OPTIONS:
     -h, --help             Show this help
 
 NOTE:
-    detect_config is currently on the QA environment. Until it reaches
-    production, point --api-url at the QA host."
+    detect_config is anonymous — init needs no API token. A token is only
+    required later, to upload and translate."
 }
 
 # `ptc init` entry point.
@@ -3091,8 +3095,8 @@ cmd_init() {
         return 1
     fi
 
-    # ci18-7276 - `ptc init` no longer requires a token. detect_config is
-    # anonymous (ci18-7275), and config generation is the step a developer runs
+    # `ptc init` requires no token. detect_config is
+    # anonymous, and config generation is the step a developer runs
     # BEFORE they have a token - so demanding one here blocked the exact
     # first-use path it exists to serve, including trial orgs that cannot mint a
     # token at all. A token, if present, is still forwarded (harmless; the
@@ -3131,7 +3135,7 @@ cmd_init() {
                 ;;
             404)
                 log_error "detect_config is not available on this server (HTTP 404)."
-                log_info "This endpoint is currently on the QA environment; point --api-url at the QA host."
+                log_info "Check --api-url. The endpoint is live on the default host; a self-hosted instance may predate it."
                 return 1
                 ;;
             ""|000)

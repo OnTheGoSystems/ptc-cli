@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Tests for ci18-7342 - the run verdict and the polling knobs.
+# Tests for the run verdict and the polling knobs.
 #
 # Two behaviours are covered:
 #
@@ -142,7 +142,7 @@ assert_eq "ready exits zero" "$rc" "0"
 echo
 echo "=== download outcome decides the file's verdict ==="
 
-# ci18-7342 - the config path used to mark a file completed BEFORE downloading
+# The config path used to mark a file completed BEFORE downloading
 # and downgrade a failed download to a warning, so a run that wrote no files
 # still exited 0. There are three outcomes, not two: 2 means the archive is not
 # ready yet (HTTP 202), which must keep the file in the loop — translation_status

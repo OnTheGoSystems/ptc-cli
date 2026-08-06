@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# Tests for ci18-7342 - tolerating both shapes of a rejected API response.
+# Tests for tolerating both shapes of a rejected API response.
 #
 # The PTC API reports a rejected request one of two ways depending on the
 # server build: HTTP 200 with {"success":false,...,"code":422} in the body
-# (older), or a real HTTP 422 carrying the same body (newer). Production and
-# staging do not flip on the same day, so the CLI must read both identically.
+# (older), or a real HTTP 422 carrying the same body (newer). Deployments do not
+# all update on the same day, so the CLI must read both identically.
 #
 # The regressions these guard against are silent rather than loud: a rejected
 # `process` reported as "processing started successfully", and a rejected

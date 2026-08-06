@@ -4,7 +4,7 @@
 #
 # These source ptc-cli.sh and stub curl, so they exercise the real detection,
 # YAML rendering and .ptcignore/CI logic without touching the network. They
-# cover the three contract branches from ci18-7268: a detected layout written to
+# cover the three contract branches: a detected layout written to
 # .ptc-config.yml, a kind:"any" commented template, and the 422 rejection path.
 
 set -uo pipefail
@@ -313,7 +313,7 @@ test_cmd_init_404_gate() {
 }
 
 test_cmd_init_no_token() {
-    echo "--- cmd_init works without a token (ci18-7276)"
+    echo "--- cmd_init works without a token"
 
     local saved="$PTC_API_TOKEN"
     MOCK_DETECT_BODY="$RAILS_BODY"; MOCK_DETECT_CODE="200"
@@ -368,7 +368,7 @@ test_env_token_survives_startup() {
     assert_eq "env token is retained after sourcing" "$got" "env-tok"
 }
 
-# ci18-7254: the GitHub snippet runs through ptc-action rather than a
+# The GitHub snippet runs through ptc-action rather than a
 # hand-rolled curl of the CLI. GitLab cannot - see render_ci_gitlab - so it
 # gets the equivalent job inline. Guards against a regression back to a
 # floating tag / old version / a GitLab job with no runner image, and against

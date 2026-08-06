@@ -1,0 +1,15 @@
+# Configuration for a React application
+# Usage: ./ptc-cli.sh --config-file config/examples/react-app.yml
+#
+# The token is never written here — provide it via the PTC_API_TOKEN
+# environment variable.
+
+source_locale: en
+file_tag_name: main
+
+files:
+  - file: public/locales/en/common.json
+    output: public/locales/{{lang}}/common.json
+
+  - file: public/locales/en/translation.json
+    output: public/locales/{{lang}}/translation.json
