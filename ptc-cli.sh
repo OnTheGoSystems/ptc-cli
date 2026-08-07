@@ -2976,12 +2976,16 @@ ptc-translate:
     # > "Allow Git push requests to the repository" (GitLab 18.4+, off by
     # default). Otherwise set PTC_GIT_PUSH_TOKEN to a project access token with
     # the write_repository scope, as a masked CI/CD variable.
+    # \`git add -A\` comes BEFORE the check, and the check reads the index.
+    # On the first run the translations are new files, and a plain
+    # \`git diff\` only looks at tracked ones - it would report "nothing changed",
+    # skip the push, and leave a green job that produced no merge request.
     - |
-      if ! git diff --quiet; then
-        git config user.email "ci@ptc"
-        git config user.name "PTC Translate"
-        git checkout -B ptc/translations
-        git add -A
+      git config user.email "ci@ptc"
+      git config user.name "PTC Translate"
+      git checkout -B ptc/translations
+      git add -A
+      if ! git diff --cached --quiet; then
         git commit -m "chore(i18n): update translations via PTC [skip ci]"
         git push -o merge_request.create \\
                  -o merge_request.target="\$CI_DEFAULT_BRANCH" \\

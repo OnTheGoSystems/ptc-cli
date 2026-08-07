@@ -408,6 +408,21 @@ test_ci_snippets_use_action() {
     # by default), so the recipe must accept a write_repository token instead.
     assert_contains "gitlab allows a push token override" "$gl" 'PTC_GIT_PUSH_TOKEN:-$CI_JOB_TOKEN'
 
+    # On the first run the translations are NEW files. `git diff`
+    # reads the worktree against the index and only sees tracked paths, so it
+    # reports "nothing changed", the push is skipped, and the job goes green
+    # having produced no merge request. Staging first and asking `--cached`
+    # is what makes run #1 push. Order is the defect, so assert the order,
+    # not merely the presence of both commands.
+    assert_contains "gitlab checks the index, where new files land" "$gl" "git diff --cached --quiet"
+    assert_not_contains "gitlab does not check the worktree, which misses new files" "$gl" "if ! git diff --quiet"
+    local add_at check_at
+    add_at=$(printf '%s\n' "$gl" | grep -n "git add -A" | head -1 | cut -d: -f1)
+    check_at=$(printf '%s\n' "$gl" | grep -n "git diff --cached --quiet" | head -1 | cut -d: -f1)
+    assert_eq "gitlab stages before it checks for changes" \
+        "$([ -n "$add_at" ] && [ -n "$check_at" ] && [ "$add_at" -lt "$check_at" ] && echo "add-then-check" || echo "check-then-add")" \
+        "add-then-check"
+
     # The standalone path is still offered, so the CLI does not depend on the action.
     assert_contains "standalone CLI usage is still shown" "$block" "./ptc-cli.sh --config-file .ptc-config.yml"
 }
