@@ -2496,11 +2496,17 @@ download_translations() {
                 fi
                 log_debug "Moving translation files to target directory..."
                 local moved_count=0
-                if find "$temp_extract_dir" -type f -name "*.json" -o -name "*.po" -o -name "*.pot" -o -name "*.mo" -o -name "*.yml" -o -name "*.yaml" 2>/dev/null | while read -r file; do
+                local move_failed=false
+                # The -name alternatives are grouped with \( \) so -type f applies
+                # to every one of them (without the group it binds only to the
+                # first). The loop is fed by process substitution rather than a
+                # `find | while` pipe: a pipe runs the loop in a subshell, so
+                # moved_count would never survive and always read 0.
+                while IFS= read -r file; do
                     local filename=$(basename "$file")
                     local target_file="$target_dir/$filename"
                     log_debug "Moving: $filename → $target_file"
-                    
+
                     # Check if target file already exists
                     if [[ -f "$target_file" ]]; then
                         log_debug "Overwriting existing file: $target_file"
@@ -2508,39 +2514,36 @@ download_translations() {
                             log_info "Overwriting: $filename"
                         fi
                     fi
-                    
-                    if mv "$file" "$target_file" 2>/dev/null; then
-                        # Verify the move was successful
-                        if [[ -f "$target_file" ]]; then
-                            local final_size=$(stat -f%z "$target_file" 2>/dev/null || stat -c%s "$target_file" 2>/dev/null || echo "unknown")
-                            log_debug "Successfully moved $filename ($final_size bytes)"
-                            if [[ "$PTC_VERBOSE" == "true" ]]; then
-                                log_info "  ✓ $filename ($final_size bytes)"
-                            fi
-                            moved_count=$((moved_count + 1))
-                        else
-                            log_warning "File move reported success but target file not found: $target_file"
-                            return 1
+
+                    if mv "$file" "$target_file" 2>/dev/null && [[ -f "$target_file" ]]; then
+                        local final_size=$(stat -f%z "$target_file" 2>/dev/null || stat -c%s "$target_file" 2>/dev/null || echo "unknown")
+                        log_debug "Successfully moved $filename ($final_size bytes)"
+                        if [[ "$PTC_VERBOSE" == "true" ]]; then
+                            log_info "  ✓ $filename ($final_size bytes)"
                         fi
+                        moved_count=$((moved_count + 1))
                     else
                         log_warning "Failed to move $filename to $target_file"
-                        return 1
+                        move_failed=true
+                        break
                     fi
-                done; then
-                    log_debug "Moved $moved_count translation files successfully"
-                    if [[ "$PTC_VERBOSE" == "true" ]]; then
-                        log_info "Successfully moved $moved_count files"
-                    fi
-                    log_success "Translations unpacked successfully to $target_dir"
-                    log_debug "Cleaning up temporary files..."
-                    rm -rf "$temp_extract_dir" "$temp_zip"
-                    return 0
-                else
+                done < <(find "$temp_extract_dir" -type f \( -name "*.json" -o -name "*.po" -o -name "*.pot" -o -name "*.mo" -o -name "*.yml" -o -name "*.yaml" \) 2>/dev/null)
+
+                if [[ "$move_failed" == "true" ]]; then
                     log_error "Failed to move translation files to target directory"
                     log_debug "Cleaning up temporary files after failure..."
                     rm -rf "$temp_extract_dir" "$temp_zip"
                     return 1
                 fi
+
+                log_debug "Moved $moved_count translation files successfully"
+                if [[ "$PTC_VERBOSE" == "true" ]]; then
+                    log_info "Successfully moved $moved_count files"
+                fi
+                log_success "Translations unpacked successfully to $target_dir"
+                log_debug "Cleaning up temporary files..."
+                rm -rf "$temp_extract_dir" "$temp_zip"
+                return 0
             else
                 log_error "Failed to extract translations ZIP"
                 rm -rf "$temp_extract_dir" "$temp_zip"
