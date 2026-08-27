@@ -313,10 +313,10 @@ Pipelines download the script from a **pinned release tag**, not a moving branch
 so a push to `main` can never change what your build runs:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.3/ptc-cli.sh -o ptc-cli.sh
+curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.4/ptc-cli.sh -o ptc-cli.sh
 ```
 
-Use an exact release tag such as `v1.0.3` to pin, or the floating `v1` tag to
+Use an exact release tag such as `v1.0.4` to pin, or the floating `v1` tag to
 pick up backward-compatible updates automatically. `ptc init` scaffolds the
 pinned URL for you, at the version of the CLI that printed it.
 
@@ -391,15 +391,19 @@ ptc-translate:
   before_script:
     - apk add --no-cache bash curl git unzip
   script:
-    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.3/ptc-cli.sh -o ptc-cli.sh
+    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.4/ptc-cli.sh -o ptc-cli.sh
     - chmod +x ptc-cli.sh
     - ./ptc-cli.sh --config-file .ptc-config.yml
+    # `git add -A` comes BEFORE the check, and the check reads the index.
+    # On the first run the translations are new files, and a plain
+    # `git diff` only looks at tracked ones - it would report "nothing changed",
+    # skip the push, and leave a green job that produced no merge request.
     - |
-      if ! git diff --quiet; then
-        git config user.email "ci@ptc"
-        git config user.name "PTC Translate"
-        git checkout -B ptc/translations
-        git add -A
+      git config user.email "ci@ptc"
+      git config user.name "PTC Translate"
+      git checkout -B ptc/translations
+      git add -A
+      if ! git diff --cached --quiet; then
         git commit -m "chore(i18n): update translations via PTC [skip ci]"
         git push -o merge_request.create \
                  -o merge_request.target="$CI_DEFAULT_BRANCH" \
