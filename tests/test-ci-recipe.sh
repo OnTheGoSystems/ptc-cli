@@ -40,26 +40,44 @@ assert_eq() {
 MOCK_PID=""
 MOCK_PORT=""
 
+MOCK_LOG=""
+
 start_mock() {
+    MOCK_LOG="$(mktemp "${TMPDIR:-/tmp}/ptc-mock-log-XXXXXX")"
     local port
     for port in 18787 18797 18807 18817; do
         PTC_MOCK_PORT="$port" PTC_MOCK_LOCALES=de,fr PTC_MOCK_PENDING=0 \
-            python3 "$MOCK" >/dev/null 2>&1 &
+            python3 "$MOCK" >>"$MOCK_LOG" 2>&1 &
         local pid=$!
         local i
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            if python3 -c "import socket,sys; s=socket.create_connection(('127.0.0.1', $port), 0.4); s.close()" 2>/dev/null; then
+        # Up to ~12s: a cold python start on a hosted macOS runner is slow, and
+        # a short wait here turns into a silently skipped suite - which is how
+        # this suite stopped covering macOS without anyone noticing.
+        for i in $(seq 1 30); do
+            if python3 -c "import socket; socket.create_connection(('127.0.0.1', $port), 0.4).close()" 2>/dev/null; then
                 MOCK_PID="$pid"; MOCK_PORT="$port"; return 0
             fi
             kill -0 "$pid" 2>/dev/null || break
             sleep 0.4
         done
+        disown "$pid" 2>/dev/null || true
         kill "$pid" 2>/dev/null
     done
+    echo "the mock did not come up; its output was:" >&2
+    sed 's/^/    /' "$MOCK_LOG" >&2
     return 1
 }
 
-stop_mock() { [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null; return 0; }
+stop_mock() {
+    # `disown` first: without it the shell announces "Terminated" on stderr when
+    # the background mock is killed, which reads like a test failure.
+    if [ -n "$MOCK_PID" ]; then
+        disown "$MOCK_PID" 2>/dev/null || true
+        kill "$MOCK_PID" 2>/dev/null
+    fi
+    [ -n "$MOCK_LOG" ] && rm -f "$MOCK_LOG"
+    return 0
+}
 trap stop_mock EXIT
 
 # --- fixture ----------------------------------------------------------------
