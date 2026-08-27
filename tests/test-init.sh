@@ -397,10 +397,21 @@ test_ci_snippets_use_action() {
     assert_not_contains "gitlab does not float the CLI on main" "$gl" "ptc-cli/main/ptc-cli.sh"
     assert_contains "gitlab brings its own runner image" "$gl" "image: alpine:"
     assert_contains "gitlab installs bash for the CLI" "$gl" "apk add --no-cache bash"
-    # [skip ci] is the only skip token GitLab actually honours - [skip
-    # translations] is a GitHub-side convention and means nothing here.
-    assert_contains "gitlab guards the loop with a real skip token" "$gl" '[skip ci]'
-    assert_not_contains "gitlab does not rely on a token GitLab ignores" "$gl" '[skip translations]'
+    # [skip ci] IS the token GitLab honours - by creating no pipeline at all for
+    # that push. Used here it silenced the pipeline of the translation merge
+    # request itself, so the translations could not be tested before merge and,
+    # with "Pipelines must succeed" enabled, could not be merged at all. Worse,
+    # a squash or merge commit carried [skip ci] into the default branch and
+    # silenced the whole project's pipeline.
+    #
+    # The guard belongs in rules:, which GitLab evaluates against the commit
+    # message without suppressing anything.
+    # The commit message specifically - the recipe's comments mention [skip ci]
+    # to explain why it is not used, and a bare substring check would trip on
+    # its own rationale.
+    assert_not_contains "gitlab does not silence the merge request's own pipeline" \
+        "$(printf '%s\n' "$gl" | grep 'git commit -m')" '[skip ci]'
+    assert_contains "gitlab guards the loop in rules:, where GitLab evaluates it" "$gl" 'CI_COMMIT_MESSAGE !~'
     assert_contains "gitlab only runs on the default branch" "$gl" 'CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     assert_contains "gitlab reuses one stable MR branch" "$gl" "HEAD:ptc/translations"
     assert_contains "gitlab opens the MR via push options" "$gl" "merge_request.create"
@@ -408,20 +419,46 @@ test_ci_snippets_use_action() {
     # by default), so the recipe must accept a write_repository token instead.
     assert_contains "gitlab allows a push token override" "$gl" 'PTC_GIT_PUSH_TOKEN:-$CI_JOB_TOKEN'
 
-    # On the first run the translations are NEW files. `git diff`
-    # reads the worktree against the index and only sees tracked paths, so it
-    # reports "nothing changed", the push is skipped, and the job goes green
-    # having produced no merge request. Staging first and asking `--cached`
-    # is what makes run #1 push. Order is the defect, so assert the order,
-    # not merely the presence of both commands.
+    # On the first run the translations are NEW files. `git diff` reads the
+    # worktree against the index and only sees tracked paths, so it reports
+    # "nothing changed", the push is skipped, and the job goes green having
+    # produced no merge request. Staging first and asking `--cached` is what
+    # makes run #1 push.
     assert_contains "gitlab checks the index, where new files land" "$gl" "git diff --cached --quiet"
     assert_not_contains "gitlab does not check the worktree, which misses new files" "$gl" "if ! git diff --quiet"
-    local add_at check_at
-    add_at=$(printf '%s\n' "$gl" | grep -n "git add -A" | head -1 | cut -d: -f1)
-    check_at=$(printf '%s\n' "$gl" | grep -n "git diff --cached --quiet" | head -1 | cut -d: -f1)
-    assert_eq "gitlab stages before it checks for changes" \
-        "$([ -n "$add_at" ] && [ -n "$check_at" ] && [ "$add_at" -lt "$check_at" ] && echo "add-then-check" || echo "check-then-add")" \
-        "add-then-check"
+
+    # What is staged comes from the manifest the CLI writes, not from the whole
+    # working directory: the job downloads the CLI, and an earlier step in the
+    # caller's pipeline may have written anything else.
+    assert_not_contains "gitlab does not commit the whole working directory" "$gl" "git add -A"
+    assert_contains "gitlab stages what the run recorded" "$gl" "--pathspec-from-file=/tmp/ptc-written"
+    assert_contains "gitlab reads that file as NUL-separated" "$gl" "--pathspec-file-nul"
+    assert_contains "gitlab asks the CLI for that manifest" "$gl" "--written-manifest /tmp/ptc-written"
+    # An ignored translation path makes git exit 1 while still staging the rest,
+    # and GitLab would abort the job on that alone.
+    assert_contains "gitlab survives a partially ignored stage" "$gl" "--pathspec-file-nul || true"
+    # The CLI is downloaded outside the checkout, or it ends up in the MR.
+    assert_not_contains "gitlab does not download the CLI into the project" "$gl" "-o ptc-cli.sh"
+    assert_contains "gitlab downloads the CLI outside the checkout" "$gl" "-o /tmp/ptc-cli.sh"
+
+    # Behaviour, not wording: tests/test-ci-recipe.sh executes this recipe.
+
+    # The README carries a copy of this recipe. Copies of it have drifted before
+    # - at one point the CLI printed one shape, a fresh install printed another,
+    # and both READMEs printed a third that nothing produced. Compare them.
+    local readme="$TEST_DIR/../README.md"
+    if [ -f "$readme" ]; then
+        local in_readme
+        in_readme=$(awk '/^```yaml$/ { block = ""; inblock = 1; next }
+                         inblock && /^```$/ { if (block ~ /ptc-translate:/) { printf "%s", block; exit } inblock = 0; next }
+                         inblock { block = block $0 "\n" }' "$readme")
+        if [ "$(printf '%s' "$in_readme" | sed 's/[[:space:]]*$//')" = "$(printf '%s\n' "$gl" | sed 's/[[:space:]]*$//')" ]; then
+            pass "the README carries the recipe the CLI actually prints"
+        else
+            fail "the README recipe has drifted from what ptc init prints"
+            diff <(printf '%s' "$in_readme") <(printf '%s\n' "$gl") | head -8 | sed 's/^/        /'
+        fi
+    fi
 
     # The standalone path is still offered, so the CLI does not depend on the action.
     assert_contains "standalone CLI usage is still shown" "$block" "./ptc-cli.sh --config-file .ptc-config.yml"

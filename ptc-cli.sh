@@ -8,7 +8,7 @@ set -euo pipefail  # Strict mode: exit on errors, undefined variables and pipe e
 # Constants
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly VERSION="1.0.4"
+readonly VERSION="1.0.5"
 readonly PTC_USER_AGENT="ptc-cli/${VERSION}"
 
 # Colors for output
@@ -36,6 +36,10 @@ PTC_DRY_RUN=false
 PTC_MONITOR_INTERVAL=5   # seconds between status checks
 PTC_MONITOR_MAX_ATTEMPTS=100  # maximum number of status checks
 PTC_ACTION=""            # specific action to perform: upload, status, download
+# Where to record every file this run writes, for a CI job that must commit the
+# translations and nothing else. Empty means "do not record".
+PTC_WRITTEN_MANIFEST=""
+
 
 
 
@@ -363,6 +367,10 @@ OPTIONS:
     -d, --project-dir DIR          Project directory (default: current)
     --api-url URL                  PTC API base URL (default: https://app.ptc.wpml.org/api/v1/)
     --api-token TOKEN              API token override (prefer the PTC_API_TOKEN env var)
+    --written-manifest FILE        Append every file this run writes to FILE,
+                                   NUL-separated and relative to the repository
+                                   root, for
+                                   git add --pathspec-from-file=FILE --pathspec-file-nul
     --monitor-interval SECONDS     Seconds between status checks (default: 5)
     --monitor-max-attempts COUNT   Maximum status check attempts (default: 100)
     --action ACTION                Perform isolated action: upload, status, download
@@ -426,13 +434,82 @@ show_version() {
     echo "$SCRIPT_NAME v$VERSION"
 }
 
+# Records one written file in the manifest, if one was asked for.
+#
+# A CI job that commits translations has to know which files those are, and it
+# cannot work them out: `git add -A` sweeps in whatever else the job left in the
+# working directory, and the config's `output:` is not where the files land -
+# the archive is unpacked next to the SOURCE file, by basename.
+#
+# NUL-separated and repository-root-relative, so a job can hand the file
+# straight to `git add --pathspec-from-file=FILE --pathspec-file-nul` without
+# parsing anything. Appended, never truncated: one manifest can span `ptc init`
+# and the translate run that follows it.
+record_written_path() {
+    local absolute="$1" root="$2"
+
+    [[ -n "$PTC_WRITTEN_MANIFEST" ]] || return 0
+
+    local relative="${absolute#"$root"/}"
+
+    # Still absolute means the path was not under the root we were given -
+    # which happens when one of them went through a symlink, as /var does on
+    # macOS. Recording it would be worse than skipping it: `git add` treats a
+    # pathspec that matches nothing as fatal and stages NOTHING at all, losing
+    # every other translation in the same call.
+    case "$relative" in
+        /*)
+            log_debug "Not recording '$absolute': outside the repository root '$root'"
+            return 0
+            ;;
+    esac
+
+    # `git add -- <path>` takes a PATHSPEC: `--` stops option parsing, it does
+    # not stop globbing. A translation written to messages[1].json - an ordinary
+    # Next.js or Nuxt layout - would otherwise stage the caller's
+    # messages1.json instead, and git would exit 0 having done it.
+    case "$relative" in
+        *'*'*|*'?'*|*'['*|:*) relative=":(literal)$relative" ;;
+    esac
+
+    printf '%s\0' "$relative" >> "$PTC_WRITTEN_MANIFEST"
+}
+
 # Function to get current git branch
+#
+# CI runners check out a DETACHED HEAD - GitLab, Bitbucket Pipelines and the
+# Jenkins git plugin all do. There `git branch --show-current` SUCCEEDS and
+# prints an empty string, so the `||` fallbacks below are never reached, and the
+# caller ends up with no file tag: the run then stops in validate_args before a
+# single API call. That is why every CI recipe had to pass --file-tag-name by
+# hand, and why the ones that forgot translated nothing at all.
+#
+# The runner knows the branch even when git does not, and says so in the
+# environment. Those variables are consulted only after git has failed to
+# answer, so a normal checkout is unaffected.
 get_current_branch() {
+    local branch=""
+
     if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        git branch --show-current 2>/dev/null || git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main"
-    else
-        echo "main"
+        branch=$(git branch --show-current 2>/dev/null)
+        if [[ -z "$branch" ]]; then
+            branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+            # On a detached HEAD this is the literal string "HEAD", which is a
+            # worse tag than nothing - it would group every CI run together.
+            [[ "$branch" == "HEAD" ]] && branch=""
+        fi
     fi
+
+    if [[ -z "$branch" ]]; then
+        # GitLab, GitHub Actions, Bitbucket Pipelines, Jenkins, CircleCI.
+        branch="${CI_COMMIT_REF_NAME:-${GITHUB_REF_NAME:-${BITBUCKET_BRANCH:-${BRANCH_NAME:-${CIRCLE_BRANCH:-}}}}}"
+    fi
+
+    if [[ -z "$branch" ]]; then
+        branch="main"
+    fi
+
+    echo "$branch"
 }
 
 # Function to get base directory (git root or current working directory)
@@ -2496,7 +2573,17 @@ download_translations() {
                 fi
                 log_debug "Moving translation files to target directory..."
                 local moved_count=0
-                if find "$temp_extract_dir" -type f -name "*.json" -o -name "*.po" -o -name "*.pot" -o -name "*.mo" -o -name "*.yml" -o -name "*.yaml" 2>/dev/null | while read -r file; do
+                # Parenthesised, because `-o` binds looser than the implicit
+                # `-a`: without the group, `-type f` applied only to the first
+                # -name, so a DIRECTORY named e.g. "x.po" matched and was moved
+                # wholesale.
+                #
+                # .php and .properties are here because they are documented -
+                # `type: php` as an additional_translation_files companion, and
+                # .properties as a source pattern. Both were dropped silently:
+                # the archive carried them, the filter did not, and the user was
+                # left waiting for a compiled companion that never arrived.
+                if find "$temp_extract_dir" -type f \( -name "*.json" -o -name "*.po" -o -name "*.pot" -o -name "*.mo" -o -name "*.yml" -o -name "*.yaml" -o -name "*.php" -o -name "*.properties" -o -name "*.xml" -o -name "*.strings" -o -name "*.resx" \) 2>/dev/null | while read -r file; do
                     local filename=$(basename "$file")
                     local target_file="$target_dir/$filename"
                     log_debug "Moving: $filename → $target_file"
@@ -2512,6 +2599,11 @@ download_translations() {
                     if mv "$file" "$target_file" 2>/dev/null; then
                         # Verify the move was successful
                         if [[ -f "$target_file" ]]; then
+                            # Recorded here, where the file is proven on disk,
+                            # so the manifest never names something that is not
+                            # there - a pathspec matching nothing is fatal to
+                            # `git add` and takes the whole staging call with it.
+                            record_written_path "$target_file" "$base_dir"
                             local final_size=$(stat -f%z "$target_file" 2>/dev/null || stat -c%s "$target_file" 2>/dev/null || echo "unknown")
                             log_debug "Successfully moved $filename ($final_size bytes)"
                             if [[ "$PTC_VERBOSE" == "true" ]]; then
@@ -2957,10 +3049,14 @@ ptc-translate:
   image: alpine:3.22
   # Loop-safe twice over: the job only runs on a push to the default branch (the
   # translation push targets ptc/translations, so it cannot retrigger this job),
-  # and the commit carries [skip ci] - the only skip token GitLab honours. The
-  # GitHub-side convention this recipe used before means nothing to GitLab.
+  # and rules: below refuses a commit marked [skip translations].
   rules:
-    - if: '\$CI_PIPELINE_SOURCE == "push" && \$CI_COMMIT_BRANCH == \$CI_DEFAULT_BRANCH'
+    # The second condition is what keeps this loop-safe, and it has to live
+    # here: GitLab evaluates rules: against the commit message, whereas
+    # \`[skip ci]\` in the message would suppress the pipeline of the merge
+    # request itself - leaving the translations untested and, with "Pipelines
+    # must succeed" enabled, unmergeable.
+    - if: '\$CI_PIPELINE_SOURCE == "push" && \$CI_COMMIT_BRANCH == \$CI_DEFAULT_BRANCH && \$CI_COMMIT_MESSAGE !~ /\[skip translations\]/'
   before_script:
     # jq is never invoked by the CLI. unzip is - it unpacks the downloaded
     # translations; alpine already provides it as a busybox applet, so it is
@@ -2968,25 +3064,37 @@ ptc-translate:
     # git is needed by the push step below, not by the CLI.
     - apk add --no-cache bash curl git unzip
   script:
-    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v${VERSION}/ptc-cli.sh -o ptc-cli.sh
-    - chmod +x ptc-cli.sh
-    - ./ptc-cli.sh --config-file .ptc-config.yml
+    # Downloaded OUTSIDE the checkout: anything this job writes into the working
+    # tree is a file the commit below could sweep into the merge request, and
+    # the CLI is 100+ KB of it.
+    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v${VERSION}/ptc-cli.sh -o /tmp/ptc-cli.sh
+    - chmod +x /tmp/ptc-cli.sh
+    - rm -f /tmp/ptc-written
+    - /tmp/ptc-cli.sh --config-file .ptc-config.yml --written-manifest /tmp/ptc-written
     # Pushing needs a token that may write to the repository. CI_JOB_TOKEN can,
     # but ONLY if a maintainer turns on Settings > CI/CD > Job token permissions
     # > "Allow Git push requests to the repository" (GitLab 18.4+, off by
     # default). Otherwise set PTC_GIT_PUSH_TOKEN to a project access token with
     # the write_repository scope, as a masked CI/CD variable.
-    # \`git add -A\` comes BEFORE the check, and the check reads the index.
-    # On the first run the translations are new files, and a plain
-    # \`git diff\` only looks at tracked ones - it would report "nothing changed",
-    # skip the push, and leave a green job that produced no merge request.
+    # Staged from the manifest, so the merge request carries the translations and
+    # nothing else - not this job's downloads, not whatever an earlier step in
+    # your pipeline left in the working directory.
+    #
+    # \`|| true\` is not cosmetic: if a translation lands on a path your
+    # .gitignore covers, git exits 1 while still staging everything else, and
+    # GitLab would abort the job on that exit code alone.
+    #
+    # Staging comes BEFORE the check, and the check reads the index: on the
+    # first run the translations are new files, and a plain \`git diff\` only
+    # looks at tracked ones - it would report "nothing changed", skip the push,
+    # and leave a green job that produced no merge request.
     - |
       git config user.email "ci@ptc"
       git config user.name "PTC Translate"
       git checkout -B ptc/translations
-      git add -A
+      git add --pathspec-from-file=/tmp/ptc-written --pathspec-file-nul || true
       if ! git diff --cached --quiet; then
-        git commit -m "chore(i18n): update translations via PTC [skip ci]"
+        git commit -m "chore(i18n): update translations via PTC [skip translations]"
         git push -o merge_request.create \\
                  -o merge_request.target="\$CI_DEFAULT_BRANCH" \\
                  -o merge_request.title="Update translations from PTC" \\
@@ -3233,6 +3341,14 @@ main() {
                 ;;
             --api-token=*)
                 PTC_API_TOKEN="${1#*=}"
+                shift
+                ;;
+            --written-manifest)
+                PTC_WRITTEN_MANIFEST="$2"
+                shift 2
+                ;;
+            --written-manifest=*)
+                PTC_WRITTEN_MANIFEST="${1#*=}"
                 shift
                 ;;
             --monitor-interval)

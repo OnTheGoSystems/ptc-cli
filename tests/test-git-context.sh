@@ -63,13 +63,31 @@ main() {
     fi
 
     # 2. Detached HEAD — what every CI checkout looks like by default.
+    #
+    # This used to stop the run: `git branch --show-current` succeeds and prints
+    # an empty string there, so the fallbacks were never reached and the empty
+    # tag was rejected before a single API call. Every CI recipe that forgot to
+    # pass --file-tag-name therefore translated nothing at all, which is exactly
+    # what the printed GitLab recipe did.
     ( cd "$repo" && git checkout -q --detach HEAD )
-    output="$(run_cli "$repo")"
+    output="$(CI_COMMIT_REF_NAME=feature/from-ci run_cli "$repo")"
     if echo "$output" | grep -q 'could not auto-detect git branch'; then
-        pass "detached HEAD: auto-detection fails with an explicit message"
-    else
-        fail "detached HEAD: expected the auto-detect failure message"
+        fail "detached HEAD: the run still stops instead of using the runner's branch"
         echo "$output" | tail -3 | sed 's/^/        /'
+    else
+        pass "detached HEAD: the runner's branch variable carries the file tag"
+    fi
+
+    # ...and with no runner variables either, a default beats stopping.
+    # A subshell with the variables unset - `env -u` cannot run a shell
+    # function, and would have made this assert pass on empty output.
+    output="$( unset CI_COMMIT_REF_NAME GITHUB_REF_NAME BITBUCKET_BRANCH BRANCH_NAME CIRCLE_BRANCH
+               run_cli "$repo" )"
+    if echo "$output" | grep -q 'could not auto-detect git branch'; then
+        fail "detached HEAD with no CI variables: the run stops"
+        echo "$output" | tail -3 | sed 's/^/        /'
+    else
+        pass "detached HEAD with no CI variables: falls back rather than stopping"
     fi
 
     # 3. ...and an explicit tag is the way through it. This is why the CI
@@ -84,14 +102,10 @@ main() {
 
     # 4. Outside a repository there IS a default, and the run proceeds.
     #
-    # Note the asymmetry with case 2, which is what it looks like: no repo
-    # falls back to "main", while a repo on a detached HEAD falls back to
-    # nothing. get_current_branch chains
-    #   git branch --show-current || git rev-parse --abbrev-ref HEAD || echo main
-    # and that chain assumes the first command fails on a detached HEAD. It does
-    # not — it prints an empty string and exits 0, so neither fallback is
-    # reached. Asserted here as it stands; changing it changes CLI behaviour and
-    # belongs in its own change, not in a test.
+    # The asymmetry this note used to describe — no repo falls back to "main",
+    # a detached HEAD fell back to nothing — is gone: get_current_branch now
+    # treats an empty `git branch --show-current` as "no answer", consults the
+    # runner's own branch variables, and only then defaults.
     local bare
     bare="$(mktemp -d)"
     mkdir -p "$bare/locales"
