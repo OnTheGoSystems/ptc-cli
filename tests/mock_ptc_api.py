@@ -27,6 +27,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 PORT = int(os.environ.get("PTC_MOCK_PORT", "8787"))
+# Loopback by default: binding 0.0.0.0 on a hosted macOS runner is refused by
+# the firewall, and the suite then skipped itself while the job stayed green.
+# Everything that talks to this mock is on the same host - under act the job
+# container shares the VM's network namespace, so 127.0.0.1 reaches it there
+# too. Override with PTC_MOCK_BIND if something ever needs the wider bind.
+BIND = os.environ.get("PTC_MOCK_BIND", "127.0.0.1")
 LOCALES = [x for x in os.environ.get("PTC_MOCK_LOCALES", "de,fr").split(",") if x]
 PENDING = int(os.environ.get("PTC_MOCK_PENDING", "0"))
 LOGFILE = os.environ.get("PTC_MOCK_LOG", "")
@@ -223,9 +229,9 @@ if __name__ == "__main__":
     servers = []
     for i, name in enumerate(SCENARIOS):
         cls = type(f"Handler_{name}", (Handler,), {"scenario": name})
-        srv = ThreadingHTTPServer(("0.0.0.0", PORT + i), cls)
+        srv = ThreadingHTTPServer((BIND, PORT + i), cls)
         servers.append(srv)
-        journal(f"mock PTC API  0.0.0.0:{PORT + i}  scenario={name}")
+        journal(f"mock PTC API  {BIND}:{PORT + i}  scenario={name}")
     journal(f"locales={LOCALES} pending={PENDING}")
     for srv in servers[1:]:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
