@@ -1,6 +1,11 @@
 # PTC CLI - Private Translation Cloud CLI
 
-[![Self-test](https://github.com/OnTheGoSystems/ptc-cli/actions/workflows/test.yml/badge.svg)](https://github.com/OnTheGoSystems/ptc-cli/actions/workflows/test.yml)
+> **Source of truth: `cli/` in `ci18n/private-translation-cloud`.**
+> This directory is where the CLI is developed and gated (`cli-tests` in
+> `.gitlab-ci/component-tests.yml`). It is published to
+> <https://github.com/OnTheGoSystems/ptc-cli> by the release job on tags
+> matching `cli/vX.Y.Z` (cut by hand on `release`); the GitHub repository is a publish target, not a place
+> to commit. Customer pipelines keep fetching the published copy by tag.
 
 Bash script for processing translation files through PTC (Private Translation Cloud) API with support for various project configurations.
 
@@ -313,10 +318,10 @@ Pipelines download the script from a **pinned release tag**, not a moving branch
 so a push to `main` can never change what your build runs:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.5/ptc-cli.sh -o ptc-cli.sh
+curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.6/ptc-cli.sh -o ptc-cli.sh
 ```
 
-Use an exact release tag such as `v1.0.5` to pin, or the floating `v1` tag to
+Use an exact release tag such as `v1.0.6` to pin, or the floating `v1` tag to
 pick up backward-compatible updates automatically. `ptc init` scaffolds the
 pinned URL for you, at the version of the CLI that printed it.
 
@@ -406,7 +411,7 @@ ptc-translate:
     # Downloaded OUTSIDE the checkout: anything this job writes into the working
     # tree is a file the commit below could sweep into the merge request, and
     # the CLI is 100+ KB of it.
-    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.5/ptc-cli.sh -o /tmp/ptc-cli.sh
+    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.6/ptc-cli.sh -o /tmp/ptc-cli.sh
     - chmod +x /tmp/ptc-cli.sh
     - rm -f /tmp/ptc-written
     - /tmp/ptc-cli.sh --config-file .ptc-config.yml --written-manifest /tmp/ptc-written
