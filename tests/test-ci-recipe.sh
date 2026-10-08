@@ -24,6 +24,18 @@ set -uo pipefail
 readonly TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CLI_UNDER_TEST="$TEST_DIR/../ptc-cli.sh"
 readonly MOCK="$TEST_DIR/mock_ptc_api.py"
+refuse_busy_port() {  # a port that already answers would hide a mock that could not bind (a stale run's server passes the probe)
+    local i  # up to ~5 s for a listener in its last moments (the previous suite's mock shutting down) to go quiet
+    for i in $(seq 1 20); do
+        python3 -c "import socket; socket.create_connection(('127.0.0.1', $1), 0.4).close()" 2>/dev/null || return 0
+        sleep 0.25
+    done
+    echo "port $1 already in use: a stale mock_ptc_api.py? (pgrep -af mock_ptc_api.py)" >&2; exit 1
+}
+stop_mocks() {  # kill the suite's mocks AND wait until they are gone, so the next suite finds their ports free
+    local p i; for p in "$@"; do kill "$p" 2>/dev/null; done
+    for p in "$@"; do wait "$p" 2>/dev/null; for i in $(seq 1 50); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done; done
+}
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 test_count=0; passed_count=0; failed_count=0
@@ -46,6 +58,7 @@ start_mock() {
     MOCK_LOG="$(mktemp "${TMPDIR:-/tmp}/ptc-mock-log-XXXXXX")"
     local port
     for port in 18787 18797 18807 18817; do
+        refuse_busy_port "$port"
         PTC_MOCK_PORT="$port" PTC_MOCK_LOCALES=de,fr PTC_MOCK_PENDING=0 \
             python3 "$MOCK" >>"$MOCK_LOG" 2>&1 &
         local pid=$!
@@ -54,7 +67,7 @@ start_mock() {
         # a short wait here turns into a silently skipped suite - which is how
         # this suite stopped covering macOS without anyone noticing.
         for i in $(seq 1 30); do
-            if python3 -c "import socket; socket.create_connection(('127.0.0.1', $port), 0.4).close()" 2>/dev/null; then
+            if python3 -c "import socket; socket.create_connection(('127.0.0.1', $port), 0.4).close()" 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
                 MOCK_PID="$pid"; MOCK_PORT="$port"; return 0
             fi
             kill -0 "$pid" 2>/dev/null || break
@@ -73,7 +86,7 @@ stop_mock() {
     # the background mock is killed, which reads like a test failure.
     if [ -n "$MOCK_PID" ]; then
         disown "$MOCK_PID" 2>/dev/null || true
-        kill "$MOCK_PID" 2>/dev/null
+        stop_mocks "$MOCK_PID"
     fi
     [ -n "$MOCK_LOG" ] && rm -f "$MOCK_LOG"
     return 0
@@ -127,6 +140,11 @@ prev=""
 for a in "\$@"; do
   [ "\$prev" = "-o" ] && out="\$a"
   prev="\$a"
+  # AGD-11: with PTC_TEST_NO_RELEASE set, the released CLI is unreachable (a lab runner that must use its own copy).
+  case "\$a" in
+    https://raw.githubusercontent.com/*) [ -n "\${PTC_TEST_NO_RELEASE:-}" ] && exit 22 ;;
+    file://*) exec $(command -v curl) "\$@" ;;  # a pinned local copy: the real curl reads it
+  esac
 done
 case "\$out" in
   *ptc-cli.sh) cp "$CLI_UNDER_TEST" "\$out"; chmod +x "\$out"; exit 0 ;;
@@ -209,6 +227,25 @@ test_recipe_translates() {
     rm -rf "$dir"
 }
 
+# --- 1b. AGD-11: a CI/CD variable PTC_CLI_URL pins another copy of the CLI ---
+test_cli_url_knob() {
+    echo -e "${YELLOW}[TEST]${NC} PTC_CLI_URL pins the CLI the recipe downloads; unset, the release tag"
+    local line dir rc version
+    version="$(sed -n 's/^readonly VERSION="\(.*\)"/\1/p' "$CLI_UNDER_TEST" | head -1)"
+    line="$(recipe_script | grep -F -- '-o /tmp/ptc-cli.sh')"
+    assert_eq "the download line defaults to the release tag and honours PTC_CLI_URL" "$line" \
+        "curl -fsSL \"\${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v${version}/ptc-cli.sh}\" -o /tmp/ptc-cli.sh"
+    dir="$(make_fixture)"
+    PTC_CLI_URL="file://$(cd "$TEST_DIR/.." && pwd)/ptc-cli.sh"
+    export PTC_TEST_NO_RELEASE=1 PTC_CLI_URL
+    rc="$(run_recipe "$dir")"
+    unset PTC_TEST_NO_RELEASE PTC_CLI_URL
+    assert_eq "with the release unreachable, PTC_CLI_URL=file://... runs the recipe" "$rc" "0"
+    assert_eq "the translations reached disk" \
+        "$(ls "$dir/locales" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ *$//')" "de.json en.json fr.json"
+    rm -rf "$dir"
+}
+
 # --- 2. the merge request carries translations and nothing else -------------
 test_recipe_commits_only_translations() {
     echo -e "${YELLOW}[TEST]${NC} the merge request carries only what the run wrote"
@@ -232,7 +269,7 @@ test_cli_not_left_behind() {
     dir="$(make_fixture)"
     run_recipe "$dir" >/dev/null
 
-    if printf '%s' "$(committed_files "$dir")" | grep -q 'ptc-cli.sh'; then
+    if grep -q 'ptc-cli.sh' <<<"$(committed_files "$dir")"; then
         fail "the downloaded CLI was committed into the merge request"
     else
         pass "the downloaded CLI was not committed"
@@ -273,15 +310,22 @@ test_push_shape() {
     run_recipe "$dir" >/dev/null
     args="$(cat "$PTC_TEST_PUSH_LOG" 2>/dev/null || echo '')"
 
-    if printf '%s' "$args" | grep -q 'merge_request.create'; then
+    if grep -q 'merge_request.create' <<<"$args"; then
         pass "the push creates a merge request"
     else
         fail "the push does not create a merge request (args: $args)"
     fi
-    if printf '%s' "$args" | grep -q 'merge_request.target=main'; then
+    if grep -q 'merge_request.target=main' <<<"$args"; then
         pass "the merge request targets the default branch"
     else
         fail "the merge request does not target the default branch (args: $args)"
+    fi
+    # Eran 2026-09-29: PTC's findings (or the neutral text) ride in the push as the merge request's description, on
+    # ONE line - git refuses a push option that holds a newline.
+    if grep -qE 'merge_request\.description=[^ ]' <<<"$args" && [ "$(wc -l < "$PTC_TEST_PUSH_LOG")" -eq 1 ]; then
+        pass "the push sets the merge request description on one line"
+    else
+        fail "the push carries no one-line merge request description (args: $args)"
     fi
     rm -rf "$dir"
 }
@@ -311,6 +355,7 @@ main() {
     echo "mock PTC API on 127.0.0.1:$MOCK_PORT"
 
     test_recipe_translates
+    test_cli_url_knob
     test_recipe_commits_only_translations
     test_cli_not_left_behind
     test_no_translations_no_push

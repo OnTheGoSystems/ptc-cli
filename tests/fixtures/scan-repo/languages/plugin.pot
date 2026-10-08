@@ -1,0 +1,21 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#. Button label on the settings screen
+#: includes/admin.php:3
+msgid "Save changes"
+msgstr ""
+
+#: includes/admin.php:4
+msgid "Hello %s"
+msgstr ""
+
+msgctxt "noun"
+msgid "Post"
+msgstr ""
+
+msgid "%d item"
+msgid_plural "%d items"
+msgstr[0] ""
+msgstr[1] ""

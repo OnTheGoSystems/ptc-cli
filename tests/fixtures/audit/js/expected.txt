@@ -1,0 +1,5 @@
+hardcoded_string jsx_text_literal 7
+hardcoded_string jsx_attr_literal 8
+concatenation t_result_plus_join 9
+concatenation template_literal_concat 10
+locale_format number_without_locale 11

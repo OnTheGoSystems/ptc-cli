@@ -8,7 +8,7 @@ set -uo pipefail  # Note: -e is not used to allow tests to fail without stopping
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 readonly PTC_CLI="$PROJECT_DIR/ptc-cli.sh"
-readonly FIXTURES_DIR="$SCRIPT_DIR/fixtures"
+readonly FIXTURES_DIR="$SCRIPT_DIR/fixtures/runner"   # scratch; tests/fixtures/scan-repo is committed
 
 # Colors for output
 readonly RED='\033[0;31m'

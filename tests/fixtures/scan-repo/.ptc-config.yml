@@ -1,0 +1,9 @@
+source_locale: en
+files:
+  - file: config/locales/en.yml
+    output: config/locales/{{lang}}.yml
+  - file: languages/plugin.pot
+    output: languages/plugin-{{lang}}.po
+guide:
+  session_id: gs_mock
+  languages: [de, fr]

@@ -172,6 +172,25 @@ assert_eq "a not-ready archive is not failed" "${#failed_files[@]}" "0"
 assert_eq "a not-ready archive is not completed" "${#completed_files[@]}" "0"
 
 echo
+echo "=== the default monitor budget scales with the number of files (decision 4) ==="
+
+# A fixed 100 x 5 s = 500 s ran out on a 40-file push queued behind the upload rate limit. Left at the default,
+# the budget is max(100, 20 x files); a flag or the config's monitor_max_attempts is never rescaled.
+PTC_MONITOR_MAX_ATTEMPTS="100"; PTC_MONITOR_MAX_ATTEMPTS_SET="false"
+scale_monitor_max_attempts 3
+assert_eq "3 files keep the floor of 100" "$PTC_MONITOR_MAX_ATTEMPTS" "100"
+PTC_MONITOR_MAX_ATTEMPTS="100"; PTC_MONITOR_MAX_ATTEMPTS_SET="false"
+scale_monitor_max_attempts 12
+assert_eq "12 files get 20 x 12 = 240" "$PTC_MONITOR_MAX_ATTEMPTS" "240"
+PTC_SOURCE_LOCALE=""; PTC_FILE_TAG_NAME=""; PTC_MONITOR_INTERVAL="5"; PTC_MONITOR_MAX_ATTEMPTS="100"; PTC_MONITOR_MAX_ATTEMPTS_SET="false"
+parse_config_file "$(write_config fixed.yml 'source_locale: en' 'monitor_max_attempts: 50' 'files:' '  - file: locales/en.json' '    output: locales/{{lang}}.json')" >/dev/null 2>&1
+scale_monitor_max_attempts 12
+assert_eq "a config-set budget is not rescaled" "$PTC_MONITOR_MAX_ATTEMPTS" "50"
+PTC_MONITOR_MAX_ATTEMPTS="100"; PTC_MONITOR_MAX_ATTEMPTS_SET="true"   # what --monitor-max-attempts 100 leaves
+scale_monitor_max_attempts 12
+assert_eq "a flag-set budget (even 100) is not rescaled" "$PTC_MONITOR_MAX_ATTEMPTS" "100"
+
+echo
 echo "=========================================="
 echo "Total:  $test_count"
 echo -e "Passed: ${GREEN}${passed_count}${NC}"

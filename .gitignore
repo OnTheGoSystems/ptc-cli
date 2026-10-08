@@ -7,7 +7,7 @@
 *.log
 
 # Test data
-tests/fixtures/
+tests/fixtures/runner/
 tests/output/
 
 # Backup files

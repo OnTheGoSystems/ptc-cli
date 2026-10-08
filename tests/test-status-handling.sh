@@ -147,10 +147,11 @@ test_monitored_status_classifier() {
     classify_monitored_status "completed" "f.json" >/dev/null 2>&1; rc=$?
     assert_eq "completed -> download" "$rc" "0"
 
-    for s in failed out_of_credit; do
-        classify_monitored_status "$s" "f.json" >/dev/null 2>&1; rc=$?
-        assert_eq "$s -> give up" "$rc" "1"
-    done
+    classify_monitored_status "out_of_credit" "f.json" >/dev/null 2>&1; rc=$?
+    assert_eq "out_of_credit -> give up" "$rc" "1"
+    # S2-R2 item 1: failed segments never block the file; it is downloaded and delivered when PTC serves it.
+    classify_monitored_status "failed" "f.json" >/dev/null 2>&1; rc=$?
+    assert_eq "failed -> download, deliver when served" "$rc" "5"
 
     for s in queued in_progress pending null status_unknown; do
         classify_monitored_status "$s" "f.json" >/dev/null 2>&1; rc=$?
@@ -161,14 +162,14 @@ test_monitored_status_classifier() {
     # translate. Kept pollable (the attachment may still be landing) but it must
     # be called out rather than passing for progress.
     rc=0; out=$(classify_monitored_status "draft" "f.json" 2>&1) || rc=$?
-    if [[ "$rc" == "2" ]] && printf '%s' "$out" | grep -q "No uploaded file behind"; then
+    if [[ "$rc" == "2" ]] && grep -q "No uploaded file behind" <<<"$out"; then
         pass "draft -> keep polling, but surfaced"
     else
         fail "draft (rc=$rc): $out"
     fi
 
     rc=0; out=$(classify_monitored_status "not_found" "f.json" 2>&1) || rc=$?
-    if [[ "$rc" == "2" ]] && printf '%s' "$out" | grep -q "Status unavailable"; then
+    if [[ "$rc" == "2" ]] && grep -q "Status unavailable" <<<"$out"; then
         pass "not_found -> keep polling, but surfaced"
     else
         fail "not_found (rc=$rc): $out"
@@ -283,19 +284,19 @@ test_all_check_status_callers_handle_terminal() {
 
     local out
     out=$(perform_download_action "$base/en.json" 2>&1) || true
-    if printf '%s' "$out" | grep -q "Translation failed and will not complete"; then
+    if grep -q "Translation failed and will not complete" <<<"$out"; then
         pass "perform_download_action reports a terminal file"
     else
         fail "perform_download_action stayed silent on a terminal file: $out"
     fi
-    if printf '%s' "$out" | grep -q "Failed to download 1 file"; then
+    if grep -q "Failed to download 1 file" <<<"$out"; then
         pass "perform_download_action counts it as failed"
     else
         fail "perform_download_action did not count the terminal file as failed: $out"
     fi
 
     out=$(perform_status_action "$base/en.json" 2>&1) || true
-    if printf '%s' "$out" | grep -q "Translation failed and will not complete"; then
+    if grep -q "Translation failed and will not complete" <<<"$out"; then
         pass "perform_status_action reports a terminal file"
     else
         fail "perform_status_action stayed silent on a terminal file: $out"
@@ -319,7 +320,7 @@ test_preflight() {
     local out rc
 
     out=$(preflight_check 2>&1); rc=$?
-    if [[ $rc -eq 0 ]] && printf '%s' "$out" | grep -q "Preflight OK: source=en, plan=trial, balance=4200 trial words"; then
+    if [[ $rc -eq 0 ]] && grep -q "Preflight OK: source=en, plan=trial, balance=4200 trial words" <<<"$out"; then
         pass "healthy account reports one OK line"
     else
         fail "healthy account (rc=$rc): $out"
@@ -332,8 +333,8 @@ test_preflight() {
     MOCK_BALANCE_BODY='{"plan":"pro","status":"unlimited","active":true,"seats":99,"trial_wallet":{"words_count":0},"ate_wallet":{"words_count":0}}'
     MOCK_TRIAL_BALANCE="0"; MOCK_PREPAID_BALANCE="0"
     out=$(preflight_check 2>&1); rc=$?
-    if [[ $rc -eq 0 ]] && printf '%s' "$out" | grep -q "balance=unlimited" \
-        && ! printf '%s' "$out" | grep -q "balance is 0"; then
+    if [[ $rc -eq 0 ]] && grep -q "balance=unlimited" <<<"$out" \
+        && ! grep -q "balance is 0" <<<"$out"; then
         pass "unlimited plan reports unlimited, no zero-balance warning"
     else
         fail "unlimited plan (rc=$rc): $out"
@@ -344,7 +345,7 @@ test_preflight() {
     local saved_token="$PTC_API_TOKEN"
     PTC_API_TOKEN=""
     out=$(preflight_check 2>&1); rc=$?
-    if [[ $rc -eq 1 ]] && printf '%s' "$out" | grep -q "no API token"; then
+    if [[ $rc -eq 1 ]] && grep -q "no API token" <<<"$out"; then
         pass "missing token aborts"
     else
         fail "missing token (rc=$rc): $out"
@@ -353,7 +354,7 @@ test_preflight() {
 
     MOCK_STATUS_CODE="401"; MOCK_STATUS_BODY=""
     out=$(preflight_check 2>&1); rc=$?
-    if [[ $rc -eq 1 ]] && printf '%s' "$out" | grep -q "rejected the API token"; then
+    if [[ $rc -eq 1 ]] && grep -q "rejected the API token" <<<"$out"; then
         pass "rejected token aborts with a specific message"
     else
         fail "rejected token (rc=$rc): $out"
@@ -363,7 +364,7 @@ test_preflight() {
     # must not fail a run that would otherwise have worked.
     MOCK_STATUS_CODE="503"; MOCK_STATUS_BODY='{"error":"upstream"}'
     out=$(preflight_check 2>&1); rc=$?
-    if [[ $rc -eq 0 ]] && printf '%s' "$out" | grep -q "could not reach the PTC API"; then
+    if [[ $rc -eq 0 ]] && grep -q "could not reach the PTC API" <<<"$out"; then
         pass "unreachable API warns but continues"
     else
         fail "unreachable API should not abort (rc=$rc): $out"
@@ -372,7 +373,7 @@ test_preflight() {
     MOCK_STATUS_CODE="200"
     MOCK_STATUS_BODY='{"source_language":{"id":1,"iso":"de","name":"German"},"languages":[{"id":2,"iso":"fr","name":"French"}]}'
     out=$(preflight_check 2>&1); rc=$?
-    if [[ $rc -eq 0 ]] && printf '%s' "$out" | grep -q "Source locale mismatch"; then
+    if [[ $rc -eq 0 ]] && grep -q "Source locale mismatch" <<<"$out"; then
         pass "source locale mismatch warns but continues"
     else
         fail "locale mismatch (rc=$rc): $out"
@@ -381,7 +382,7 @@ test_preflight() {
     MOCK_STATUS_BODY='{"source_language":{"id":1,"iso":"en","name":"English"},"languages":[]}'
     MOCK_BALANCE_BODY='{"plan":"pro","active":false}'
     out=$(preflight_check 2>&1); rc=$?
-    if [[ $rc -eq 1 ]] && printf '%s' "$out" | grep -q "not active"; then
+    if [[ $rc -eq 1 ]] && grep -q "not active" <<<"$out"; then
         pass "inactive subscription aborts"
     else
         fail "inactive subscription (rc=$rc): $out"
@@ -390,8 +391,8 @@ test_preflight() {
     # A broken /balance must not invent a wallet or a scary zero-balance warning.
     MOCK_BALANCE_CODE="500"; MOCK_BALANCE_BODY='{"error":"stripe exploded"}'
     out=$(preflight_check 2>&1); rc=$?
-    if [[ $rc -eq 0 ]] && printf '%s' "$out" | grep -q "4200 trial / 0 prepaid words" \
-        && ! printf '%s' "$out" | grep -q "balance is 0"; then
+    if [[ $rc -eq 0 ]] && grep -q "4200 trial / 0 prepaid words" <<<"$out" \
+        && ! grep -q "balance is 0" <<<"$out"; then
         pass "unknown plan reports both wallets, no false warning"
     else
         fail "unknown plan (rc=$rc): $out"

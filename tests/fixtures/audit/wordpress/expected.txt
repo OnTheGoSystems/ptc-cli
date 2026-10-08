@@ -1,0 +1,7 @@
+hardcoded_string php_echo_literal 9
+concatenation gettext_concat_fragment 11
+i18n_call_misuse gettext_variable_domain 12
+i18n_call_misuse gettext_concat_msgid 13
+plural plural_ternary 14
+locale_format date_literal_format 15
+hardcoded_string php_html_text 20

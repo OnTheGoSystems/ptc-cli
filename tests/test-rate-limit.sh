@@ -51,6 +51,8 @@ assert_contains() {
 # sleeps for real would take minutes and would be the first thing anyone skips.
 SLEPT=()
 sleep() { SLEPT+=("$1"); }
+# 1.2.3 waits through ptc_sleep (a backgrounded sleep a signal interrupts, E18); record it the same way.
+ptc_sleep() { SLEPT+=("$1"); }
 
 header_file_with() {
     local file
@@ -194,6 +196,39 @@ assert_eq "so does starting processing" "$?" "$PTC_RATE_LIMITED"
 ptc_curl() { printf '%s%s' '{"success":false,"error":"File format is invalid"}' '422'; }
 make_ptc_api_call "$work_dir/en.json" "en.json" "{{lang}}.json" "main" "" >/dev/null 2>&1
 assert_eq "a real rejection is still a plain failure" "$?" "1"
+
+echo
+echo "=== S2-R12: a transient 5xx / no response is not a PTC rejection ==="
+
+ptc_curl() { printf '%s%s' '<html><body>ERR_NGROK_3004 Bad gateway</body></html>' '503'; }
+start_processing "$work_dir/en.json" "en.json" "main" >/dev/null 2>&1
+assert_eq "a 503 on process asks for a transient retry" "$?" "$PTC_TRANSIENT"
+make_ptc_api_call "$work_dir/en.json" "en.json" "{{lang}}.json" "main" "" >/dev/null 2>&1
+assert_eq "so does a 503 on upload" "$?" "$PTC_TRANSIENT"
+ptc_curl() { printf '%s' '000'; }
+start_processing "$work_dir/en.json" "en.json" "main" >/dev/null 2>&1
+assert_eq "no response at all (HTTP 000) is transient too" "$?" "$PTC_TRANSIENT"
+ptc_curl() { printf '%s%s' '<html><body>ERR_NGROK_3004 Bad gateway</body></html>' '503'; }
+out=$(start_processing "$work_dir/en.json" "en.json" "main" 2>&1)
+assert_contains "the log names the layer's own error code from the body" "$out" "ERR_NGROK_3004"
+
+CALLS=0
+SLEPT=()
+transient_twice() { CALLS=$((CALLS + 1)); (( CALLS <= 2 )) && return "$PTC_TRANSIENT"; return 0; }
+call_with_rate_limit_retry transient_twice >/dev/null 2>&1
+assert_eq "a transient failure twice then success exits 0" "$?" "0"
+assert_eq "after three calls" "$CALLS" "3"
+assert_eq "with a backoff between them" "${SLEPT[*]}" "$PTC_TRANSIENT_BASE_DELAY $((PTC_TRANSIENT_BASE_DELAY * 2))"
+
+CALLS=0
+SLEPT=()
+always_transient() { CALLS=$((CALLS + 1)); return "$PTC_TRANSIENT"; }
+out=$(call_with_rate_limit_retry always_transient 2>&1)
+rc=$?
+CALLS=0; call_with_rate_limit_retry always_transient >/dev/null 2>&1
+assert_eq "a permanent transient failure gives up with PTC_UNREACHABLE" "$rc" "$PTC_UNREACHABLE"
+assert_eq "after the configured retries" "$CALLS" "$((PTC_TRANSIENT_MAX_RETRIES + 1))"
+assert_contains "and says PTC could not be reached, not that it rejected the file" "$out" "could not reach PTC"
 
 rm -rf "$work_dir"
 

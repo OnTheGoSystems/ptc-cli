@@ -1,0 +1,14 @@
+# Source strings for the users area
+en:
+  users:
+    title: "Users"
+    greeting: "Hello, %{name}!"
+    count:
+      one: "%{count} user"
+      other: "%{count} users"
+    index:
+      title: Team members
+  # Shown in the footer
+  footer: |
+    All rights reserved.
+    Contact us.

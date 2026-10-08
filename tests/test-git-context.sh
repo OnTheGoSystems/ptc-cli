@@ -55,7 +55,7 @@ main() {
 
     # 1. On a branch, the tag is detected and the run proceeds.
     output="$(run_cli "$repo")"
-    if echo "$output" | grep -q 'Processing completed successfully'; then
+    if grep -q 'Processing completed successfully' <<<"$output"; then
         pass "on a branch: the file tag is auto-detected and the run completes"
     else
         fail "on a branch: the run did not complete"
@@ -71,7 +71,7 @@ main() {
     # what the printed GitLab recipe did.
     ( cd "$repo" && git checkout -q --detach HEAD )
     output="$(CI_COMMIT_REF_NAME=feature/from-ci run_cli "$repo")"
-    if echo "$output" | grep -q 'could not auto-detect git branch'; then
+    if grep -q 'could not auto-detect git branch' <<<"$output"; then
         fail "detached HEAD: the run still stops instead of using the runner's branch"
         echo "$output" | tail -3 | sed 's/^/        /'
     else
@@ -83,7 +83,7 @@ main() {
     # function, and would have made this assert pass on empty output.
     output="$( unset CI_COMMIT_REF_NAME GITHUB_REF_NAME BITBUCKET_BRANCH BRANCH_NAME CIRCLE_BRANCH
                run_cli "$repo" )"
-    if echo "$output" | grep -q 'could not auto-detect git branch'; then
+    if grep -q 'could not auto-detect git branch' <<<"$output"; then
         fail "detached HEAD with no CI variables: the run stops"
         echo "$output" | tail -3 | sed 's/^/        /'
     else
@@ -93,7 +93,7 @@ main() {
     # 3. ...and an explicit tag is the way through it. This is why the CI
     #    recipes the CLI prints pass one.
     output="$(run_cli "$repo" --file-tag-name my-branch)"
-    if echo "$output" | grep -q 'Processing completed successfully'; then
+    if grep -q 'Processing completed successfully' <<<"$output"; then
         pass "detached HEAD: an explicit --file-tag-name completes the run"
     else
         fail "detached HEAD: an explicit --file-tag-name should complete the run"
@@ -111,7 +111,7 @@ main() {
     mkdir -p "$bare/locales"
     printf '{"hello":"Hello"}\n' > "$bare/locales/en.json"
     output="$(run_cli "$bare")"
-    if echo "$output" | grep -q 'Processing completed successfully'; then
+    if grep -q 'Processing completed successfully' <<<"$output"; then
         pass "outside a repository: falls back to a default tag and completes"
     else
         fail "outside a repository: expected the default-tag fallback to complete the run"

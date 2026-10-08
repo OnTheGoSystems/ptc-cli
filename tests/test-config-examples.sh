@@ -53,16 +53,16 @@ assert_parses() {
     name="$(basename "$config")"
     output="$(run_example "$config")"
 
-    if echo "$output" | grep -q "Missing 'files:' section"; then
+    if grep -q "Missing 'files:' section" <<<"$output"; then
         fail "$name is parsed as a config (got: Missing 'files:' section)"
         return
     fi
-    if echo "$output" | grep -q 'File not found'; then
+    if grep -q 'File not found' <<<"$output"; then
         fail "$name declares source paths the parser then cannot find"
         echo "$output" | grep 'File not found' | sed 's/^/        /'
         return
     fi
-    if ! echo "$output" | grep -q 'Processing files from config'; then
+    if ! grep -q 'Processing files from config' <<<"$output"; then
         fail "$name never reached file processing"
         echo "$output" | tail -3 | sed 's/^/        /'
         return

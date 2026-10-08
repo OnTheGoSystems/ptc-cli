@@ -1,0 +1,5 @@
+hardcoded_string view_text_literal 2
+hardcoded_string helper_literal 3
+concatenation string_plus_t 4
+plural pluralize_helper 5
+locale_format strftime_literal 6

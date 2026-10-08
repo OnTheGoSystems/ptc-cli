@@ -1,0 +1,7 @@
+<h1><%= t('.title') %></h1>
+<p>No items were found here</p>
+<%= link_to 'Create a new item', new_item_path %>
+<p><%= 'Hello ' + t('.name') %></p>
+<p><%= pluralize(@items.size, 'item') %></p>
+<p><%= @item.created_at.strftime('%d/%m/%Y') %></p>
+<p><%= l(@item.created_at, format: :short) %></p>

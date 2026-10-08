@@ -143,6 +143,27 @@ assert_contains "an accepted 200 reports success" "$output" "processing started 
 rm -f "$probe_file"
 
 echo
+echo "=== a project with no target languages: the status and download say so (F15) ==="
+
+# agent-guide S1 F15: when PTC had not accepted the config commit the project had no target languages, and the
+# translate step failed every file with a bare HTTP 404. The API now answers 422 with code no_target_languages.
+NO_TARGETS_BODY='{"error":"project has no target languages yet (the PTC config commit was not accepted)","code":"no_target_languages"}'
+ptc_curl() {
+    local out=""
+    while [[ $# -gt 0 ]]; do [[ "$1" == "-o" ]] && { out="$2"; shift; }; shift; done
+    if [[ -n "$out" ]]; then printf '%s' "$NO_TARGETS_BODY" > "$out"; else printf '%s' "$NO_TARGETS_BODY"; fi
+    printf '%s' "422"
+}
+output=$(check_translation_status "locales/en.json" "main" 2>&1)
+rc=$?
+assert_eq "no target languages is terminal for the status poll" "$rc" "3"
+assert_contains "the status poll prints the reason" "$output" "project has no target languages yet (the PTC config commit was not accepted)"
+output=$(download_translations "locales/en.json" "main" "$(mktemp -d)" 2>&1)
+rc=$?
+assert_eq "no target languages fails the download" "$rc" "1"
+assert_contains "the download prints the reason" "$output" "project has no target languages yet (the PTC config commit was not accepted)"
+
+echo
 echo "=========================================="
 echo "Total:  $test_count"
 echo -e "Passed: ${GREEN}${passed_count}${NC}"
