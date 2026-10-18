@@ -16,6 +16,10 @@ Endpoints (all under /api/v1/):
     POST guide/wait {task_id, timeout_s}   -> (ptc-cli 1.2.0) long-poll; by task id:
          gt_wait  "waiting" for PTC_MOCK_WAIT_ROUNDS calls (default 1), then accepted
          gt_never always "waiting"      gt_flaky  503 once, then accepted
+         gt_notproved / gt_capped  always "waiting" with a stored needs_more verdict (GAP-F3): 23 reasons, or the
+                   server's own capped list (20 + its "and N more" line)
+         gt_grouping  accepted, next null + `waiting` (GAP-F4/F5: the next task waits on PTC's background grouping)
+    GET guide/status?session_id=gs_grouping -> carries the same `waiting` (GAP-F5)
          gt_rej   rejected              anything else: accepted at once
     action_runs answers {received, provenance, provenance_reason}: ci_id_token decoded (HS256 signature
          checked when PTC_MOCK_LAB_SECRET is set), claims repository|project_path and sha vs the body.
@@ -61,6 +65,15 @@ OUT_OF_CREDIT = {x for x in os.environ.get("PTC_MOCK_OUT_OF_CREDIT", "").split("
 # S2-R3B F-2 knob (file_path list): translation_status answers "in_progress" forever (a first translation that outlives
 # the CI job's monitor bound).
 STILL_TRANSLATING = {x for x in os.environ.get("PTC_MOCK_STILL_TRANSLATING", "").split(",") if x}
+# GAP-CI-2 F14 knob (file_path list): translation_status answers "reviewing" forever (every string translated and stored in
+# PTC, the project's review holding the delivery: POL-11, SourceFilesController#api_status).
+REVIEWING = {x for x in os.environ.get("PTC_MOCK_REVIEWING", "").split(",") if x}
+# GAP-F15 knobs (file_path lists): translation_status answers a PARTLY translated file. FAILED_STRINGS: "failed" with the
+# strings counts (3 of 10 translated, 7 failed); PARTIAL_COMPLETED: "completed" while 2 of 10 strings were never translated;
+# FAILED_BARE: "failed" without counts (a server before GAP-F15). Their downloads are served as for any completed file.
+FAILED_STRINGS = {x for x in os.environ.get("PTC_MOCK_FAILED_STRINGS", "").split(",") if x}
+PARTIAL_COMPLETED = {x for x in os.environ.get("PTC_MOCK_PARTIAL_COMPLETED", "").split(",") if x}
+FAILED_BARE = {x for x in os.environ.get("PTC_MOCK_FAILED_BARE", "").split(",") if x}
 # S2-R12 knobs (file_path lists): process answers a proxy-shaped 503 (an ngrok error page, no PTC JSON) -
 # always, or only on the first call for that file.
 PROCESS_503 = {x for x in os.environ.get("PTC_MOCK_PROCESS_503", "").split(",") if x}
@@ -75,6 +88,13 @@ STATUS_404_SEEN = set()
 # background (the per-file door never builds it inline); the next download answers the zip.
 DOWNLOAD_BUILDING_ONCE = {x for x in os.environ.get("PTC_MOCK_DOWNLOAD_BUILDING_ONCE", "").split(",") if x}
 DOWNLOAD_BUILDING_SEEN = set()
+# WF-20 knobs: download_translations answers the in-progress 202 (render_translation_pending: Retry-After header and
+# retry_after body) for these files on every call, with PTC_MOCK_RETRY_AFTER seconds (the server's
+# reschedulable_job.retry_delay, 30 s in production; default 1 here).
+DOWNLOAD_BUILDING = {x for x in os.environ.get("PTC_MOCK_DOWNLOAD_BUILDING", "").split(",") if x}
+RETRY_AFTER = os.environ.get("PTC_MOCK_RETRY_AFTER", "1")
+# WF-11 knob: guide/action_runs answers 422 with this `error` text (production: {"error":"payload too large"}).
+ACTION_RUN_422 = os.environ.get("PTC_MOCK_ACTION_RUN_422", "")
 LOGFILE = os.environ.get("PTC_MOCK_LOG", "")
 
 # One process, one port per scenario, so a workflow picks a failure mode purely
@@ -91,11 +111,17 @@ API_DONE = ("Setup is done; the delivery channel is the API: run `ptc sync` in t
             "write the translations (and again after every change); no CI file and no push are needed.")
 WAIT_ROUNDS = int(os.environ.get("PTC_MOCK_WAIT_ROUNDS", "1"))
 WAIT_CALLS = defaultdict(int)
+# GAP-F4/F5: the `waiting` text PTC sends when the next task waits on its background grouping.
+GROUPING_WAITING = ('PTC is grouping the strings of 3 file(s) in the background (running since 14:02Z); the feature inventory is built after it. Run guide next again in a minute')
 LAB_SECRET = os.environ.get("PTC_MOCK_LAB_SECRET", "")
 # (L11, SF-31) the conversion pushes on guide answers (see _json).
 PUSHES = os.environ.get("PTC_MOCK_PUSHES", "") == "1"
 # (L11, SF-32) PTC_MOCK_REFUSE_PROCESS=1: every PUT source_files/process answers the trial cap's 402.
 REFUSE_PROCESS = os.environ.get("PTC_MOCK_REFUSE_PROCESS", "") == "1"
+# (ptc-cli 1.5.0, L21-3) file_path list: PUT source_files/process answers 200 + code suite_setup_pending (the project's
+# suite is still being set up: the upload is stored, not translated), body from the recorded fixture.
+SUITE_PENDING = {x for x in os.environ.get("PTC_MOCK_SUITE_PENDING", "").split(",") if x}
+SUITE_PENDING_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "suite_setup_pending", "process.json")
 PUSH_ROUTES = {"guide/next", "guide/wait", "guide/submit", "guide/skip", "guide/action_runs", "guide/delivery_commits"}
 
 
@@ -361,7 +387,8 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "guide/status":
             self._json(200, {"stage": 0, "readiness": 0.25, "cli": cli,
                              "tasks": [{"id": "gt_1", "type": "repo_census", "state": "done", "verdict": "accepted"}],
-                             "pending_ask_human": []})
+                             "pending_ask_human": [],
+                             **({"waiting": GROUPING_WAITING} if (q.get("session_id") or [""])[0] == "gs_grouping" else {})})
         elif route in ("guide/submit", "guide/skip") and method == "POST":
             try:
                 d = json.loads(body or b"{}")
@@ -391,6 +418,18 @@ class Handler(BaseHTTPRequestHandler):
                 # (P4E-4) a closed task: skip is answered like submit, rejected.
                 verdict, reasons = "rejected", ["gt_accepted is already accepted"]
             self._json(200, {"verdict": verdict, "reasons": reasons, "next": TASK, "cli": cli})
+        elif route == "guide/run_paths" and method == "GET":
+            # (L16, SF-50) the pre-run door: the paths PTC verified / the open source-fix tasks name (PTC_MOCK_RUN_PATHS,
+            # comma-separated); absent -> 404 like a server without the door.
+            # GAP-G6: PTC_MOCK_RUN_PATHS_STATUS answers the door with that HTTP error (a PTC that cannot list the paths).
+            if os.environ.get("PTC_MOCK_RUN_PATHS_STATUS"):
+                return self._json(int(os.environ["PTC_MOCK_RUN_PATHS_STATUS"]), {"error": "run paths unavailable"}) or True
+            paths = [x for x in os.environ.get("PTC_MOCK_RUN_PATHS", "").split(",") if x]
+            if not os.environ.get("PTC_MOCK_RUN_PATHS"):
+                return self._json(404, {"error": "Not found"}) or True
+            self._json(200, {"project_id": int((q.get("project_id") or ["0"])[0] or 0), "paths": paths})
+        elif route == "guide/action_runs" and method == "POST" and ACTION_RUN_422:
+            return self._json(422, {"error": ACTION_RUN_422}) or True
         elif route == "guide/action_runs" and method == "POST":
             try:
                 d = json.loads(body or b"{}")
@@ -460,6 +499,16 @@ class Handler(BaseHTTPRequestHandler):
             if tid == "gt_never" or (tid == "gt_wait" and n <= WAIT_ROUNDS):
                 time.sleep(min(float(d.get("timeout_s") or 0), 0.3))
                 self._json(200, waiting)
+            elif tid in ("gt_notproved", "gt_capped"):
+                time.sleep(min(float(d.get("timeout_s") or 0), 0.3))
+                paths = ["src/p%02d.php was not reported by the CI run for abcdef012345" % i for i in range(1, 24)]
+                if tid == "gt_capped":
+                    paths = paths[:20] + ["and 3 more verified paths (23 in all) are not proved by this run; GET guide/run_paths lists every path the run must hash"]
+                self._json(200, dict(waiting, verdict="needs_more", reasons=paths,
+                                     hint="Nothing changed yet (CI may still be running). Call wait again."))
+            elif tid == "gt_grouping":
+                self._json(200, {"status": "changed", "state": "done", "verdict": "accepted", "reasons": [], "next": None,
+                                 "waiting": GROUPING_WAITING, "cli": cli})
             elif tid == "gt_flaky" and n == 1:
                 self._json(503, {"error": "upstream timeout"})
             elif tid == "gt_desc":
@@ -518,6 +567,20 @@ class Handler(BaseHTTPRequestHandler):
             if fp in APPROVAL_EXPIRED:
                 return self._json(200, {"translation_status": {"status": "approval_expired", "completeness": 0,
                                                                "terminal": True, "failure_reason": "approval_expired"}})
+            if fp in FAILED_STRINGS:
+                return self._json(200, {"translation_status": {"status": "failed", "completeness": 30, "terminal": True,
+                                                               "failure_reason": "failed", "strings": {
+                                                                   "total": 10, "completed": 3, "failed": 7, "not_translated": 7}}})
+            if fp in PARTIAL_COMPLETED:
+                return self._json(200, {"translation_status": {"status": "completed", "completeness": 80, "terminal": True,
+                                                               "failure_reason": None, "strings": {
+                                                                   "total": 10, "completed": 8, "failed": 0, "not_translated": 2}}})
+            if fp in FAILED_BARE:
+                return self._json(200, {"translation_status": {"status": "failed", "completeness": 30, "terminal": True,
+                                                               "failure_reason": "failed"}})
+            if fp in REVIEWING:
+                return self._json(200, {"translation_status": {"status": "reviewing", "completeness": 100,
+                                                               "terminal": False, "failure_reason": None}})
             if fp in OUT_OF_CREDIT:
                 return self._json(200, {"translation_status": {"status": "out_of_credit", "completeness": 0,
                                                                "terminal": True, "failure_reason": "out_of_credit"}})
@@ -537,6 +600,11 @@ class Handler(BaseHTTPRequestHandler):
             if self._need_token():
                 return
             fp = q.get("file_path", [""])[0]
+            if fp in DOWNLOAD_BUILDING:
+                journal(f"     -> 202 archive building for {fp} (retry_after {RETRY_AFTER})")
+                body = json.dumps({"status": "processing", "retry_after": int(RETRY_AFTER),
+                                   "message": "The translations archive is being built. Please retry after the specified delay."})
+                return self._send(202, body, "application/json", {"Retry-After": RETRY_AFTER})
             if fp in DOWNLOAD_BUILDING_ONCE and fp not in DOWNLOAD_BUILDING_SEEN:
                 DOWNLOAD_BUILDING_SEEN.add(fp)
                 journal(f"     -> 202 archive building for {fp}")
@@ -562,6 +630,9 @@ class Handler(BaseHTTPRequestHandler):
             if self._need_token():
                 return
             record_upload(body)
+            if BODY_DIR:  # every upload's raw body, in order (WF-5: the locale_map fields ride along)
+                with open(os.path.join(BODY_DIR, "uploads.raw"), "ab") as fh:
+                    fh.write(body + b"\n--END-OF-UPLOAD--\n")
             if self.scenario == "soft_fail":
                 # A 201 that still carries "success": false is a
                 # rejected upload dressed as a created one.
@@ -613,6 +684,29 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._json(404, {"success": False, "message": f"no route {route}", "errors": [404]})
 
+    def do_PATCH(self):
+        route, q = self._path()
+        body = self._body()
+        journal(f"PATCH /{route}  {len(body)}B  auth={'yes' if self._auth() else 'no'}")
+        import re as _re
+        m = _re.fullmatch(r"guide/action_runs/(\d+)/files_sample", route)
+        if m:
+            # (GAP-G12) the source-file batches after the report, like GuideActionRunsController#files_sample: an entry
+            # whose content does not hash to its sha is refused; every batch is appended to files_sample_batches.jsonl.
+            if self._need_token():
+                return
+            d = json.loads(body or b"{}")
+            entries = d.get("files_sample") or {}
+            import hashlib
+            bad = [p for p, e in entries.items() if hashlib.sha256(str((e or {}).get("content", "")).encode()).hexdigest() != (e or {}).get("sha")]
+            if bad:
+                return self._json(422, {"error": "content does not hash to its sha: " + ", ".join(bad)})
+            if BODY_DIR:
+                with open(os.path.join(BODY_DIR, "files_sample_batches.jsonl"), "a") as fh:
+                    fh.write(json.dumps({"run_id": int(m.group(1)), "bytes": len(body), "body": d}) + "\n")
+            return self._json(200, {"run_id": int(m.group(1)), "received": sorted(entries)})
+        return self._json(404, {"success": False, "message": f"no route {route}", "errors": [404]})
+
     def do_PUT(self):
         route, q = self._path()
         body = self._body()
@@ -634,6 +728,12 @@ class Handler(BaseHTTPRequestHandler):
                                   "text/html", {"ngrok-error-code": "ERR_NGROK_3004"})
             if m and m.group(1).decode() in REJECT_PROCESS:
                 return self._json(422, {"success": False, "message": "YAML aliases are not allowed", "errors": [422]})
+            if fp in SUITE_PENDING:
+                # (ptc-cli 1.5.0, L21-3) the suite gate is closed: stored, not translated - PTC's recorded answer.
+                with open(SUITE_PENDING_FIXTURE) as fh:
+                    answer = json.load(fh)
+                answer["source_file"]["file_path"] = fp
+                return self._json(200, answer)
             if REFUSE_PROCESS:
                 # (L11, SF-32) TrialApiTranslationCap: the trial's free automatic deliveries are used up.
                 url = "https://ptc.test/#/dashboard/organizations/5/billing?conversion_source=api_translation_cap"

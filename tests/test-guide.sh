@@ -343,15 +343,18 @@ PTC_ORG_TOKEN=org-token "$CLI" guide wait gt_wait --api-url "$OLD_API" -d "$W" >
 [[ "$(_s=$(bash -c 'source "$1"; _guide_seconds 20m; _guide_seconds 1h; _guide_seconds 90s; _guide_seconds 7' _ "$CLI"); echo $_s)" == "1200 3600 90 7" ]] && pass "durations: 20m 1h 90s 7" || fail "durations"
 
 PTC_FILES_SAMPLE_LIMIT=10 PTC_API_TOKEN=project-token "$CLI" guide action-run --api-url "$API" -d "$WORK/repo" >/dev/null 2>&1
-jcheck "files_sample respects the byte cap" "$BODIES/guide_action_runs.json" "d['body']['files_sample'] == {}"
-# S2-R21-2 (run 11: a source fix in en.yml left out by the cap, so review_followup could not see it): a source file the
-# commit changed is sent beyond the cap.
+# WF-11 (WF-RCA.md): the source files respect the byte cap; the files the commit changed that are not sources (code a
+# source fix edits) ride with their bytes, PTC holding no upload of them.
+jcheck "files_sample respects the byte cap for source files; changed non-source files ride with their bytes" "$BODIES/guide_action_runs.json" "sorted(d['body']['files_sample']) == ['.ptc-extra.yml', 'app/js/size.js', 'tasks/NOTE.md']"
+# S2-R21-2 / WF-11: a source file the commit changed (run 11: a source fix in en.yml) is proved on PTC's stored upload by
+# its sha256: it rides as its digest in files_sha, never as bytes beyond the cap (sitepress: a 2.85 MB report).
 r21_main=$(git -C "$WORK/repo" rev-parse -q --verify refs/remotes/origin/main)
 echo "  r21: Fixed typo" >> "$WORK/repo/config/locales/en.yml"
 git -C "$WORK/repo" add config/locales/en.yml && git -C "$WORK/repo" -c user.email=t@t -c user.name=t commit -qm r21
 git -C "$WORK/repo" update-ref refs/remotes/origin/main HEAD~1
 PTC_FILES_SAMPLE_LIMIT=10 PTC_API_TOKEN=project-token "$CLI" guide action-run --api-url "$API" -d "$WORK/repo" >/dev/null 2>&1
-jcheck "files_sample: a source file the commit changed is sent beyond the byte cap (S2-R21-2)" "$BODIES/guide_action_runs.json" "sorted(d['body']['files_sample']) == ['config/locales/en.yml'] and 'r21: Fixed typo' in d['body']['files_sample']['config/locales/en.yml']"
+r21_sha=$(sha256sum "$WORK/repo/config/locales/en.yml" | cut -d' ' -f1)
+jcheck "a source file the commit changed rides as its digest, not beyond the byte cap (S2-R21-2, WF-11)" "$BODIES/guide_action_runs.json" "d['body']['files_sample'] == {} and d['body']['files_sha']['config/locales/en.yml'] == '$r21_sha'"
 git -C "$WORK/repo" reset -q --keep HEAD~1
 if [[ -n "$r21_main" ]]; then git -C "$WORK/repo" update-ref refs/remotes/origin/main "$r21_main"; else git -C "$WORK/repo" update-ref -d refs/remotes/origin/main; fi
 

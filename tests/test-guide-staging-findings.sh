@@ -43,7 +43,7 @@ rc=$?
 [[ $rc -eq 0 ]] && pass "--organization-id -> the project is created and the session opened (exit 0)" || fail "start --organization-id exit $rc: $(cat "$WORK/start2.out")"
 [[ "$(body "d.get('organization_id')" projects)" == "1023" ]] && pass "POST /projects carries organization_id" || fail "projects body: $(body "d" projects)"
 grep -q "Created PTC project 42" "$WORK/start2.out" && pass "the created project is named" || fail "start2: $(cat "$WORK/start2.out")"
-"$CLI" guide --help 2>&1 | grep -q -- "--organization-id" && pass "guide --help names --organization-id" || fail "help lacks --organization-id"
+grep -q -- "--organization-id" <<<"$("$CLI" guide --help 2>&1)" && pass "guide --help names --organization-id" || fail "help lacks --organization-id"
 
 echo "=== SF-24: ask_human options that are objects ==="
 "${NOCI[@]}" PTC_ORG_TOKEN=org-token "$CLI" guide next --session-id gs_named --api-url "$API" -d "$P" >"$WORK/next.out" 2>&1
@@ -89,9 +89,14 @@ want=$(sha256sum "$T/app/files_import.js" | cut -d' ' -f1)
 [[ "$(body "d['files_sha'].get('app/files_import.js')" guide_action_runs)" == "$want" ]] && pass "the edited file's new digest is reported" || fail "edited digest"
 "${NOCI[@]}" PTC_ORG_TOKEN=org-token "$CLI" guide action-run --api-url "$API" -d "$T" >/dev/null 2>&1
 [[ "$(body "d.get('workspace_fingerprint')" guide_action_runs)" == "$fp2" ]] && pass "same tree twice -> same fingerprint" || fail "fingerprint not stable"
-"${NOCI[@]}" PTC_ORG_TOKEN=org-token "$CLI" guide action-run --file app/other.js --file ../escape.js --api-url "$API" -d "$T" >/dev/null 2>&1
-[[ "$(body "'app/other.js' in d['files_sample'] and '../escape.js' not in d['files_sha']" guide_action_runs)" == "True" ]] \
-    && pass "--file adds a file; a path leaving the tree is ignored" || fail "--file: $(body "sorted(d['files_sha'])" guide_action_runs)"
+"${NOCI[@]}" PTC_ORG_TOKEN=org-token "$CLI" guide action-run --file app/other.js --api-url "$API" -d "$T" >/dev/null 2>&1
+[[ "$(body "'app/other.js' in d['files_sample']" guide_action_runs)" == "True" ]] \
+    && pass "--file adds a file" || fail "--file: $(body "sorted(d['files_sha'])" guide_action_runs)"
+# LR2-F7: a --file leaving the tree is an error naming it, never dropped in silence; nothing is reported.
+"${NOCI[@]}" PTC_ORG_TOKEN=org-token "$CLI" guide action-run --file app/other.js --file ../escape.js --api-url "$API" -d "$T" >"$WORK/escape.out" 2>&1
+rc=$?
+[[ $rc -ne 0 ]] && grep -q -- "--file ../escape.js: outside the repository" "$WORK/escape.out" \
+    && pass "--file leaving the tree stops the run, naming the path" || fail "escape: rc=$rc $(cat "$WORK/escape.out")"
 
 echo "=== with git: a committed named file keeps the commit's digest ==="
 G="$WORK/git"; cp -r "$T" "$G"; git -C "$G" init -q && git -C "$G" add -A && git -C "$G" -c user.email=t@example.com -c user.name=t commit -qm init

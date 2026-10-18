@@ -389,6 +389,13 @@ Input: `{"descriptions":[{"file", "key", "context"?, "description", "usage"?: {"
 - **Chrome-i18n JSON:** the message's `description` sibling. Other formats
   (Rails YAML, flat i18next JSON) have no slot PTC reads and are skipped.
 
+The note is PTC's description **byte for byte** (LR2-F6, WPML lab run 2): PTC
+composes it within the comment rule (one line, at most 200 characters unless a
+placeholder list needs more, the screen in the UI's words, no code), so the CLI
+never cuts or rewrites it. A description that names a repository path, a source
+file, a function (`name()`) or a `snake_case` identifier (one PTC stored before
+that rule) is skipped with the reason, never written.
+
 Re-applying is idempotent. Exit `0` every description written or already
 present, `2` some skipped (listed with reasons), `1` bad input.
 
@@ -488,7 +495,12 @@ task named (the paths of its payload's `proposals` / `readiness_manual`, recorde
 fetched the task) and each `--file PATH` rides with its sha256 in `files_sha` and its bytes in `files_sample` (at most
 100 files of 1 MB each, inside the repository), and the workspace fingerprint covers them too, so on a plain directory
 (no git) an edit to a code file is provable and the run after it has a new key (SF-22). A path git already reported
-from the commit keeps the commit's digest.
+from the commit keeps the commit's digest. A `--file PATH` is relative to the run directory (`-d DIR`, default the
+current one): the directory a suite product's task paths are relative to (`ptc guide action-run -d sitepress --file
+menu/x.php`, as the task's `cli_commands` gives it); it is reported under its repository-root path. A `--file` that is
+missing, outside the repository or over 1 MB stops the run with the reason and nothing is reported (LR2-F7: a dropped
+file was a run PTC could not prove the edit on). A path a task named is looked up from the repository root, then under
+the run directory.
 
 Used by ptc-action (and the GitLab recipe) after each run, with the one CI
 secret `PTC_API_TOKEN` (your agent token, from PTC's agent token page `/dashboard/agent-tokens`;
@@ -580,6 +592,15 @@ The script follows a step-based approach:
 3. **👀 Monitoring Step**: Translation status is monitored with compact progress display
 4. **📥 Download Step**: Completed translations are downloaded and unpacked
 
+### A project whose suite is still being set up (1.5.0)
+A project can belong to a suite (a group of projects set up together, for example the products of one plugin family).
+Until every project of the suite has finished its setup, PTC stores an upload but does not translate it, and answers
+the processing step with `code: suite_setup_pending` and a message naming what it is waiting for. The CLI then prints
+that message, one line saying the translation starts by itself once every project of the suite is set up, and the
+files held. It does not wait for their translation: a run where every file was held exits `0`, and the next CI run
+(or `--action download`) delivers the translations once PTC has made them. Files PTC did start in the same run are
+monitored and written as usual. `--action status` and `--action download` are unchanged.
+
 ### Isolated Actions
 For more granular control, you can perform specific steps in isolation:
 
@@ -629,7 +650,7 @@ The exit code is the CI-facing verdict, so it reports what actually happened rat
 
 | Code | Meaning |
 |------|---------|
-| `0` | Every file completed. For `--action status`, every file is either ready or still translating. |
+| `0` | Every file completed. For `--action status`, every file is either ready or still translating. Also when every file was held for its suite (`suite_setup_pending`, see "A project whose suite is still being set up"): stored in PTC, translated by itself once the suite is set up, delivered by the next run. |
 | `1` | Something did not complete: a file failed, no files were found, the API rejected a request, or the arguments were invalid. |
 | `5` | Partial: PTC rejected some source files (a processing 4xx such as HTTP 422, a file left `draft` for 3 checks — `PTC_DRAFT_TERMINAL_ROUNDS` — or status `rejected`), and every other file completed and was written. The summary lists them under "Rejected by PTC". A file whose processing request never got a PTC answer (HTTP 5xx or no response, e.g. a proxy or tunnel in between) is retried 3 times with backoff (5 s, 10 s, 20 s; `PTC_TRANSIENT_BASE_DELAY` sets the first wait) and, if it still fails, is listed under "Could not reach PTC" instead: it was not rejected, a re-run translates it. It also exits `5`. So does a file whose status could not be read (no answer, 404, 5xx, a body that is not JSON) on every poll since some time until the monitor bound (S2-R19-1): it is listed under "Could not reach PTC" with since when and the last HTTP code, its state unknown — not "still translating". ptc-action and the GitLab recipe still deliver the written translations, then fail the job with "PTC rejected some files or could not be reached for them" (S2-R19-3). |
 | `6` | Partial: PTC paused some files out-of-credit (status `out_of_credit`: the organization's credit does not cover them; they are listed under "Paused out-of-credit in PTC" and resume when the organization tops up or upgrades — when nothing completed the run exits `1` instead), or parked some files behind an over-limit approval (the run costs more than the organization's translation approval limit; status `awaiting_approval`, or `approval_expired` once the 24 h request lapsed), and every other file completed and was written. The summary lists them under "Parked for an over-limit approval in PTC" with the remedy: approve the request in PTC (emailed to the organization's administrators) or raise the approval limit; the next run picks them up once the approval is given. ptc-action and the GitLab recipe still deliver the written translations and report the delivery commit, then fail the job. A run with other failed or unfinished files exits `1`. |
@@ -650,10 +671,10 @@ Pipelines download the script from a **pinned release tag**, not a moving branch
 so a push to `main` can never change what your build runs:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.4.0/ptc-cli.sh -o ptc-cli.sh
+curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.5.1/ptc-cli.sh -o ptc-cli.sh
 ```
 
-Use an exact release tag such as `v1.4.0` to pin, or the floating `v1` tag to
+Use an exact release tag such as `v1.5.1` to pin, or the floating `v1` tag to
 pick up backward-compatible updates automatically: `v1` always equals the newest
 published CLI — the release job moves it onto every new `vX.Y.Z` and fails if the
 two differ. `ptc init` scaffolds the
@@ -728,8 +749,10 @@ your own GitLab instance, so a component published anywhere else is unreachable.
 ptc-translate:
   stage: deploy
   image: alpine:3.22
-  # A first translation of a large project outlives GitLab's default 1 h job limit (CI-16). 3 h covers it; the CLI stops
-  # on its own at a 45-minute bound (monitor_max_minutes in .ptc-config.yml), delivers what finished and exits 7.
+  # A first translation of a large project outlives GitLab's default 1 h job limit (CI-16), so the job asks for 3 h; the
+  # project's timeout and the runner's maximum can still shorten it. The CLI reads the job's real limit (CI_JOB_TIMEOUT)
+  # and stops 10 minutes before it, or at its own 45-minute bound (monitor_max_minutes in .ptc-config.yml), delivers
+  # what finished and exits 7. PTC keeps translating; the next run delivers the rest and translates nothing again.
   timeout: 3h
   # The preflight writes the CI-time limit note here (balance short of the census); the merge request description
   # below carries it, as a GitHub pull request body does.
@@ -761,13 +784,15 @@ ptc-translate:
     # the CLI is 100+ KB of it.
     # A CI/CD variable PTC_CLI_URL pins another copy of the CLI (curl accepts
     # file://, e.g. file://$CI_PROJECT_DIR/cli/ptc-cli.sh for the repository's own).
-    - curl -fsSL "${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.4.0/ptc-cli.sh}" -o /tmp/ptc-cli.sh
+    - curl -fsSL "${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.5.1/ptc-cli.sh}" -o /tmp/ptc-cli.sh
     - chmod +x /tmp/ptc-cli.sh
     - rm -f /tmp/ptc-written /tmp/ptc-limit-note
     # Report the run to PTC's agent guide (scan, config digests, identity token); never fails the job.
     - /tmp/ptc-cli.sh guide action-run --config-file .ptc-config.yml || true
     # Check first (agent guide): PTC reports missing information for this commit; it never withholds the translation.
-    - PTC_ORG_TOKEN="${PTC_ORG_TOKEN:-$PTC_API_TOKEN}" /tmp/ptc-cli.sh guide check --json --config-file .ptc-config.yml > /tmp/ptc-check.json || true
+    # PTC_API_TOKEN (the agent token PTC asks for) comes first; the legacy PTC_ORG_TOKEN is read only without it.
+    - if [ -z "${PTC_API_TOKEN:-}" ] && [ -n "${PTC_ORG_TOKEN:-}" ]; then echo "PTC_ORG_TOKEN is deprecated - set the masked CI/CD variable PTC_API_TOKEN (your agent token) instead."; fi
+    - PTC_ORG_TOKEN="${PTC_API_TOKEN:-$PTC_ORG_TOKEN}" /tmp/ptc-cli.sh guide check --json --config-file .ptc-config.yml > /tmp/ptc-check.json || true
     # The merge request's description carries PTC's findings (set by the push below; the project setting in PTC turns
     # them off). They are printed here too, so every job log shows them, also when there is nothing new to push.
     - ptc_mr_description="$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
@@ -791,7 +816,7 @@ ptc-translate:
     # nothing else - not this job's downloads, not whatever an earlier step in
     # your pipeline left in the working directory.
     #
-    # `|| true` is not cosmetic: if a translation lands on a path your
+    # Exit 1 from git add is tolerated, not cosmetic: if a translation lands on a path your
     # .gitignore covers, git exits 1 while still staging everything else, and
     # GitLab would abort the job on that exit code alone.
     #
@@ -799,11 +824,32 @@ ptc-translate:
     # first run the translations are new files, and a plain `git diff` only
     # looks at tracked ones - it would report "nothing changed", skip the push,
     # and leave a green job that produced no merge request.
+    #
+    # The manifest's paths are relative to the repository root, and a job may run
+    # from a subdirectory (a suite job starts with `cd <product dir>`), so the
+    # staging runs at the root. A file the run wrote that is still unstaged after
+    # it means git matched none of the paths: the job says so and fails, never a
+    # green job without a merge request.
     - |
       git config user.email "ci@ptc"
       git config user.name "PTC Translate"
       git checkout -B ptc/translations
-      git add --pathspec-from-file=/tmp/ptc-written --pathspec-file-nul || true
+      ptc_top="$(git rev-parse --show-toplevel)"
+      ptc_add_rc=0
+      git -C "$ptc_top" add --pathspec-from-file=/tmp/ptc-written --pathspec-file-nul || ptc_add_rc=$?
+      # 1 = some path is ignored (the rest is staged); 128 = a path matched nothing and git staged NOTHING.
+      if [ "$ptc_add_rc" -gt 1 ]; then
+        echo "git add of the translations this run wrote failed (exit $ptc_add_rc), so nothing was staged for the merge request."
+        exit 1
+      fi
+      if [ -s /tmp/ptc-written ]; then
+        ptc_unstaged="$(xargs -0 git -C "$ptc_top" status --porcelain --untracked-files=all -- < /tmp/ptc-written | grep '^.[^ ]' || true)"
+        if [ -n "$ptc_unstaged" ]; then
+          echo "PTC wrote these translations, but they were not staged for the merge request (git add matched none of them):"
+          echo "$ptc_unstaged"
+          exit 1
+        fi
+      fi
       if ! git diff --cached --quiet; then
         git commit -m "chore(i18n): update translations via PTC [skip translations]"
         ptc_mr_description="$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"

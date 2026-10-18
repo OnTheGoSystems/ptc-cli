@@ -147,7 +147,8 @@ cp -R "$G" "$WORK/g1"
 if changed=$(tree_diff "$G" "$WORK/g1"); then pass "re-apply is idempotent (block and inline comments)"; else fail "re-apply changed: $changed"; fi
 sed -i 's/Button that saves the form/Saves the settings form/' "$WORK/g.json"
 "$CLI" describe apply --file "$WORK/g.json" -d "$G" >/dev/null 2>&1
-grep -c "translators:" "$G/src/a.php" | grep -qx 2 && grep -q "/\* translators: Saves the settings form \*/" "$G/src/a.php" && pass "a changed description replaces the old translators: line" || fail "update: $(cat "$G/src/a.php")"
+# WF-8: an existing /* translators: */ note is never replaced (a hand-written one looks exactly like PTC's): kept, skipped.
+grep -c "translators:" "$G/src/a.php" | grep -qx 2 && grep -q "/\* translators: Button that saves the form \*/" "$G/src/a.php" && ! grep -q "Saves the settings form" "$G/src/a.php" && pass "a changed description never replaces an existing translators: line" || fail "update: $(cat "$G/src/a.php")"
 # usage from the scan's usage map when the item has none
 printf 'msgid ""\nmsgstr ""\n\nmsgid "Only via scan"\nmsgstr ""\n' > "$G/languages/q.pot"
 printf '<?php\necho __( "Only via scan", "p" );\n' > "$G/src/c.php"
@@ -198,5 +199,91 @@ d = json.load(open(sys.argv[2]))
 assert not d["skipped"], d["skipped"]
 PY
 
+
+echo "=== GAP-G5: a note is never written inside a literal; it sits where the extractor reads it ==="
+# WPML lab run 4: the usage line of a string concatenated into a multi-line single-quoted PHP string got its note on the
+# line above, i.e. inside the literal (shown as text on the String Translation page). JS notes above a `? __(` / `: __(`
+# continuation or above a JSX element line were not extracted (or became JSX text). The note goes on its own line above
+# the call's line when that line starts in code (PHP) or starts with the call (JS); otherwise directly before the call.
+K="$WORK/k"; mkdir -p "$K/languages" "$K/src"
+printf 'msgid ""\nmsgstr ""\n' > "$K/languages/k.pot"
+cat > "$K/src/st.php" <<'PHP'
+<?php
+class X {
+	function notice() {
+		echo '<div class="info-wrap">
+				<p>' . __( 'Scan the selected components', 'd' ) . '</p>
+				<form><button type="button">' . __( 'Select affected components', 'd' ) . '</button></form>
+			</div>';
+		$long = __(
+			'A sentence on its own line',
+			'd'
+		);
+		$doc = <<<TXT
+Call __( 'Ghost', 'd' ) to translate.
+TXT;
+	}
+}
+PHP
+cat > "$K/src/jobs.js" <<'JS'
+export const loading = page => page === 'queue'
+  ? __( 'Loading queue', 'd' )
+  : __( 'Loading jobs', 'd' )
+const heading = ( a ) => {
+  if ( a ) return __( 'Connected', 'd' )
+  const n = _n(
+    'One item',
+    '%d items',
+    a,
+    'd'
+  )
+  return n
+}
+const Row = () => (
+  <td>
+    <a className='edit' aria-label={__('Edit pair', 'd')}>x</a>
+  </td>
+)
+JS
+cat > "$WORK/k.json" <<'JSON'
+{"descriptions": [
+ {"file": "languages/k.pot", "key": "Scan the selected components", "description": "Notice text", "usage": {"path": "src/st.php", "line": 5}},
+ {"file": "languages/k.pot", "key": "Select affected components", "description": "Notice button", "usage": {"path": "src/st.php", "line": 6}},
+ {"file": "languages/k.pot", "key": "A sentence on its own line", "description": "Long sentence", "usage": {"path": "src/st.php", "line": 9}},
+ {"file": "languages/k.pot", "key": "Ghost", "description": "Not a call", "usage": {"path": "src/st.php", "line": 13}},
+ {"file": "languages/k.pot", "key": "Loading queue", "description": "Status Q", "usage": {"path": "src/jobs.js", "line": 2}},
+ {"file": "languages/k.pot", "key": "Loading jobs", "description": "Status J", "usage": {"path": "src/jobs.js", "line": 3}},
+ {"file": "languages/k.pot", "key": "Connected", "description": "Heading C", "usage": {"path": "src/jobs.js", "line": 5}},
+ {"file": "languages/k.pot", "key": "One item", "description": "Count O", "usage": {"path": "src/jobs.js", "line": 7}},
+ {"file": "languages/k.pot", "key": "Edit pair", "description": "Tooltip E", "usage": {"path": "src/jobs.js", "line": 16}}
+]}
+JSON
+git -C "$K" init -q
+"$CLI" describe apply --file "$WORK/k.json" -d "$K" --json >"$WORK/k.out" 2>/dev/null; expect_rc "a call that is no call (inside a heredoc) is skipped -> exit 2" 2 $?
+python3 - "$K" "$WORK/k.out" <<'PY' && pass "PHP: a call inside a multi-line string's concatenation gets its note before the call, never inside the literal; a heredoc mention is skipped with the reason" || fail "G5 PHP: $(cat "$K/src/st.php" "$WORK/k.out")"
+import json, sys
+p = open(sys.argv[1] + "/src/st.php").read().split("\n")
+assert p[4] == "\t\t\t\t<p>' . /* translators: Notice text */ __( 'Scan the selected components', 'd' ) . '</p>", p[3:7]
+assert p[5] == "\t\t\t\t<form><button type=\"button\">' . /* translators: Notice button */ __( 'Select affected components', 'd' ) . '</button></form>", p[3:7]
+assert p[3] == "\t\techo '<div class=\"info-wrap\">", p[3:7]
+assert p[7] == "\t\t/* translators: Long sentence */" and p[8] == "\t\t$long = __(", p[7:10]
+assert "Call __( 'Ghost', 'd' ) to translate." == p[13] and "Not a call" not in "\n".join(p), p[11:15]
+d = json.load(open(sys.argv[2]))
+r = {x["key"]: x["reason"] for x in d["skipped"]}
+assert list(r) == ["Ghost"] and "no gettext call" in r["Ghost"], r
+PY
+python3 - "$K" <<'PY' && pass "JS: notes before a ?/: continuation call, after return, before a multi-line call and inside a JSX attribute sit right before the call" || fail "G5 JS: $(cat "$K/src/jobs.js")"
+import sys
+j = open(sys.argv[1] + "/src/jobs.js").read().split("\n")
+assert j[1] == "  ? /* translators: Status Q */ __( 'Loading queue', 'd' )", j[:3]
+assert j[2] == "  : /* translators: Status J */ __( 'Loading jobs', 'd' )", j[:3]
+assert j[4] == "  if ( a ) return /* translators: Heading C */ __( 'Connected', 'd' )", j[3:7]
+assert j[5] == "  const n = /* translators: Count O */ _n(" and j[6] == "    'One item',", j[3:8]
+assert j[15] == "    <a className='edit' aria-label={/* translators: Tooltip E */ __('Edit pair', 'd')}>x</a>", j[13:17]
+assert len(j) == 19, len(j)
+PY
+cp -R "$K" "$WORK/k1"
+"$CLI" describe apply --file "$WORK/k.json" -d "$K" >/dev/null 2>&1
+if changed=$(tree_diff "$K" "$WORK/k1"); then pass "re-apply of inline notes is idempotent"; else fail "re-apply changed: $changed"; fi
 echo; echo "describe suite: $passed passed, $failed failed"
 [[ $failed -eq 0 ]]

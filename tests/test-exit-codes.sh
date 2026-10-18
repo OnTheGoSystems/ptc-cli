@@ -175,7 +175,13 @@ echo
 echo "=== the default monitor budget scales with the number of files (decision 4) ==="
 
 # A fixed 100 x 5 s = 500 s ran out on a 40-file push queued behind the upload rate limit. Left at the default,
-# the budget is max(100, 20 x files); a flag or the config's monitor_max_attempts is never rescaled.
+# the budget is max(100, 20 x files, rounds the time bound needs at the monitor interval + 10) (WF-20: it never binds before
+# the time bound); a flag or the config's monitor_max_attempts is never rescaled.
+PTC_MONITOR_MAX_SECONDS=""; PTC_MONITOR_MAX_MINUTES=45; PTC_MONITOR_INTERVAL=5
+PTC_MONITOR_MAX_ATTEMPTS="100"; PTC_MONITOR_MAX_ATTEMPTS_SET="false"
+scale_monitor_max_attempts 3
+assert_eq "the 45-minute bound at 5 s needs 540 rounds: 550" "$PTC_MONITOR_MAX_ATTEMPTS" "550"
+PTC_MONITOR_MAX_SECONDS=100
 PTC_MONITOR_MAX_ATTEMPTS="100"; PTC_MONITOR_MAX_ATTEMPTS_SET="false"
 scale_monitor_max_attempts 3
 assert_eq "3 files keep the floor of 100" "$PTC_MONITOR_MAX_ATTEMPTS" "100"
@@ -189,6 +195,7 @@ assert_eq "a config-set budget is not rescaled" "$PTC_MONITOR_MAX_ATTEMPTS" "50"
 PTC_MONITOR_MAX_ATTEMPTS="100"; PTC_MONITOR_MAX_ATTEMPTS_SET="true"   # what --monitor-max-attempts 100 leaves
 scale_monitor_max_attempts 12
 assert_eq "a flag-set budget (even 100) is not rescaled" "$PTC_MONITOR_MAX_ATTEMPTS" "100"
+PTC_MONITOR_MAX_SECONDS=""
 
 echo
 echo "=========================================="

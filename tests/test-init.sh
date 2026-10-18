@@ -436,7 +436,11 @@ test_ci_snippets_use_action() {
     assert_contains "gitlab asks the CLI for that manifest" "$gl" "--written-manifest /tmp/ptc-written"
     # An ignored translation path makes git exit 1 while still staging the rest,
     # and GitLab would abort the job on that alone.
-    assert_contains "gitlab survives a partially ignored stage" "$gl" "--pathspec-file-nul || true"
+    assert_contains "gitlab survives a partially ignored stage" "$gl" "--pathspec-file-nul || ptc_add_rc="
+    # WF-16: staged at the repository root (a suite job runs from its product directory), and never a green job
+    # without a merge request when git staged nothing of what the run wrote.
+    assert_contains "gitlab stages at the repository root" "$gl" 'git -C "$ptc_top" add --pathspec-from-file'
+    assert_contains "gitlab fails loudly when the written files stay unstaged" "$gl" "they were not staged for the merge request"
     # The CLI is downloaded outside the checkout, or it ends up in the MR.
     assert_not_contains "gitlab does not download the CLI into the project" "$gl" "-o ptc-cli.sh"
     assert_contains "gitlab downloads the CLI outside the checkout" "$gl" "-o /tmp/ptc-cli.sh"

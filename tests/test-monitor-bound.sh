@@ -75,6 +75,21 @@ expect_rc "files still translating at the bound -> exit 7" 7 $rc
 has "the summary names the file still translating with its state" "$WORK/clock.out" "config/locales/b.en.yml (in_progress)"
 has "the summary says the bound was reached" "$WORK/clock.out" "Still translating in PTC: 1"
 
+echo "=== GAP-JOBS F11: the CI job's own timeout caps the bound, so the run stops and delivers before GitLab kills it ==="
+# WPML lab run 2: monitor bound 162 min, GitLab killed the job at 1 h, nothing delivered. Here the job may run 605 s and
+# started now; with a 602-second delivery reserve the bound is ~3 s, not the 45-minute default.
+R="$WORK/ci-timeout"; mkrepo "$R"
+start=$SECONDS
+( cd "$R" && CI_JOB_TIMEOUT=605 CI_JOB_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" CI_PROJECT_ID=4242 PTC_CI_DELIVERY_RESERVE_SECONDS=602 \
+    PTC_API_TOKEN=t "$CLI" --config-file .ptc-config.yml --api-url "$API" --monitor-interval 1 --monitor-max-attempts 40 ) >"$WORK/ci-timeout.out" 2>&1
+rc=$?; took=$((SECONDS - start))
+expect_rc "the CI job's timeout ends the run at its bound -> exit 7 (delivered, not killed)" 7 $rc
+[[ $took -lt 20 ]] && pass "the job timeout set the bound (${took}s, not 45 minutes nor the 40-attempt budget)" || fail "the run took ${took}s"
+[[ -f "$R/config/locales/a.de.yml" ]] && pass "the completed file is written before the job limit" || fail "a.de.yml missing"
+has "the warning names the job's timeout" "$WORK/ci-timeout.out" "This CI job may run 10 minutes (its timeout"
+has "the warning gives the exact call to raise it" "$WORK/ci-timeout.out" "glab api -X PUT projects/4242 -f build_timeout=10800"
+has "the summary names the CI bound" "$WORK/ci-timeout.out" "(the CI job's timeout, less the time to deliver)"
+
 echo "=== nothing written inside the bound: the manifest still exists, empty (the job's git add reads it) ==="
 R="$WORK/clock-empty"; mkdir -p "$R/config/locales"
 printf 'en:\n  b: "Hello b"\n' > "$R/config/locales/b.en.yml"

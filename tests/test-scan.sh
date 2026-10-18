@@ -25,11 +25,16 @@ M="$WORK/multi"; mkdir -p "$M/pa/languages" "$M/pb/languages" "$M/lib/languages"
 echo '{"name": "x/pa"}' > "$M/pa/composer.json"
 printf '<?php\n/*\n * Plugin Name: PB\n */\n' > "$M/pb/pb.php"
 for d in pa pb lib; do printf 'msgid ""\nmsgstr ""\n\nmsgid "Save"\nmsgstr ""\n' > "$M/$d/languages/$d.pot"; done
+printf '# deps\n/vendor\n\n/locale/jed/**/*.po\n' > "$M/pb/.gitignore"; printf 'node_modules/\n' > "$M/.gitignore"
 git -C "$M" init -q
 SCAN_M="$WORK/multi.json"
 "$CLI" scan --json -d "$M" > "$SCAN_M" 2>/dev/null
 python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if [p['dir'] for p in d['products']] == ['pa', 'pb'] else 1)" "$SCAN_M" && pass "products = top-level dirs with resource sets AND a manifest or plugin main file (lib/ has neither)" || fail "products: $(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('products'))" "$SCAN_M")"
 python3 -c "import json,sys; d=json.load(open(sys.argv[1])); p={x['dir']: x for x in d['products']}; sys.exit(0 if all(s.startswith(k + '/') for k in p for s in p[k]['resource_sets']) and p['pa']['resource_sets'] and d['schema'] == 2 and len(d['resource_sets']) == 3 else 1)" "$SCAN_M" && pass "each product lists its own resource sets; the flat list and schema 2 stay" || fail "product resource sets: $(cat "$SCAN_M" | head -c 600)"
+
+# GAP-G2 (WPML lab run 3, gt_347): every .gitignore of the checkout, pattern lines with their numbers, so PTC checks the
+# outputs of the configs it generates by the rule `config validate` applies (a nested product .gitignore included).
+python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d['gitignore'] == [{'path': '.gitignore', 'rules': [{'line': 1, 'pattern': 'node_modules/'}]}, {'path': 'pb/.gitignore', 'rules': [{'line': 2, 'pattern': '/vendor'}, {'line': 4, 'pattern': '/locale/jed/**/*.po'}]}] else 1)" "$SCAN_M" && pass "scan lists every .gitignore (root and product) with its pattern lines and their numbers" || fail "gitignore: $(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('gitignore'))" "$SCAN_M")"
 
 echo "=== config validate: shared outputs (D12) ==="
 V="$WORK/val"; mkdir -p "$V/pa/l" "$V/pb/l"

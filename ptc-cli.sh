@@ -8,7 +8,7 @@ set -euo pipefail  # Strict mode: exit on errors, undefined variables and pipe e
 # Constants
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly VERSION="1.4.0"
+readonly VERSION="1.5.1"
 readonly PTC_USER_AGENT="ptc-cli/${VERSION}"
 
 # Colors for output
@@ -25,6 +25,9 @@ PTC_PATTERNS=()
 PTC_CONFIG_FILE=""
 PTC_PROJECT_DIR="$(pwd)"
 PTC_FILE_TAG_NAME=""
+PTC_LOCALE_MAP_JSON=""   # WF-5: the config's locale_map ({PTC code: file locale}) as JSON, sent with each upload
+PTC_LOCALE_MAP_FORM=()   # the same as multipart fields locale_map[<code>]=<locale>
+PTC_LOCALE_MAP_FIELD=""  # the same as a JSON member (",\n    \"locale_map\": {...}") for the JSON uploads
 # Environment first (B2): PTC_API_URL points every command at another PTC instance; --api-url still wins.
 PTC_API_URL="${PTC_API_URL:-https://app.ptc.wpml.org/api/v1/}"
 # The API token is env-first: an inherited PTC_API_TOKEN is honoured across every
@@ -46,6 +49,8 @@ PTC_MONITOR_MAX_MINUTES_SET=false; [[ -n "${PTC_MONITOR_MAX_MINUTES:-}" ]] && PT
 PTC_MONITOR_MAX_MINUTES="${PTC_MONITOR_MAX_MINUTES:-45}"
 PTC_MONITOR_MAX_SECONDS="${PTC_MONITOR_MAX_SECONDS:-}"
 PTC_MONITOR_DEADLINE=""  # the SECONDS value at which the bound is reached (start_monitor_clock)
+# WF-20: the poll interval PTC asked for in this monitoring round (a 202's retry_after); the next round waits at least it.
+PTC_SERVER_POLL_INTERVAL=""
 # S2-R3B C-4: every temporary file a guide command makes, removed by cleanup (ptc_mktemp).
 PTC_TMP_FILES=()
 PTC_ACTION=""            # specific action to perform: upload, status, download
@@ -137,6 +142,22 @@ readonly PTC_TRANSIENT_MAX_RETRIES=3
 # processing at the first one - the remaining files are not sent (each would be refused and recorded again) - and the
 # refusal is printed once. The files count as refused, so the exit code is the one a refused run always had.
 readonly PTC_REFUSED=11
+# 1.5.0 (L21-3): PTC stored the upload but answered `code: suite_setup_pending` - the project belongs to a suite whose
+# setup is not finished, and PTC starts the translation by itself once every project of the suite is set up. The run
+# prints PTC's message once, lists the files held, does not poll for them (the next CI run delivers them) and, when
+# every file was held, exits 0. Internal to the run, like the codes above.
+readonly PTC_SUITE_PENDING=12
+PTC_SUITE_PENDING_MESSAGE=""
+# report_suite_pending BASE_DIR FILE... : PTC's message (once), the suite line, the held files.
+report_suite_pending() {
+    local base_dir="$1" file; shift
+    [[ -n "$PTC_SUITE_PENDING_MESSAGE" ]] && log_warning "$PTC_SUITE_PENDING_MESSAGE"
+    log_warning "Suite setup pending (suite_setup_pending): PTC translates the held files by itself once every project of the suite is set up; the next CI run delivers them."
+    log_warning "Held for the suite (stored, not translated yet): $#"
+    for file in "$@"; do
+        log_warning "  … $(get_relative_path "$file" "$base_dir")"
+    done
+}
 PTC_TRANSIENT_BASE_DELAY="${PTC_TRANSIENT_BASE_DELAY:-5}"
 [[ "$PTC_TRANSIENT_BASE_DELAY" =~ ^[0-9]+$ ]] || PTC_TRANSIENT_BASE_DELAY=5
 
@@ -677,6 +698,12 @@ OPTIONS:
     -h, --help                     Show this help
     --version                      Show version
 
+SUITES:
+    A project in a suite whose setup is not finished: PTC stores the upload and answers
+    code suite_setup_pending. The run prints PTC's message and the files held, does not
+    wait for their translation (PTC starts it by itself once every project of the suite
+    is set up; the next CI run delivers it) and exits 0 when every file was held.
+
 PATTERN EXAMPLES:
     'sample-{{lang}}.json'         Finds: sample-en.json, sample-de.json, sample-fr.json
     '{{lang}}/**/*.json'           Finds: en/**/*.json, de/**/*.json
@@ -1165,6 +1192,31 @@ parse_config_file() {
         fi
     fi
     
+    # WF-5: `locale_map: {he: he_IL, es: es_ES}` names the locale each PTC language's files use ({{lang}} expands to it).
+    local config_locale_map pair code loc _locale_pairs
+    config_locale_map=$(grep '^locale_map:' "$config_file" 2>/dev/null | sed -E 's/^locale_map: *\{?//; s/\} *$//')
+    if [[ -n "$config_locale_map" ]]; then
+        PTC_LOCALE_MAP_FORM=()
+        PTC_LOCALE_MAP_JSON=""
+        IFS=',' read -ra _locale_pairs <<< "$config_locale_map"
+        for pair in "${_locale_pairs[@]}"; do
+            code=$(printf '%s' "${pair%%:*}" | tr -d " '\"")
+            loc=$(printf '%s' "${pair#*:}" | tr -d " '\"")
+            if [[ ! "$code" =~ ^[A-Za-z0-9_-]{1,20}$ || ! "$loc" =~ ^[A-Za-z0-9_-]{1,20}$ ]]; then
+                log_warning "Ignoring locale_map entry '$pair' in $config_file (expected <ptc code>: <file locale>)."
+                continue
+            fi
+            PTC_LOCALE_MAP_FORM+=(-F "locale_map[$code]=$loc")
+            PTC_LOCALE_MAP_JSON="${PTC_LOCALE_MAP_JSON:+$PTC_LOCALE_MAP_JSON, }\"$code\": \"$loc\""
+        done
+        if [[ -n "$PTC_LOCALE_MAP_JSON" ]]; then
+            PTC_LOCALE_MAP_JSON="{$PTC_LOCALE_MAP_JSON}"
+            PTC_LOCALE_MAP_FIELD=",
+    \"locale_map\": $PTC_LOCALE_MAP_JSON"
+        fi
+        log_debug "Loaded locale_map from config: $PTC_LOCALE_MAP_JSON"
+    fi
+
     if [[ "$PTC_API_URL" == "https://app.ptc.wpml.org/api/v1/" ]]; then
         local config_api_url
         config_api_url=$(grep '^api_url:' "$config_file" 2>/dev/null | sed 's/^api_url: *//' | sed 's/ *$//')
@@ -1724,8 +1776,78 @@ start_monitor_clock() {
         log_error "--monitor-max-minutes / monitor_max_minutes must be a positive integer (got '$PTC_MONITOR_MAX_MINUTES')"
         return 1
     fi
+    # GAP-JOBS F11, GAP-CI-2 F13: inside a GitLab job (it names its timeout, or GITLAB_CI says it is one); outside GitLab
+    # CI the bound is exactly as before.
+    if [[ "${CI_JOB_TIMEOUT:-}" =~ ^[1-9][0-9]*$ || "${GITLAB_CI:-}" == "true" ]]; then
+        cap_monitor_to_ci_job "$secs"
+        [[ -n "${PTC_MONITOR_CI_CAPPED:-}" ]] && secs="$PTC_MONITOR_CI_CAPPED"
+    fi
     PTC_MONITOR_DEADLINE=$(( SECONDS + secs ))
     log_debug "Monitor bound: ${secs}s from the first upload"
+}
+
+# GAP-JOBS F11 (WPML lab run 2: GitLab killed the sitepress job at 1 h, "execution took longer than 1h0m0s seconds", at
+# check 137 of 1,954 (status checks, not strings), before the 162-minute monitor bound could stop and deliver: nothing was
+# delivered). The bound never outlives the job: it ends PTC_CI_DELIVERY_RESERVE_SECONDS (600 by default) before the job
+# would be killed, so the stop-and-deliver step (exit 7: every finished file written, the delivery pushed) always runs.
+# GAP-CI-2 F13 (the retry died at 1 h too, after the project timeout was raised to 3 h: the shared runner's
+# maximum_timeout is 3,600 s). CI_JOB_TIMEOUT is the EFFECTIVE limit, the runner's maximum included: GitLab computes the
+# job's timeout as min(job `timeout:` or the project's build_timeout, the runner's maximum_timeout)
+# (Ci::Builds::TimeoutCalculator#applicable_timeout), hands it to the runner (RunnerInfo.timeout), and the runner both
+# kills the job at that value and exports it as CI_JOB_TIMEOUT (gitlab-runner common/build.go). So the cap needs no
+# runner lookup. What it must not do is fall back to no cap at all inside GitLab CI:
+# - no CI_JOB_TIMEOUT (GitLab Runner before 15.7): PTC_CI_JOB_TIMEOUT_SECONDS (the limit the human states), else
+#   GitLab's 60-minute default - the shortest limit a GitLab job commonly gets;
+# - CI_JOB_STARTED_AT unreadable (python3 missing, an odd format): busybox/GNU date reads it; failing that, the time
+#   used is counted from this CLI's own start (the job's earlier steps fall inside the delivery reserve).
+# Sets PTC_MONITOR_CI_CAPPED (seconds) and warns once, naming the job limit and how to raise it, when the job limit
+# shortened the bound.
+PTC_MONITOR_CI_CAPPED=""
+PTC_CI_DEFAULT_JOB_TIMEOUT_SECONDS=3600
+ci_job_started_epoch() {  # -> seconds since the epoch of CI_JOB_STARTED_AT, or nothing
+    local at="${CI_JOB_STARTED_AT:-}" started="" plain
+    [[ -n "$at" ]] || return 0
+    if command -v python3 >/dev/null 2>&1; then
+        started=$(python3 -c 'import sys, datetime; print(int(datetime.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")).timestamp()))' "$at" 2>/dev/null) || started=""
+    fi
+    if ! [[ "$started" =~ ^[0-9]+$ ]]; then
+        plain="${at%Z}"; plain="${plain%%.*}"; plain="${plain/T/ }"   # 2026-10-15T23:53:35.655Z -> 2026-10-15 23:53:35 (UTC)
+        started=$(date -u -d "$plain" +%s 2>/dev/null) || started=""
+    fi
+    [[ "$started" =~ ^[0-9]+$ ]] && echo "$started"
+    return 0
+}
+cap_monitor_to_ci_job() {
+    local secs="$1" left started="" elapsed reserve="${PTC_CI_DELIVERY_RESERVE_SECONDS:-600}" capped timeout source="its timeout"
+    PTC_MONITOR_CI_CAPPED=""
+    if [[ "${CI_JOB_TIMEOUT:-}" =~ ^[1-9][0-9]*$ ]]; then
+        timeout="$CI_JOB_TIMEOUT"
+    elif [[ "${GITLAB_CI:-}" == "true" ]]; then
+        if [[ "${PTC_CI_JOB_TIMEOUT_SECONDS:-}" =~ ^[1-9][0-9]*$ ]]; then
+            timeout="$PTC_CI_JOB_TIMEOUT_SECONDS"; source="the limit PTC_CI_JOB_TIMEOUT_SECONDS states"
+        else
+            timeout="$PTC_CI_DEFAULT_JOB_TIMEOUT_SECONDS"; source="GitLab's 60-minute default: this runner does not export CI_JOB_TIMEOUT (GitLab Runner before 15.7); set PTC_CI_JOB_TIMEOUT_SECONDS to the job's real limit"
+        fi
+    else
+        return 0
+    fi
+    [[ "$reserve" =~ ^[0-9]+$ ]] || reserve=600
+    started=$(ci_job_started_epoch)
+    if [[ "$started" =~ ^[0-9]+$ ]]; then
+        elapsed=$(( $(date +%s) - started ))
+    else
+        elapsed=$SECONDS
+        [[ -n "${CI_JOB_STARTED_AT:-}" ]] && log_warning "CI_JOB_STARTED_AT ('${CI_JOB_STARTED_AT}') could not be read: the time this job used is counted from the CLI's start."
+    fi
+    (( elapsed < 0 )) && elapsed=0
+    left=$(( timeout - elapsed ))
+    capped=$(( left - reserve ))
+    (( capped < 1 )) && capped=1
+    if (( capped < secs )); then
+        PTC_MONITOR_CI_CAPPED="$capped"
+        log_warning "This CI job may run $(( timeout / 60 )) minutes ($source; $(( elapsed / 60 )) used): the run stops after $(( capped / 60 )) minute(s), not $(( secs / 60 )), and delivers what finished, $(( reserve / 60 )) minute(s) before the job would be killed."
+        log_warning "To translate more per run, raise the job timeout: GitLab > Settings > CI/CD > General pipelines > Timeout, or: glab api -X PUT projects/${CI_PROJECT_ID:-PROJECT_ID} -f build_timeout=10800. The runner's own maximum timeout caps it too (a shared runner often allows 1 h): for longer runs, give the job a runner with a higher maximum (\`tags:\` naming it, or a project runner). PTC keeps translating after the job stops, and the next run delivers what finished without translating it again."
+    fi
 }
 
 monitor_bound_reached() {
@@ -1742,13 +1864,20 @@ report_still_translating() {
     while IFS= read -r line; do [[ -n "$line" ]] && lines+=("$line"); done
     n=${#lines[@]}
     if monitor_bound_reached; then
-        if [[ -n "$PTC_MONITOR_MAX_SECONDS" ]]; then bound="its ${PTC_MONITOR_MAX_SECONDS}-second bound"; else bound="its ${PTC_MONITOR_MAX_MINUTES}-minute bound (monitor_max_minutes)"; fi
+        if [[ -n "${PTC_MONITOR_CI_CAPPED:-}" ]]; then bound="its ${PTC_MONITOR_CI_CAPPED}-second bound (the CI job's timeout, less the time to deliver)"
+        elif [[ -n "$PTC_MONITOR_MAX_SECONDS" ]]; then bound="its ${PTC_MONITOR_MAX_SECONDS}-second bound"; else bound="its ${PTC_MONITOR_MAX_MINUTES}-minute bound (monitor_max_minutes)"; fi
     else
         bound="its ${PTC_MONITOR_MAX_ATTEMPTS}-check budget (monitor_max_attempts)"
     fi
     log_warning "Still translating in PTC: $n (the run stopped at $bound; the $completed completed file(s) were written)"
     for line in "${lines[@]}"; do
         path="${line%%$'\t'*}"; state="${line#*$'\t'}"
+        # WF-20: PTC reports the file completed while its download is still being prepared (202): say that, never "(completed)"
+        # in a list of files still translating.
+        [[ "$state" == "completed" ]] && state="completed in PTC; the download is still being prepared"
+        # GAP-CI-2 F14 (POL-11): every string is translated and stored in PTC; its review holds the delivery. A re-run
+        # translates none of it again: it downloads the file once the review releases it.
+        [[ "$state" == "reviewing" ]] && state="translated in PTC; its review holds the delivery until it finishes"
         log_warning "  ⏱ $path ($state)"
     done
     if [[ -n "$PTC_CONFIG_FILE" ]]; then
@@ -1765,7 +1894,7 @@ report_still_translating() {
     else
         log_info "PTC is still translating; nothing failed. Your options:"
     fi
-    log_info "  (a) Retry this CI job once PTC finishes (GitLab: Retry on the job; GitHub: Re-run jobs), or push the next commit: the run downloads what finished."
+    log_info "  (a) Retry this CI job once PTC finishes (GitLab: Retry on the job; GitHub: Re-run jobs), or push the next commit: the run downloads what finished. PTC keeps translating after this job stops and keeps every translated string; the next run translates none of it again."
     log_info "  (b) Check progress: $cmd --action status"
     if [[ -n "$pid" ]]; then
         root="${PTC_API_URL%%/api/*}"
@@ -1774,14 +1903,45 @@ report_still_translating() {
     log_info "  (c) Download manually: $cmd --action download   (writes the finished translations; then commit them)"
 }
 
+# WF-20: the time bound is what ends a run; the unset attempts cap (counted per ROUND, one pass over every file) is only a
+# safety net and never binds before it: at least one round per monitor interval over the whole bound, plus slack.
 scale_monitor_max_attempts() {
     local files="${1:-0}"
     [[ "$PTC_MONITOR_MAX_ATTEMPTS_SET" == "true" ]] && return 0
     [[ "$files" =~ ^[0-9]+$ ]] || return 0
-    local scaled=$((files * 20))
+    local scaled=$((files * 20)) secs="" interval="${PTC_MONITOR_INTERVAL:-5}" by_time
     [[ $scaled -lt 100 ]] && scaled=100
+    if [[ -n "$PTC_MONITOR_MAX_SECONDS" ]]; then secs="$PTC_MONITOR_MAX_SECONDS"
+    elif [[ "$PTC_MONITOR_MAX_MINUTES" =~ ^[0-9]+$ ]]; then secs=$(( PTC_MONITOR_MAX_MINUTES * 60 )); fi
+    [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=1
+    if [[ "$secs" =~ ^[0-9]+$ ]]; then
+        by_time=$(( (secs + interval - 1) / interval + 10 ))
+        [[ $scaled -lt $by_time ]] && scaled=$by_time
+    fi
     PTC_MONITOR_MAX_ATTEMPTS=$scaled
     log_debug "Monitor budget: $PTC_MONITOR_MAX_ATTEMPTS polls for $files file(s)"
+}
+
+# WF-20: PTC's suggested wait (retry_after of an in-progress 202, capped at 300 s): the largest seen this round.
+note_server_poll_interval() {
+    local s="${1:-}"
+    [[ "$s" =~ ^[0-9]+$ ]] && (( s > 0 )) || return 0
+    (( s > 300 )) && s=300
+    if [[ -z "$PTC_SERVER_POLL_INTERVAL" ]] || (( s > PTC_SERVER_POLL_INTERVAL )); then PTC_SERVER_POLL_INTERVAL="$s"; fi
+}
+
+# WF-20: the wait between monitoring rounds - the monitor interval, or PTC's suggested interval when longer - never past
+# the time bound (the loop then stops on monitor_bound_reached). Resets the round's suggestion.
+monitor_round_sleep() {
+    local wait="$PTC_MONITOR_INTERVAL"
+    [[ -n "$PTC_SERVER_POLL_INTERVAL" ]] && (( PTC_SERVER_POLL_INTERVAL > wait )) && wait="$PTC_SERVER_POLL_INTERVAL"
+    PTC_SERVER_POLL_INTERVAL=""
+    if [[ -n "$PTC_MONITOR_DEADLINE" ]]; then
+        local left=$(( PTC_MONITOR_DEADLINE - SECONDS ))
+        (( left < 1 )) && left=1
+        (( wait > left )) && wait="$left"
+    fi
+    ptc_sleep "$wait"
 }
 
 process_files_in_steps() {
@@ -1791,6 +1951,7 @@ process_files_in_steps() {
     start_monitor_clock || return 1
     local unmapped_files=()  # E27: no output pattern could be resolved; failed loudly, never sent
     local processed_files=()
+    local suite_pending_files=()  # 1.5.0 (L21-3): stored, not translated - held for the suite (never monitored)
     
     # Step 1: Upload all files
     log_info "=== STEP 1: Uploading all files ==="
@@ -1852,12 +2013,22 @@ process_files_in_steps() {
             elif (( start_rc == PTC_REFUSED )); then
                 refused_rest "$file" "${uploaded_files[@]}" >/dev/null
                 break
+            elif (( start_rc == PTC_SUITE_PENDING )); then
+                suite_pending_files+=("$file")
             else
                 log_error "Failed to start processing: $relative_file_path"
             fi
         fi
     done
-    
+
+    # 1.5.0 (L21-3): files held for the suite are reported once and never monitored; a run that only held files is done.
+    if [[ ${#suite_pending_files[@]} -gt 0 ]]; then
+        report_suite_pending "$base_dir" "${suite_pending_files[@]}"
+        if [[ ${#processed_files[@]} -eq 0 && ${#suite_pending_files[@]} -eq ${#uploaded_files[@]} && ${#unmapped_files[@]} -eq 0 ]]; then
+            return 0
+        fi
+    fi
+
     if [[ ${#processed_files[@]} -eq 0 ]]; then
         log_error "No files started processing successfully"
         return 1
@@ -1984,7 +2155,7 @@ process_files_in_steps() {
         
         if [[ ${#monitoring_files[@]} -gt 0 ]]; then
             if [[ $round -lt $PTC_MONITOR_MAX_ATTEMPTS ]]; then
-                ptc_sleep "$PTC_MONITOR_INTERVAL"
+                monitor_round_sleep
             fi
         fi
         
@@ -2069,6 +2240,7 @@ process_files_in_steps_with_config() {
     start_monitor_clock || return 1
     local unmapped_files=()  # E27: no output pattern could be resolved; failed loudly, never sent
     local processed_files=()
+    local suite_pending_files=()  # 1.5.0 (L21-3): stored, not translated - held for the suite (never monitored)
     # E20: files PTC refused (processing 4xx, or a draft that never gets its file). Terminal; the rest still deliver.
     local rejected_files=()
     # S2-R12: files whose processing request never got a PTC answer after retries (5xx / no response). Not rejected.
@@ -2147,6 +2319,8 @@ process_files_in_steps_with_config() {
                 local refused_file
                 while IFS= read -r refused_file; do rejected_files+=("$refused_file"); done < <(refused_rest "$file" "${uploaded_files[@]}")
                 break
+            elif (( start_rc == PTC_SUITE_PENDING )); then
+                suite_pending_files+=("$file")
             elif (( start_rc == PTC_UNREACHABLE )); then
                 log_error "Processing could not be started (could not reach PTC): $relative_file_path"
                 unreachable_files+=("$file")
@@ -2156,7 +2330,16 @@ process_files_in_steps_with_config() {
             fi
         fi
     done
-    
+
+    # 1.5.0 (L21-3): files held for the suite are reported once and never monitored; a run that only held files is done.
+    if [[ ${#suite_pending_files[@]} -gt 0 ]]; then
+        report_suite_pending "$base_dir" "${suite_pending_files[@]}"
+        if [[ ${#processed_files[@]} -eq 0 && ${#suite_pending_files[@]} -eq ${#uploaded_files[@]} && ${#unmapped_files[@]} -eq 0 ]]; then
+            write_run_summary "${#uploaded_files[@]}" 0 0 0
+            return 0
+        fi
+    fi
+
     if [[ ${#processed_files[@]} -eq 0 ]]; then
         log_error "No files were processed successfully"
         return 1
@@ -2287,7 +2470,7 @@ process_files_in_steps_with_config() {
         done
         
         # Display compact status
-        display_file_status "${#completed_files[@]}" "${#monitoring_files[@]}" "$round" "$PTC_MONITOR_MAX_ATTEMPTS" "$status_string"
+        display_file_status "${#completed_files[@]}" "${#processed_files[@]}" "$round" "$PTC_MONITOR_MAX_ATTEMPTS" "$status_string"
         
         # Update monitoring array for next round
         if [[ ${#still_monitoring[@]} -gt 0 ]]; then
@@ -2298,7 +2481,7 @@ process_files_in_steps_with_config() {
         
         # Wait before next round if files are still being monitored
         if [[ ${#monitoring_files[@]} -gt 0 ]] && [[ $round -lt $PTC_MONITOR_MAX_ATTEMPTS ]]; then
-            ptc_sleep "$PTC_MONITOR_INTERVAL"
+            monitor_round_sleep
         fi
         
         ((round++))
@@ -2679,7 +2862,7 @@ make_ptc_api_call() {
     "file_path": "$relative_file_path",
     "output_file_path": "$output_file_path", 
     "file_tag_name": "$file_tag_name",
-    "additional_translation_files": $additional_files_json
+    "additional_translation_files": $additional_files_json$PTC_LOCALE_MAP_FIELD
 }
 EOF
 )
@@ -2718,6 +2901,7 @@ EOF
                 -F "output_file_path=$output_file_path" \
                 -F "file_tag_name=$file_tag_name" \
                 -F "file=@$absolute_file_path" \
+                ${PTC_LOCALE_MAP_FORM[@]+"${PTC_LOCALE_MAP_FORM[@]}"} \
                 "$api_url" 2>/dev/null)
         fi
     else
@@ -2729,7 +2913,7 @@ EOF
     "file_path": "$relative_file_path",
     "output_file_path": "$output_file_path", 
     "file_tag_name": "$file_tag_name",
-    "additional_translation_files": $additional_files_json
+    "additional_translation_files": $additional_files_json$PTC_LOCALE_MAP_FIELD
 }
 EOF
 )
@@ -2746,6 +2930,7 @@ EOF
                 -F "output_file_path=$output_file_path" \
                 -F "file_tag_name=$file_tag_name" \
                 -F "file=@$absolute_file_path" \
+                ${PTC_LOCALE_MAP_FORM[@]+"${PTC_LOCALE_MAP_FORM[@]}"} \
                 "$api_url" 2>/dev/null)
         fi
     fi
@@ -2860,6 +3045,14 @@ start_processing() {
         # L14 (SF-43): the trial cap refuses the whole push, so every later file would be refused the same way.
         [[ "$http_code" == "402" ]] && return $PTC_REFUSED
         return 1
+    fi
+
+    # 1.5.0 (L21-3): stored, not translated - the project's suite is still being set up (see PTC_SUITE_PENDING).
+    if [[ "$(json_string_field "$response_body" "code")" == "suite_setup_pending" ]]; then
+        PTC_SUITE_PENDING_MESSAGE=$(json_string_field "$response_body" "message")
+        log_info "Stored, not translated yet (the project's suite is still being set up): $relative_file_path"
+        log_debug "Process API response: $response_body"
+        return $PTC_SUITE_PENDING
     fi
 
     log_success "File processing started successfully: $relative_file_path"
@@ -3090,8 +3283,10 @@ display_file_status() {
     # Clear current line and move cursor to beginning
     echo -ne "\r\033[K"
     
-    # Display compact status: XX round/max_round
-    echo -ne "${status_string} ${CYAN}${round}/${max_round}${NC}"
+    # GAP-CI-2 F14 (WPML lab run 2: "1/1954 ... 141/1954" read as translation units that restarted at 1 on the retry):
+    # the count is PTC's stored state - files done of the files this run sent - and the status check is named as one.
+    # max_round is the safety-net budget only (scale_monitor_max_attempts), never progress.
+    echo -ne "${status_string} ${CYAN}${completed_count} of ${total_count} file(s) done in PTC${NC} (status check ${round})"
     
     # Flush output
     echo -ne ""
@@ -3127,6 +3322,10 @@ get_status_char() {
             ;;
         "rejected")
             echo -e "${RED}R${NC}"
+            ;;
+        "reviewing")
+            # GAP-CI-2 F14 (POL-11): translated in PTC, its review holds the delivery. It printed U (unknown) before.
+            echo -e "${CYAN}V${NC}"
             ;;
         "null"|"status_unknown"|"unknown"|*)
             echo -e "${YELLOW}U${NC}"
@@ -3312,6 +3511,7 @@ download_translations() {
         local retry_after
         retry_after=$(json_number_field "$download_body" "retry_after")
         log_info "Translations for $relative_file_path are still being prepared${retry_after:+ (server suggests ${retry_after}s)}; will retry."
+        note_server_poll_interval "$retry_after"
         rm -f "$temp_zip"
         return 2
     fi
@@ -3907,8 +4107,10 @@ render_ci_gitlab() {
 ptc-translate:
   stage: deploy
   image: alpine:3.22
-  # A first translation of a large project outlives GitLab's default 1 h job limit (CI-16). 3 h covers it; the CLI stops
-  # on its own at a 45-minute bound (monitor_max_minutes in .ptc-config.yml), delivers what finished and exits 7.
+  # A first translation of a large project outlives GitLab's default 1 h job limit (CI-16), so the job asks for 3 h; the
+  # project's timeout and the runner's maximum can still shorten it. The CLI reads the job's real limit (CI_JOB_TIMEOUT)
+  # and stops 10 minutes before it, or at its own 45-minute bound (monitor_max_minutes in .ptc-config.yml), delivers
+  # what finished and exits 7. PTC keeps translating; the next run delivers the rest and translates nothing again.
   timeout: 3h
   # The preflight writes the CI-time limit note here (balance short of the census); the merge request description
   # below carries it, as a GitHub pull request body does.
@@ -3946,7 +4148,9 @@ ptc-translate:
     # Report the run to PTC's agent guide (scan, config digests, identity token); never fails the job.
     - /tmp/ptc-cli.sh guide action-run --config-file .ptc-config.yml || true
     # Check first (agent guide): PTC reports missing information for this commit; it never withholds the translation.
-    - PTC_ORG_TOKEN="\${PTC_ORG_TOKEN:-\$PTC_API_TOKEN}" /tmp/ptc-cli.sh guide check --json --config-file .ptc-config.yml > /tmp/ptc-check.json || true
+    # PTC_API_TOKEN (the agent token PTC asks for) comes first; the legacy PTC_ORG_TOKEN is read only without it.
+    - if [ -z "\${PTC_API_TOKEN:-}" ] && [ -n "\${PTC_ORG_TOKEN:-}" ]; then echo "PTC_ORG_TOKEN is deprecated - set the masked CI/CD variable PTC_API_TOKEN (your agent token) instead."; fi
+    - PTC_ORG_TOKEN="\${PTC_API_TOKEN:-\$PTC_ORG_TOKEN}" /tmp/ptc-cli.sh guide check --json --config-file .ptc-config.yml > /tmp/ptc-check.json || true
     # The merge request's description carries PTC's findings (set by the push below; the project setting in PTC turns
     # them off). They are printed here too, so every job log shows them, also when there is nothing new to push.
     - ptc_mr_description="\$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
@@ -3970,7 +4174,7 @@ ptc-translate:
     # nothing else - not this job's downloads, not whatever an earlier step in
     # your pipeline left in the working directory.
     #
-    # \`|| true\` is not cosmetic: if a translation lands on a path your
+    # Exit 1 from git add is tolerated, not cosmetic: if a translation lands on a path your
     # .gitignore covers, git exits 1 while still staging everything else, and
     # GitLab would abort the job on that exit code alone.
     #
@@ -3978,11 +4182,32 @@ ptc-translate:
     # first run the translations are new files, and a plain \`git diff\` only
     # looks at tracked ones - it would report "nothing changed", skip the push,
     # and leave a green job that produced no merge request.
+    #
+    # The manifest's paths are relative to the repository root, and a job may run
+    # from a subdirectory (a suite job starts with \`cd <product dir>\`), so the
+    # staging runs at the root. A file the run wrote that is still unstaged after
+    # it means git matched none of the paths: the job says so and fails, never a
+    # green job without a merge request.
     - |
       git config user.email "ci@ptc"
       git config user.name "PTC Translate"
       git checkout -B ptc/translations
-      git add --pathspec-from-file=/tmp/ptc-written --pathspec-file-nul || true
+      ptc_top="\$(git rev-parse --show-toplevel)"
+      ptc_add_rc=0
+      git -C "\$ptc_top" add --pathspec-from-file=/tmp/ptc-written --pathspec-file-nul || ptc_add_rc=\$?
+      # 1 = some path is ignored (the rest is staged); 128 = a path matched nothing and git staged NOTHING.
+      if [ "\$ptc_add_rc" -gt 1 ]; then
+        echo "git add of the translations this run wrote failed (exit \$ptc_add_rc), so nothing was staged for the merge request."
+        exit 1
+      fi
+      if [ -s /tmp/ptc-written ]; then
+        ptc_unstaged="\$(xargs -0 git -C "\$ptc_top" status --porcelain --untracked-files=all -- < /tmp/ptc-written | grep '^.[^ ]' || true)"
+        if [ -n "\$ptc_unstaged" ]; then
+          echo "PTC wrote these translations, but they were not staged for the merge request (git add matched none of them):"
+          echo "\$ptc_unstaged"
+          exit 1
+        fi
+      fi
       if ! git diff --cached --quiet; then
         git commit -m "chore(i18n): update translations via PTC [skip translations]"
         ptc_mr_description="\$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
@@ -4479,6 +4704,17 @@ def parse_po(text):
     return entries
 
 
+def po_is_source_template(text):
+    """GAP-G11: a .po that is a template in all but name (WordPress plugins ship locale/orig/<domain>.po): header
+    Language empty, en or en_US, and every entry's msgstr empty (plural forms too). A .po with translations is not."""
+    header = re.search(r'(?m)^msgid ""\s*\nmsgstr ""\s*\n((?:\s*".*"\s*\n?)*)', text)
+    lang = re.search(r'Language:\s*([^\\"]*)', header.group(1)) if header else None
+    if lang and lang.group(1).strip().replace("-", "_") not in ("", "en", "en_US"):
+        return False
+    entries = parse_po(text)
+    return bool(entries) and not any(v for e in entries for k, v in e.items() if k.startswith("msgstr"))
+
+
 def stats_po(text):
     es = parse_po(text)
     ph = sum(count_ph(e.get("msgid", "")) for e in es)
@@ -4576,7 +4812,7 @@ def scan(root, source_locale, config_pairs):
     root = os.path.abspath(root)
     files = list_files(root)
     groups = {}  # (format, pattern) -> {lang: [paths]}
-    pots = []
+    pots, bare_pos = [], []
     for f in files:
         if NON_PRODUCT.search(f):
             continue
@@ -4588,9 +4824,25 @@ def scan(root, source_locale, config_pairs):
             continue
         lt = lang_template(f)
         if not lt:
+            if f.endswith(".po"):
+                bare_pos.append(f)
             continue
         pat, lang = lt
         groups.setdefault((fmt, pat), {}).setdefault(lang, []).append(f)
+
+    # GAP-G11: a .po with no language in its name that is a template in all but name is the source, like a .pot, when
+    # no .pot claims its directory or its domain (wpml-cms-nav/locale/orig/wpml-cms-nav.po beside locale/*-de_DE.mo).
+    pot_dirs = {os.path.dirname(p) for p in pots}
+    pot_stems = {os.path.splitext(os.path.basename(p))[0] for p in pots}
+    for f in bare_pos:
+        if os.path.dirname(f) in pot_dirs or os.path.splitext(os.path.basename(f))[0] in pot_stems:
+            continue
+        try:
+            text = open(os.path.join(root, f), encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        if po_is_source_template(text):
+            pots.append(f)
 
     src = source_locale or "en"
     sets, usage_keys = [], {}
@@ -4613,7 +4865,7 @@ def scan(root, source_locale, config_pairs):
                          "source_pattern": pattern, "source_files": sf,
                          "existing_languages": sorted(l for l in langs if l.split("_")[0].split("-")[0] != src.split("_")[0].split("-")[0])})
 
-    # gettext: a .pot is the source; .po siblings in the same dir give the languages
+    # gettext: a .pot (or a source .po, GAP-G11) is the source; .po siblings in the same dir give the languages
     # Compiled/derived siblings count as existing translations too: WordPress
     # plugins ship name-de_DE.mo next to (or one level above) pot/name.pot, and
     # JED JSON as name-de_DE-handle.json.
@@ -4676,8 +4928,10 @@ def scan(root, source_locale, config_pairs):
             "frameworks": sorted(fw) or ["unknown"],
             "resource_sets": sets, "usages": usages,
             "products": scan_products(root, sets),
+            "gitignore": gitignore_rules(root),
             "other_string_sources": v2["other_string_sources"], "partition": v2["partition"],
             "existing_translations": v2["existing_translations"], "runtime": v2["runtime"],
+            "usages_unmatched": v2["usages_unmatched"],
             "none_reason": None if sets else "no translation resource files found (looked for Rails YAML, gettext .pot/.po, JSON locale files)"}
 
 
@@ -4736,8 +4990,11 @@ def census_v2(root, files, sets):
     Cheap, deterministic heuristics only (no model); every count is a lower-bound estimate."""
     other = {k: {"kind": k, "files": 0, "occurrences": 0, "samples": []} for k in
              ("templates", "html", "js_literals", "emails", "pdf", "seo_meta")}
-    runtime = {"text_domains": [], "domain_paths": [], "load_textdomain": [], "i18n_init": []}
+    runtime = {"text_domains": [], "domain_paths": [], "load_textdomain": [], "i18n_init": [], "gettext_domains": []}
     resource_paths = {sf["path"] for s in sets for sf in s["source_files"]}
+    domain_calls = {}  # GAP-G11: text domain -> {file: gettext calls}, so PTC can name a domain no catalogue covers
+    template_keys = gettext_template_keys(root, sets)
+    unmatched = {}  # GAP-G24: text domain -> {"calls": [...], "total": n}
 
     def hit(kind, path, line_no, text, n=1):
         o = other[kind]
@@ -4781,6 +5038,14 @@ def census_v2(root, files, sets):
                                                        "args": (call_rest(line, m.end()) or "")[:160] or None})
                 elif I18N_INIT_RE.search(line) and len(runtime["i18n_init"]) < 50 and not line.lstrip().startswith(("#", "//", "*")):
                     runtime["i18n_init"].append({"path": f, "line": no, "text": line.strip()[:200]})
+            if ext in CODE_EXT and "_" in line:
+                for m in GETTEXT_RE.finditer(line):
+                    dm = GETTEXT_DOMAIN_RE.search(call_rest(line, m.end()) or "")
+                    if dm:
+                        per = domain_calls.setdefault(dm.group(1), {})
+                        per[f] = per.get(f, 0) + 1
+                    if template_keys:
+                        add_unmatched(unmatched, template_keys, m, line, f, no)
             if SEO_RE.search(line):
                 hit("seo_meta", f, no, line); counted.add("seo_meta")
             if is_tpl or ext in JSX_TEXT_EXT:
@@ -4804,6 +5069,7 @@ def census_v2(root, files, sets):
         for k in counted:
             other[k]["files"] += 1
 
+    runtime["gettext_domains"] = [{"domain": d, "calls": sum(per.values()), "files": len(per)} for d, per in sorted(domain_calls.items())]
     partition = []
     for s in sets:
         aud, rule = audience_for(s["source_pattern"])
@@ -4811,7 +5077,127 @@ def census_v2(root, files, sets):
 
     existing = existing_translations(root, files, sets, runtime)
     return {"other_string_sources": [o for o in other.values() if o["occurrences"] or o["files"]],
-            "partition": partition, "existing_translations": existing, "runtime": runtime}
+            "partition": partition, "existing_translations": existing, "runtime": runtime,
+            "usages_unmatched": {d: {"calls": u["calls"], "total": u["total"], "truncated": u["total"] > len(u["calls"])}
+                                 for d, u in sorted(unmatched.items())}}
+
+
+# GAP-G24 (wpml-core MR !939: sitepress.pot regenerated without the page-builder add-ons lost 235-343 strings): `usages`
+# list only the calls whose msgid some template holds, so a string missing from EVERY template was invisible to PTC's
+# freshness check (GAP-G21). `usages_unmatched` lists, per text domain, every gettext call whose (msgctxt, msgid) is in no
+# census template of that domain (a template's domain is the file it is named for, `sitepress.pot` -> `sitepress`, as PTC
+# reads it); a call with no or a variable domain goes under "" and counts against every template. Precision over recall,
+# as PTC's own reading of `usages`: a msgid or msgctxt that is not a plain literal (concatenation, interpolation, variable)
+# and a call that does not close on its line are never listed. At most MAX_UNMATCHED calls per domain; `total` counts all.
+MAX_UNMATCHED = 500
+GETTEXT_CTX_AT = {"_x": 1, "_ex": 1, "esc_html_x": 1, "esc_attr_x": 1, "_nx": 3}
+GETTEXT_DOMAIN_AT = {"_x": 2, "_ex": 2, "esc_html_x": 2, "esc_attr_x": 2, "_n": 3, "_nx": 4}
+PHP_DYNAMIC = object()
+
+
+def gettext_template_keys(root, sets):
+    """{text domain: {(msgctxt, msgid)}} of the census gettext templates (po sets' .pot/.po source files)."""
+    keys = {}
+    for s in sets:
+        if s["format"] != "po":
+            continue
+        for sf in s["source_files"]:
+            if not sf["path"].endswith((".pot", ".po")):
+                continue
+            try:
+                text = open(os.path.join(root, sf["path"]), encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            dom = os.path.splitext(os.path.basename(sf["path"]))[0]
+            keys.setdefault(dom, set()).update(
+                (po_unescape(e["msgctxt"]) if "msgctxt" in e else None, po_unescape(e["msgid"])) for e in parse_po(text))
+    return keys
+
+
+def _php_quoted(t, pos):
+    """A quoted PHP literal at pos -> (value, index after it); value PHP_DYNAMIC when a double-quoted one interpolates;
+    (None, None) when it does not close on the line. Unescaped as `usages` keys a msgid (\' \" \\ only)."""
+    q, close = t[pos], pos + 1
+    while close < len(t) and t[close] != q:
+        close += 2 if t[close] == "\\" else 1
+    if close >= len(t):
+        return None, None
+    raw = t[pos + 1:close]
+    if q == '"' and re.search(r"(?<!\\)\$[{a-zA-Z_]", raw):
+        return PHP_DYNAMIC, close + 1
+    return re.sub(r"\\(['\"\\])", r"\1", raw), close + 1
+
+
+def _php_skip(t, pos):
+    """Past a non-literal argument to the comma or closing bracket at depth 0; None when the line ends first."""
+    depth = 0
+    while pos is not None and pos < len(t):
+        ch = t[pos]
+        if ch in "'\"":
+            pos = _php_quoted(t, pos)[1]
+            continue
+        if depth == 0 and ch in ",)]}":
+            return pos
+        depth += 1 if ch in "([{" else -1 if ch in ")]}" else 0
+        pos += 1
+    return None
+
+
+def php_call_args(t, pos):
+    """The arguments of the call whose '(' closes just before pos: each a literal str or PHP_DYNAMIC (a literal glued to
+    more is dynamic); None when the call does not close on this line."""
+    args = []
+    while True:
+        while pos < len(t) and t[pos].isspace():
+            pos += 1
+        if pos >= len(t):
+            return None
+        if t[pos] == ")" and not args:
+            return args
+        if t[pos] in "'\"":
+            val, end = _php_quoted(t, pos)
+            if end is None:
+                return None
+            pos = end
+            while pos < len(t) and t[pos].isspace():
+                pos += 1
+            if pos < len(t) and t[pos] in ",)":
+                args.append(val)
+                if t[pos] == ")":
+                    return args
+                pos += 1
+                continue
+        pos = _php_skip(t, pos)
+        if pos is None:
+            return None
+        args.append(PHP_DYNAMIC)
+        if t[pos] == ")":
+            return args
+        pos += 1
+
+
+def add_unmatched(unmatched, template_keys, m, line, path, no):
+    """Record the gettext call `m` (a GETTEXT_RE match on `line`) when no template of its text domain holds its string."""
+    name = m.group(0).split("(", 1)[0]
+    args = php_call_args(line, m.start() + m.group(0).index("(") + 1)
+    if not args or not isinstance(args[0], str):
+        return
+    at = GETTEXT_CTX_AT.get(name)
+    ctxt = (args[at] if len(args) > at else PHP_DYNAMIC) if at is not None else None
+    if ctxt is PHP_DYNAMIC:
+        return
+    di = GETTEXT_DOMAIN_AT.get(name, 1)
+    dom = args[di] if len(args) > di and isinstance(args[di], str) else ""
+    key = (ctxt, args[0])
+    if dom:
+        if key in template_keys.get(dom, ()):
+            return
+    elif any(key in ks for ks in template_keys.values()):
+        return
+    u = unmatched.setdefault(dom, {"calls": [], "total": 0})
+    u["total"] += 1
+    if len(u["calls"]) < MAX_UNMATCHED:
+        u["calls"].append({"msgid": args[0], "msgctxt": ctxt, "path": path, "line": no, "text": line.strip()[:200]})
 
 
 def _base_lang(code):
@@ -4895,6 +5281,30 @@ def is_product_dir(path):
     return False
 
 
+GITIGNORE_MAX_FILES = 200
+GITIGNORE_MAX_RULES = 1000
+
+
+def gitignore_rules(root):
+    """GAP-G2 (WPML lab run 3, gt_347): every .gitignore of the checkout, its pattern lines with their line numbers, so PTC
+    checks the outputs of the config it generates against the same rules `ptc config validate` applies (root and product
+    .gitignore files) and hands out the exceptions before the agent validates. Paths are relative to the scan root, as the
+    resource sets are; [] outside a git work tree."""
+    listed = git(root, "ls-files", "--cached", "--others", "--exclude-standard", "--", ".gitignore", "*/.gitignore")
+    out = []
+    for rel in sorted({p for p in listed.splitlines() if p == ".gitignore" or p.endswith("/.gitignore")})[:GITIGNORE_MAX_FILES]:
+        try:
+            with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
+                lines = fh.read(200000).splitlines()
+        except OSError:
+            continue
+        rules = [{"line": no, "pattern": line[:500]} for no, line in enumerate(lines, 1)
+                 if line.strip() and not line.startswith("#")][:GITIGNORE_MAX_RULES]
+        if rules:
+            out.append({"path": rel, "rules": rules})
+    return out
+
+
 def scan_products(root, sets):
     """Resource sets grouped by top-level product directory (multi-product repositories)."""
     tops = sorted({s["source_pattern"].split("/", 1)[0] for s in sets if "/" in s["source_pattern"]})
@@ -4908,6 +5318,8 @@ def fnmatch_path(path, pattern):
 
 
 RAILS_RE = re.compile(r"""(?<![\w.])(?:I18n\.)?(?:t|translate)\(?\s*(['"])([\w.:\-/]+)\1""")
+# The text domain of a gettext call: the last argument when it is a string literal (call_rest of a GETTEXT_RE match).
+GETTEXT_DOMAIN_RE = re.compile(r"""(?:^|,)\s*['"]([\w.-]+)['"]\s*$""")
 GETTEXT_RE = re.compile(r"""\b(?:__|_e|_x|_ex|_n|_nx|esc_html__|esc_html_e|esc_attr__|esc_attr_e|esc_html_x|esc_attr_x)\(\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)")""")
 
 
@@ -5019,6 +5431,23 @@ def config_validate(root, path):
     for l in langs:
         if not is_lang(l):
             errors.append(f"guide.languages: '{l}' is not a known language code")
+    locale_map = {}
+    raw_map = cfg.get("locale_map")
+    if raw_map:  # WF-5: {PTC code: file locale}; {{lang}} expands to the file locale
+        body = raw_map.strip()
+        if not (body.startswith("{") and body.endswith("}")):
+            errors.append(f"locale_map '{raw_map}' is not a {{code: locale, ...}} map")
+        else:
+            for pair in [x for x in body[1:-1].split(",") if x.strip()]:
+                code, _, loc = pair.partition(":")
+                code, loc = unquote(code.strip()), unquote(loc.strip())
+                if not is_lang(code):
+                    errors.append(f"locale_map: '{code}' is not a known language code")
+                elif not re.match(r"^[A-Za-z0-9_-]{1,20}$", loc):
+                    errors.append(f"locale_map: '{code}' maps to '{loc}', not a locale token")
+                else:
+                    locale_map[code] = loc
+        cfg["locale_map"] = locale_map
     for i, e in enumerate(cfg["files"], 1):
         fpat, out = e.get("file", ""), e.get("output", "")
         matches = [f for f in all_files if fnmatch_path(f, fpat)]
@@ -5035,7 +5464,7 @@ def config_validate(root, path):
                 rx = "^" + re.escape(out).replace(re.escape("{{lang}}"), "([^/]+)") + "$"
                 targets = sorted({m.group(1) for f in all_files for m in [re.match(rx, f)] if m and is_lang(m.group(1)) and m.group(1) != src})
             for l in targets:
-                entry["outputs"][l] = out.replace("{{lang}}", l)
+                entry["outputs"][l] = out.replace("{{lang}}", locale_map.get(l, l))
         report.append(entry)
     seen = {}
     for i, e in enumerate(cfg["files"], 1):
@@ -5075,7 +5504,8 @@ def ignored_outputs(root, report):
     hits = {}
     for line in res.stdout.splitlines():
         rule, _, p = line.partition("\t")
-        if p:
+        # WF-6: -v also prints the path a negation (`!pattern`) matched last: that path is NOT ignored.
+        if p and not rule.split(":", 2)[-1].startswith("!"):
             hits[p] = rule
     return [(p, hits[p]) for p in paths if p in hits]
 
@@ -5153,6 +5583,39 @@ def _key_on_line(line, key):
     return any(v and v in line for v in variants)
 
 
+JSX_EXT = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+# F6 (WPML lab run 2; specs/agent-guide AGD-3 row 6): PTC composes the note within the comment rule (one line, about 200
+# characters, no code detail; Guide::TranslatorNote) and the CLI writes it as it is: never cut, never rewritten. Cutting
+# here garbled run 2's notes ("....", "(PHP and", a leaked `wpml_bold_names`). A description that still names a
+# repository path, a source file, a function or a snake_case identifier (one PTC stored before the rule) is skipped with
+# the reason, never written. The same shapes as PTC's rule (Guide::TranslatorNote::CODE_DETAIL), placeholders aside.
+NOTE_LEAK_RE = re.compile(r"[\w.-]+/[\w.-]+/[\w./-]+|\b[\w-]+\.(?:php|jsx?|tsx?|mjs|cjs|vue|rb|py|twig|html?|s?css|ya?ml|pot?|json|xml)\b"
+                          r"|\b[A-Za-z_$][\w$]*\(\)|\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", re.I)
+NOTE_PLACEHOLDER_RE = re.compile(r"%\{\w+\}|\{\{\s*\w+\s*\}\}|%(?:\d+\$)?[sdfu@]|\{\w+\}")
+
+
+def _note_text(desc):
+    return desc
+
+
+def _note_leak(desc):
+    m = NOTE_LEAK_RE.search(NOTE_PLACEHOLDER_RE.sub(" ", desc))
+    return m.group(0) if m else None
+
+
+def _jsx_child_brace(line, key):
+    """WF-8: index of the `{` of the JSX expression container holding the call on this line (`{__('Save')}` as a JSX
+    child, alone on its line or right after a tag), or None. A note there goes inside the braces, never as a child."""
+    k = next((line.find(v) for v in (key, key.replace("'", "\\'")) if v and line.find(v) >= 0), -1)
+    if k < 0:
+        return None
+    j = line.rfind("{", 0, k)
+    if j < 0:
+        return None
+    before = line[:j].rstrip()
+    return j if before == "" or before.endswith(">") or before.endswith("}") else None
+
+
 def _translators_comment(ext, desc):
     if ext in HASH_COMMENT_EXT:
         return "# translators: " + desc
@@ -5168,10 +5631,236 @@ PTC_NOTE_RE = re.compile(r"^(?:<\?php )?(?:/\* translators: .* \*/|# translators
 PHP_OPEN_RE = re.compile(r"<\?(?:php\b|=)")
 
 
+PHP_OPEN_TAG_RE = re.compile(r"<\?(?:php\b|=|(?![a-zA-Z]))")
+JS_REGEX_AFTER = set("(,=:[!&|?{};+-*%<>~^")
+JS_REGEX_KEYWORDS = {"return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "yield", "await"}
+# GAP-G5: the gettext calls a note belongs to (WordPress PHP and @wordpress/i18n JS), with the callee's dotted owner
+# (`wp.i18n.__`) so a note goes before the whole callee.
+NOTE_CALL_RE = re.compile(r"(?<![\w$])(?:[A-Za-z_$][\w$]*\s*\.\s*)*(?:__|_e|_x|_ex|_n|_nx|_n_noop|_nx_noop|esc_html__|esc_html_e|"
+                          r"esc_attr__|esc_attr_e|esc_html_x|esc_attr_x)\s*\(\s*(['\"`])")
+LEXED_EXT = {".php"} | JSX_EXT
+
+
+def _lex_regions(text, ext):
+    """GAP-G5: the spans of a PHP or JS-family source that are not code, as sorted (start, end, kind) with kind `str`
+    (a string, heredoc or template literal's text), `comment` or `html` (PHP's inline HTML). A light lexer: enough to
+    tell whether a call or a line start sits in code. A JS quote or regex never runs past its line (JSX text such as
+    `Don't` cannot swallow the file)."""
+    regs, n, i = [], len(text), 0
+    php = ext == ".php"
+    mode = "html" if php else "code"
+    stack = []  # JS: open template literals; each entry is the `{` depth of the `${` that left it
+
+    def skip_str(j, q, multiline):
+        j += 1
+        while j < n:
+            c = text[j]
+            if c == "\\":
+                j += 2
+                continue
+            if c == q:
+                return j + 1
+            if c == "\n" and not multiline:
+                return j
+            j += 1
+        return n
+
+    def template_text(j):
+        # from just inside a template literal to its end (returns end, True) or to a `${` (returns its end, False)
+        while j < n:
+            c = text[j]
+            if c == "\\":
+                j += 2
+                continue
+            if c == "`":
+                return j + 1, True
+            if text.startswith("${", j):
+                return j + 2, False
+            j += 1
+        return n, True
+
+    depth = 0
+    while i < n:
+        if mode == "html":
+            m = PHP_OPEN_TAG_RE.search(text, i)
+            j = m.start() if m else n
+            if j > i:
+                regs.append((i, j, "html"))
+            if not m:
+                break
+            i, mode = m.end(), "code"
+            continue
+        c = text[i]
+        if php and text.startswith("?>", i):
+            i, mode = i + 2, "html"
+            continue
+        if c == "/" and text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            regs.append((i, j, "comment"))
+            i = j
+            continue
+        if text.startswith("//", i) or (php and c == "#" and not text.startswith("#[", i)):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            if php:
+                k = text.find("?>", i, j)
+                j = k if k >= 0 else j
+            regs.append((i, j, "comment"))
+            i = j
+            continue
+        if php and text.startswith("<<<", i):
+            m = re.match(r"<<<[ \t]*(['\"]?)([A-Za-z_]\w*)\1\r?\n", text[i:i + 200])
+            if m:
+                e = re.compile(r"^[ \t]*" + m.group(2) + r"\b", re.M).search(text, i + m.end())
+                j = e.end() if e else n
+                regs.append((i, j, "str"))
+                i = j
+                continue
+        if c in "'\"":
+            j = skip_str(i, c, php)
+            regs.append((i, j, "str"))
+            i = j
+            continue
+        if not php and c == "`":
+            j, closed = template_text(i + 1)
+            regs.append((i, j, "str"))
+            if not closed:
+                stack.append(depth)
+                depth = 0
+            i = j
+            continue
+        if not php and c == "/":
+            k = i - 1
+            while k >= 0 and text[k] in " \t\r\n":
+                k -= 1
+            prev = text[k] if k >= 0 else ""
+            word = re.search(r"[A-Za-z_$][\w$]*$", text[max(0, k - 20):k + 1]) if prev and (prev.isalnum() or prev in "_$") else None
+            if (not prev or prev in JS_REGEX_AFTER or (word and word.group(0) in JS_REGEX_KEYWORDS)) \
+                    and prev != "<" and not text.startswith("/>", i):
+                j, cls = i + 1, False
+                while j < n and text[j] != "\n":
+                    if text[j] == "\\":
+                        j += 2
+                        continue
+                    if text[j] == "[":
+                        cls = True
+                    elif text[j] == "]":
+                        cls = False
+                    elif text[j] == "/" and not cls:
+                        j += 1
+                        break
+                    j += 1
+                regs.append((i, j, "str"))
+                i = j
+                continue
+        if not php and stack:
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                if depth == 0:
+                    j, closed = template_text(i + 1)
+                    regs.append((i + 1, j, "str"))
+                    if closed:
+                        depth = stack.pop()
+                    i = j
+                    continue
+                depth -= 1
+        i += 1
+    return regs
+
+
+def _region_at(regs, off):
+    import bisect
+    k = bisect.bisect_right([r[0] for r in regs], off) - 1
+    return regs[k][2] if k >= 0 and regs[k][0] <= off < regs[k][1] else None
+
+
+def _unescape_literal(s):
+    return re.sub(r"\\(.)", lambda m: {"n": "\n", "t": "\t"}.get(m.group(1), m.group(1)), s, flags=re.S)
+
+
+def _find_call(text, regs, line_starts, idx, key):
+    """GAP-G5: the gettext call (callee start offset) whose msgid literal holds `key` and starts on line idx; the call
+    itself may open up to three lines above (`__(` alone, the literal below). Only a callee in code counts: a call's
+    text inside a string, heredoc or comment is no call."""
+    lo = line_starts[max(0, idx - 3)]
+    hi = line_starts[idx + 1] if idx + 1 < len(line_starts) else len(text)
+    for m in NOTE_CALL_RE.finditer(text, lo, hi):
+        q = m.group(1)
+        lit_start = m.end() - 1
+        if _region_at(regs, m.start()) is not None:
+            continue
+        j = lit_start + 1
+        while j < len(text) and text[j] != q:
+            j += 2 if text[j] == "\\" else 1
+        raw = text[lit_start + 1:j]
+        if key not in (raw, _unescape_literal(raw)) and key.replace("\n", "\\n") != raw:
+            continue
+        lit_line = bisect_line(line_starts, lit_start)
+        if lit_line != idx and bisect_line(line_starts, m.start()) != idx:
+            continue
+        return m.start()
+    return None
+
+
+def bisect_line(line_starts, off):
+    import bisect
+    return bisect.bisect_right(line_starts, off) - 1
+
+
+def _notes_outside_comments(text, ext):
+    regs = _lex_regions(text, ext)
+    return sum(1 for m in re.finditer(r"translators:", text, re.I) if _region_at(regs, m.start()) != "comment"), regs
+
+
+def _php_parses(path_or_text, is_text=False):
+    import shutil, tempfile
+    php = shutil.which("php")
+    if not php:
+        return None
+    try:
+        if is_text:
+            with tempfile.NamedTemporaryFile("w", suffix=".php", delete=False, encoding="utf-8") as fh:
+                fh.write(path_or_text)
+                path = fh.name
+        else:
+            path = path_or_text
+        r = subprocess.run([php, "-l", path], capture_output=True, text=True, timeout=60)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        if is_text:
+            try:
+                os.unlink(path)
+            except (OSError, UnboundLocalError):
+                pass
+
+
+def _post_write_check(old, new, ext, full):
+    """GAP-G5: after the notes are placed, the file must still be what it was plus comments: every note PTC wrote is a
+    comment token (none inside a string, heredoc, template literal or inline HTML), and a PHP file that parsed with
+    `php -l` (when php is installed) still parses. Returns the reason the write is refused, or None."""
+    if ext not in LEXED_EXT:
+        return None
+    before, _ = _notes_outside_comments(old, ext)
+    after, _ = _notes_outside_comments(new, ext)
+    if after > before:
+        return f"{after - before} note(s) would land inside a string, heredoc, template literal or inline HTML"
+    if ext == ".php" and _php_parses(full) and _php_parses(new, True) is False:
+        return "the file would no longer parse (php -l)"
+    return None
+
+
 def describe_source_comments(root, ds, res, dry_run, usage_map):
-    """gettext write-back that survives template regeneration: a `translators:` comment right above (or, inside an
-    inline `<?php ... ?>` template line, right before) the call site, which xgettext --add-comments=translators: and
-    `wp i18n make-pot` extract into the template's `#.` lines."""
+    """gettext write-back that survives template regeneration: a `translators:` comment where `wp i18n make-pot`,
+    xgettext --add-comments=translators: and @wordpress/babel-plugin-makepot read it into the template's `#.` lines.
+    GAP-G5 placement (PHP and JS family): the note goes on its own line directly above the call's line when that line
+    starts in PHP code, or (JS) when it starts with the call; a template line (PHP's inline HTML) gets `<?php /* */ ?>`
+    on the line above; any other call (after `return`, `? `/`: `, inside a concatenation or a multi-line string, in a
+    JSX attribute or a call's arguments) gets the note directly before the call on the same line. A msgid with no call
+    in code at its usage line is skipped with the reason; a file whose notes would not be comments is not written."""
     edits = {}  # usage path -> {line index: (d, desc)}
     for d in ds:
         u = d.get("usage") or {}
@@ -5194,26 +5883,88 @@ def describe_source_comments(root, ds, res, dry_run, usage_map):
             continue
         lines = text.split("\n")
         ext = os.path.splitext(upath)[1].lower()
+        lexed = ext in LEXED_EXT
+        regs = _lex_regions(text, ext) if lexed else []
+        line_starts = [0]
+        for l in lines[:-1]:
+            line_starts.append(line_starts[-1] + len(l) + 1)
         plan = {}  # line index -> [d, ...]: strings sharing a line get ONE combined comment (S2-R2 F8)
+        inline = {}  # line index -> {column: [d, ...]}: a note directly before the call (GAP-G5)
         for d, ln in items:
             idx = next((i for i in [ln - 1] + [ln - 1 + o for o in (-1, 1, -2, 2, -3, 3)]
                         if 0 <= i < len(lines) and _key_on_line(lines[i], d["key"])), None)
             if idx is None:
                 res["skipped"].append({"file": d["file"], "key": d["key"], "reason": f"{upath}:{ln} does not contain the msgid"})
                 continue
-            plan.setdefault(idx, []).append(d)
+            if not lexed:
+                plan.setdefault(idx, []).append(d)
+                continue
+            # the nearest line whose call's msgid IS the key (a longer msgid holding it is another string)
+            cs = next((c for c in (_find_call(text, regs, line_starts, i, d["key"])
+                                   for i in [ln - 1] + [ln - 1 + o for o in (-1, 1, -2, 2, -3, 3)]
+                                   if 0 <= i < len(lines) and _key_on_line(lines[i], d["key"])) if c is not None), None)
+            if cs is None:
+                res["skipped"].append({"file": d["file"], "key": d["key"], "reason": f"{upath}:{idx + 1} holds the msgid but no gettext call to it in code (only in a string, heredoc or comment): no note written"})
+                continue
+            cl = bisect_line(line_starts, cs)
+            start_kind = _region_at(regs, line_starts[cl])
+            first = text[line_starts[cl]:cs].strip() == ""
+            if (ext == ".php" and start_kind in (None, "html")) or (ext != ".php" and start_kind is None and first):
+                plan.setdefault(cl, []).append(d)
+            else:
+                inline.setdefault(cl, {}).setdefault(cs - line_starts[cl], []).append(d)
+        # JS: a line with more than one planned call, or whose call is not first, takes every note inline (GAP-G5)
+        for cl in [k for k in plan if k in inline]:
+            for d in plan.pop(cl):
+                cs = _find_call(text, regs, line_starts, cl, d["key"]) if lexed else None
+                if cs is not None:
+                    inline[cl].setdefault(cs - line_starts[cl], []).append(d)
         changed = False
-        for idx in sorted(plan, reverse=True):
+        for idx in sorted(set(plan) | set(inline), reverse=True):
+            if idx in inline:
+                line = lines[idx]
+                for col in sorted(inline[idx], reverse=True):
+                    ds_at = inline[idx][col]
+                    text_ = _note_text(ds_at[0]["description"]) if len(ds_at) == 1 else \
+                        _note_text("; ".join('"%s": %s' % (d["key"], d["description"]) for d in ds_at))
+                    comment = _translators_comment(ext, text_)
+                    before = line[:col]
+                    prev = re.search(r"/\*\s*translators:.*?\*/\s*$", before, re.I)
+                    if prev and prev.group(0).strip() == comment:
+                        res["unchanged"] += [{"file": d["file"], "key": d["key"]} for d in ds_at]
+                        continue
+                    if prev:
+                        res["skipped"] += [{"file": d["file"], "key": d["key"], "reason": f"{upath}:{idx + 1} already has a translators: comment (kept, never replaced)"} for d in ds_at]
+                        continue
+                    line = before + comment + " " + line[col:]
+                    changed = True
+                    res["applied"] += [{"file": d["file"], "key": d["key"], "slot": f"translators: {upath}:{idx + 1}"} for d in ds_at]
+                lines[idx] = line
+                continue
             ds_at = plan[idx]
             if len(ds_at) == 1:
-                text_ = ds_at[0]["description"]
+                text_ = _note_text(ds_at[0]["description"])
             else:
-                text_ = "; ".join('"%s": %s' % (d["key"], d["description"]) for d in ds_at)
+                text_ = _note_text("; ".join('"%s": %s' % (d["key"], d["description"]) for d in ds_at))
             line = lines[idx]
             indent = re.match(r"\s*", line).group(0)
-            # S2-R2 F8: a PHP template line (HTML with <?php / <?= tags) gets its note as a PHP comment in its own tag on
-            # the line above, never as text the page would show.
-            if ext == ".php" and PHP_OPEN_RE.search(line):
+            # WF-8: a call inside a JSX expression container gets its note inside the braces (`{ /* translators: ... */
+            # __('Save') }`): a comment line among JSX children is visible text and breaks the parse.
+            brace = _jsx_child_brace(line, ds_at[0]["key"]) if ext in JSX_EXT else None
+            if brace is not None:
+                comment = _translators_comment(ext, text_)
+                if comment in line:
+                    res["unchanged"] += [{"file": d["file"], "key": d["key"]} for d in ds_at]
+                elif "translators:" in line:
+                    res["skipped"] += [{"file": d["file"], "key": d["key"], "reason": f"{upath}:{idx + 1} already has a translators: comment (kept, never replaced)"} for d in ds_at]
+                else:
+                    lines[idx] = line[:brace + 1] + " " + comment + " " + line[brace + 1:].lstrip()
+                    changed = True
+                    res["applied"] += [{"file": d["file"], "key": d["key"], "slot": f"translators: {upath}:{idx + 1}"} for d in ds_at]
+                continue
+            # S2-R2 F8: a PHP template line (one that starts in inline HTML) gets its note as a PHP comment in its own
+            # tag on the line above, never as text the page would show.
+            if ext == ".php" and ((lexed and _region_at(regs, line_starts[idx]) == "html") or (not lexed and PHP_OPEN_RE.search(line))):
                 comment = "<?php " + _translators_comment(".php", text_) + " ?>"
             else:
                 comment = _translators_comment(ext, text_)
@@ -5226,17 +5977,27 @@ def describe_source_comments(root, ds, res, dry_run, usage_map):
             if comment.strip() in block:
                 res["unchanged"] += [{"file": d["file"], "key": d["key"]} for d in ds_at]
                 continue
-            own = next((i for i in range(top, idx) if PTC_NOTE_RE.match(lines[i].strip())), None)
-            if own is not None:
-                lines[own] = indent + comment
-            else:
-                lines.insert(top, indent + comment)
+            # WF-8: an existing note in PTC's format is never replaced: a hand-written `/* translators: */` looks exactly
+            # like PTC's own, so it is kept and the description is skipped. A developer note in another form (`//`) stays
+            # and PTC's note goes above it (S2-R2 F8).
+            if any(PTC_NOTE_RE.match(l.strip()) for l in lines[top:idx]):
+                res["skipped"] += [{"file": d["file"], "key": d["key"], "reason": f"{upath}:{idx + 1} already has a translators: comment (kept, never replaced)"} for d in ds_at]
+                continue
+            lines.insert(top, indent + comment)
             changed = True
             res["applied"] += [{"file": d["file"], "key": d["key"], "slot": f"translators: {upath}:{idx + 1}"} for d in ds_at]
         if changed:
+            new = "\n".join(lines)
+            why = _post_write_check(text, new, ext, full)
+            if why:
+                # never a silent wrong write: the file's notes come back as skipped, with the reason
+                mine = [a for a in res["applied"] if a.get("slot", "").startswith(f"translators: {upath}:")]
+                res["applied"] = [a for a in res["applied"] if a not in mine]
+                res["skipped"] += [{"file": a["file"], "key": a["key"], "reason": f"{upath}: not written: {why}"} for a in mine]
+                continue
             res["files"].append(upath)
             if not dry_run:
-                open(full, "w", encoding="utf-8").write("\n".join(lines))
+                open(full, "w", encoding="utf-8").write(new)
 
 
 def describe_apply(root, desc_path, dry_run, into_template=False):
@@ -5250,7 +6011,11 @@ def describe_apply(root, desc_path, dry_run, into_template=False):
         if not isinstance(d, dict) or not d.get("file") or d.get("key") is None or not d.get("description"):
             res["skipped"].append({"item": d, "reason": "needs file, key and description"})
             continue
-        desc = re.sub(r"[\x00-\x1f\x7f]+", " ", str(d["description"])).strip()[:500]
+        desc = re.sub(r"[\x00-\x1f\x7f]+", " ", str(d["description"])).strip()
+        leak = _note_leak(desc)
+        if leak:
+            res["skipped"].append({"file": d["file"], "key": d["key"], "reason": f"the description names {leak} (a path or source file a translator cannot use); not written: PTC hands out a new note once the string's context is given again"})
+            continue
         by_file.setdefault(d["file"], []).append(dict(d, description=desc))
     cache = {}
 
@@ -5420,9 +6185,10 @@ def count_words(text):
     return len(WC_HAN_RE.findall(text)) + len(WC_KANA_RUN.findall(text)) + len(ws_split(WC_CJK.sub(" ", text)))
 
 
-def estimate(root, paths, langs, rate, balance, remote=None):
+def estimate(root, paths, langs, rate, balance, remote=None, covered=False):
     # remote: {path: source words per language} from PTC's dry-run estimate (S2-R3 item 3) for the files no local
     # reader covers; a path without a quote there stays in `unquoted`.
+    # covered (GAP-JOBS F2, AGD-7): the subscription covers the run, so there is no word balance and no shortfall.
     files, unquoted = [], []
     remote = remote or {}
     for p in paths:
@@ -5447,6 +6213,8 @@ def estimate(root, paths, langs, rate, balance, remote=None):
            "credits_per_language": credits_lang, "credits_total": num(words_total * rate) if rate is not None else None,
            "balance_words": num(balance) if balance is not None else None,
            "shortfall_words": num(max(0, words_total - balance)) if balance is not None else None}
+    if covered:
+        res.update({"balance_words": None, "shortfall_words": 0, "covered_by": "subscription"})
     return res
 
 
@@ -5745,24 +6513,30 @@ GETTEXT_CALL_RE = re.compile(r"\b" + WP_GETTEXT + r"\(")
 STRING_LITERAL_RE = re.compile(r"""'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*\"""")
 
 
-def gettext_string_spans(line):
+def gettext_string_spans(line, depth=0):
     """(start, end) of every quoted string inside the argument list of a __()-family call on the line (an unterminated
-    one runs to the end of the line). Text there is the msgid (or context / domain) itself, never a hardcoded string:
-    a literal HTML fragment in a msgid (`esc_html__( 'The <em>Plugin</em> is on' )`) is translated as a whole (E30)."""
-    spans = []
-    for call in GETTEXT_CALL_RE.finditer(line):
-        depth, i = 1, call.end()
-        while i < len(line) and depth:
-            ch = line[i]
-            if ch in "'\"":
-                lit = STRING_LITERAL_RE.match(line, i)
-                end = lit.end() if lit else len(line)
-                spans.append((i, end))
-                i = end
-                continue
-            depth += (ch == "(") - (ch == ")")
-            i += 1
-    return spans
+    one runs to the end of the line), and the call's open-parenthesis depth at the end of the line. Text there is the
+    msgid (or context / domain) itself, never a hardcoded string: a literal HTML fragment in a msgid
+    (`esc_html__( 'The <em>Plugin</em> is on' )`) is translated as a whole (E30). WF-21: a call spans lines
+    (`_x(\n  'Text',\n  'context',\n  'domain'\n)`): `depth` is the depth the previous line left open."""
+    spans, i, n = [], 0, len(line)
+    while i < n:
+        if not depth:
+            call = GETTEXT_CALL_RE.search(line, i)
+            if not call:
+                break
+            depth, i = 1, call.end()
+            continue
+        ch = line[i]
+        if ch in "'\"":
+            lit = STRING_LITERAL_RE.match(line, i)
+            end = lit.end() if lit else n
+            spans.append((i, end))
+            i = end
+            continue
+        depth += (ch == "(") - (ch == ")")
+        i += 1
+    return spans, depth
 
 
 AUDIT_WEIGHTS = {"hardcoded_string": 1.0, "concatenation": 1.0, "i18n_call_misuse": 1.0, "plural": 1.0, "locale_format": 0.5}
@@ -5790,12 +6564,13 @@ def audit_frameworks(root, files, census):
     return out
 
 
-def audit_line_findings(framework, path, no, line):
+def audit_line_findings(framework, path, no, line, gettext_spans=None):
     res = []
     if COMMENT_LINE_RE.match(line):
         return res
     ext = os.path.splitext(path)[1].lower()
-    gettext_spans = gettext_string_spans(line) if framework == "wordpress" else []
+    if gettext_spans is None:
+        gettext_spans = gettext_string_spans(line)[0] if framework == "wordpress" else []
     for fw, rule, cls, rexts, rx, hint in AUDIT_RULES:
         if fw != framework or ext not in rexts:
             continue
@@ -5844,8 +6619,16 @@ def audit_strings(root, with_runtime):
             continue
         scanned += 1
         for fw in frameworks:
+            depth, open_lines = 0, 0
             for no, line in enumerate(text.splitlines(), 1):
-                findings += audit_line_findings(fw, f, no, line)
+                spans = None
+                if fw == "wordpress":
+                    spans, depth = gettext_string_spans(line, depth)
+                    # A call left open for more than 20 lines is a parse miss (an unbalanced parenthesis), not an argument list.
+                    open_lines = open_lines + 1 if depth else 0
+                    if open_lines > 20:
+                        depth, open_lines = 0, 0
+                findings += audit_line_findings(fw, f, no, line, spans)
     counts = {}
     for x in findings:
         counts[x["class"]] = counts.get(x["class"], 0) + 1
@@ -5884,6 +6667,8 @@ def audit_runtime(root, files, census):
         if m:
             cats.append((f, m.group("domain"), m.group("lang"), m.group("rest"), m.group("ext")))
     pots = {os.path.splitext(os.path.basename(f))[0] for f in files if f.endswith(".pot")}
+    pots |= {os.path.splitext(os.path.basename(sf["path"]))[0] for s in census.get("resource_sets") or [] if s.get("format") == "po"
+             for sf in s.get("source_files") or [] if sf.get("path", "").endswith(".po") and not lang_template(sf["path"])}
     for h in handles:
         jsons = [c for c in cats if c[4] == "json" and c[1] == h["domain"]]
         if jsons and not any(c[3] == h["handle"] or re.fullmatch(r"[0-9a-f]{32}", c[3] or "") for c in jsons):
@@ -5998,6 +6783,42 @@ def render_pushes(resp):
     return out
 
 
+REASONS_MAX = 20  # = Guide::Tasks::DeliveryChannel::REASONS_MAX: a verdict names at most 20 reasons, then "and N more"
+
+
+def capped_reasons(reasons):
+    """GAP-F3: at most REASONS_MAX reasons, then one "and N more" line; a list PTC already capped (REASONS_MAX + its own
+    "and N more" line) is printed whole."""
+    reasons = [str(r) for r in reasons or []]
+    if len(reasons) <= REASONS_MAX or (len(reasons) == REASONS_MAX + 1 and reasons[-1].startswith("and ")):
+        return reasons
+    return reasons[:REASONS_MAX] + ["and %d more reasons (%d in all)" % (len(reasons) - REASONS_MAX, len(reasons))]
+
+
+def wait_timeout(body_path, task_id, timeout):
+    """GAP-F3 (CLI-19): a `guide wait` that timed out prints the verdict PTC stored for the task (needs_more: the
+    agent acts on its reasons), not only "no verdict yet"."""
+    try:
+        resp = json.load(open(body_path)) if body_path else {}
+    except Exception:
+        resp = {}
+    verdict = resp.get("verdict") if isinstance(resp, dict) else None
+    if not verdict:
+        print(f"Still waiting after {timeout}s: PTC has no verdict for {task_id} yet. Run 'guide wait {task_id}' again.")
+        return 0
+    print(f"Still waiting after {timeout}s: PTC has no newer verdict for {task_id}. Run 'guide wait {task_id}' again "
+          "once you have acted on the stored one.")
+    state = f" (task {resp['state']})" if resp.get("state") else ""
+    print(f"PTC's stored verdict on task {task_id}: {verdict}{state}")
+    for r in capped_reasons(resp.get("reasons")):
+        print(f"  - {r}")
+    if resp.get("hint"):
+        print(f"PTC: {resp['hint']}")
+    if resp.get("waiting"):
+        print(f"PTC: {resp['waiting']}")
+    return 0
+
+
 def guide_render(kind, body_path, as_json, version):
     """Print the response; exit code per the protocol."""
     try:
@@ -6022,6 +6843,9 @@ def guide_render(kind, body_path, as_json, version):
             print(f"Verdict: {v}")
             for r in resp.get("reasons") or []:
                 print(f"  - {r}")
+            if kind == "wait" and resp.get("waiting"):
+                # GAP-F5 (CLI-20): no next task because PTC is still working (its grouping, an induction): say on what.
+                print(f"PTC: {resp['waiting']}")
             nxt = resp.get("next")
             if isinstance(nxt, dict) and nxt.get("id"):
                 print("\nNext:\n" + render_task(nxt))
@@ -6060,6 +6884,8 @@ def guide_render(kind, body_path, as_json, version):
                 print(f"  waiting on the human: {q.get('question') if isinstance(q, dict) else q}")
             for p in resp.get("products") or []:
                 print(f"  product {p.get('dir')}: session {p.get('session_id')}  {p.get('state')}  readiness {p.get('readiness')}")
+            if resp.get("waiting"):
+                print(f"PTC: {resp['waiting']}")  # GAP-F5 (CLI-20): the background work the next task waits on
     elif kind == "start":
         if not as_json:
             print(f"Guide session {resp.get('session_id')} (stage {resp.get('stage')}, readiness {resp.get('readiness')})")
@@ -6280,26 +7106,60 @@ def written_files_sha(root, manifest):
 
 NAMED_FILES_MAX = 100
 NAMED_FILE_MAX_BYTES = 1024 * 1024
+CHANGED_CODE_MAX_BYTES = 2 * 1024 * 1024
 
 
-def named_files(root, listing):
-    """SF-22 (L8): {repository-root path: bytes} of the files named in `listing` (one path per line: the --file arguments
-    and the paths guide tasks named, .ptc/session.json named_files) that exist under the repository root; a path that
-    leaves the root, a missing file and a file over NAMED_FILE_MAX_BYTES are left out."""
+def _clean_rel(raw):
+    path = raw.strip().replace(os.sep, "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def named_files(root, listing, prefix=""):
+    """SF-22 (L8): {repository-root path: bytes} of the files named in `listing` (one path per line: the paths guide tasks
+    named, .ptc/session.json named_files, the paths PTC serves, PTC_ACTION_RUN_FILES) that exist under the repository
+    root; a path that leaves the root, a missing file and a file over NAMED_FILE_MAX_BYTES are left out. F7: a product
+    session names its paths relative to the product directory, so a path not found from the repository root is looked
+    up under the run's directory (`prefix`, the run dir relative to the root) and keyed by its repository-root path."""
     top = os.path.realpath(git(root, "rev-parse", "--show-toplevel") or root)
     out = {}
     for raw in listing.splitlines():
-        path = raw.strip().replace(os.sep, "/")
-        while path.startswith("./"):
-            path = path[2:]
+        path = _clean_rel(raw)
         if not path or path in out or len(out) >= NAMED_FILES_MAX:
             continue
-        full = os.path.realpath(os.path.join(top, path))
-        if not full.startswith(top + os.sep) or not os.path.isfile(full) or os.path.getsize(full) > NAMED_FILE_MAX_BYTES:
-            continue
-        with open(full, "rb") as fh:
-            out[path] = fh.read()
+        for form in dict.fromkeys([path, prefix + path] if prefix and not path.startswith(prefix) else [path]):
+            full = os.path.realpath(os.path.join(top, form))
+            if not full.startswith(top + os.sep) or not os.path.isfile(full) or os.path.getsize(full) > NAMED_FILE_MAX_BYTES:
+                continue
+            if form not in out:
+                with open(full, "rb") as fh:
+                    out[form] = fh.read()
+            break
     return out
+
+
+def explicit_files(root, prefix, listing):
+    """F7 (WPML lab run 2, gt_255: both --file paths were silently dropped): each `--file PATH` is relative to the run's
+    directory (-d, default the current one), the directory the guide's task paths are relative to. -> (the repository-
+    root paths, the problems); a path that is missing, leaves the repository or is over NAMED_FILE_MAX_BYTES is a
+    problem, never dropped in silence."""
+    top = os.path.realpath(git(root, "rev-parse", "--show-toplevel") or root)
+    paths, problems = [], []
+    for raw in listing.splitlines():
+        path = _clean_rel(raw)
+        if not path:
+            continue
+        full = os.path.realpath(os.path.join(root, path))
+        if not full.startswith(top + os.sep):
+            problems.append(f"--file {path}: outside the repository")
+        elif not os.path.isfile(full):
+            problems.append(f"--file {path}: no such file under {os.path.abspath(root)} (--file paths are relative to the run directory, -d)")
+        elif os.path.getsize(full) > NAMED_FILE_MAX_BYTES:
+            problems.append(f"--file {path}: {os.path.getsize(full)} bytes, over the {NAMED_FILE_MAX_BYTES}-byte limit for a named file")
+        else:
+            paths.append(os.path.relpath(full, top).replace(os.sep, "/"))
+    return paths, problems
 
 
 def action_body(scan_path, cfg_path, project_id, sha, branch, root, limit, changed_path=None):
@@ -6307,23 +7167,42 @@ def action_body(scan_path, cfg_path, project_id, sha, branch, root, limit, chang
     cfg_doc = json.load(open(cfg_path)) if cfg_path else {}
     cfg = cfg_doc.get("config")
     changed = read_changed(changed_path) if changed_path else None
-    # S2-R21-2: a source file the commit changed is always sent, beyond the cap, so a source fix is provable without
-    # raising PTC_FILES_SAMPLE_LIMIT (changed paths are repository-root paths; scan paths are relative to the run dir).
+    # WF-11 (WF-RCA.md): a source file rides within the sample cap only; one the commit changed is reported by its digest
+    # (files_sha), and PTC reads its stored upload by that sha (Guide::RunEvidence), so a changed template never inflates
+    # the report (sitepress: 2.85 MB). A changed NON-source file (a code file a source fix edits, PTC stores no upload of)
+    # rides with its bytes, each up to NAMED_FILE_MAX_BYTES (changed paths are repository-root paths; scan paths are
+    # relative to the run dir).
+    # GAP-G12 (WPML lab run 6: 5 of sitepress' 41 source files never reached PTC, so its quote was partial): EVERY scanned
+    # source file is sent, in batches of at most `limit` bytes each (PTC_FILES_SAMPLE_LIMIT bounds a request, never the
+    # run), in file order. The report carries the first batch; the others go to PATCH guide/action_runs/:id/files_sample
+    # (PTC_FILES_SAMPLE_BATCHES: one request body per line). A file over the budget goes alone in its
+    # own batch, never in the report (WF-11: the report stays small).
     prefix = git(root, "rev-parse", "--show-prefix").strip()
-    changed_set = set(changed or [])
-    sample, total = {}, 0
+    sources = set()
+    batches, current, total = [], {}, 0
     for s in scan_doc.get("resource_sets", []):
         for sf in s.get("source_files", []):
+            sources.add(prefix + sf["path"])
+            if sf["path"] in current or any(sf["path"] in b for b in batches):
+                continue
             p = os.path.join(root, sf["path"])
             try:
                 data = open(p, encoding="utf-8", errors="replace").read()
             except OSError:
                 continue
             size = len(data.encode("utf-8"))
-            if total + size > limit and (prefix + sf["path"]) not in changed_set:
+            if current and (size > limit or total + size > limit):
+                batches.append(current)
+                current, total = {}, 0
+            if size > limit:
+                batches.append({sf["path"]: data})
                 continue
-            sample[sf["path"]] = data
+            current[sf["path"]] = data
             total += size
+    if current:
+        batches.append(current)
+    first_fits = bool(batches) and sum(len(v.encode("utf-8")) for v in batches[0].values()) <= limit
+    sample = dict(batches.pop(0)) if first_fits else {}
     pid = project_id or ((cfg or {}).get("guide") or {}).get("project_id")
     body = {"project_id": int(pid) if str(pid or "").isdigit() else (pid or None), "commit_sha": sha, "branch": branch,
             "config": cfg, "scan": scan_doc, "files_sample": sample,
@@ -6344,7 +7223,25 @@ def action_body(scan_path, cfg_path, project_id, sha, branch, root, limit, chang
     # SF-22 (L8, POL-116): the files a guide task named (and each --file) ride with their bytes, so PTC proves an edit to
     # a file it stores no upload of (a code file a source fix edits) on the run's own copy (Guide::RunEvidence), with
     # or without git; the fingerprint, the run key without a commit, covers them too.
-    named = named_files(root, os.environ.get("PTC_NAMED_FILES", ""))
+    explicit, problems = explicit_files(root, prefix, os.environ.get("PTC_EXPLICIT_FILES", ""))
+    if problems:
+        for problem in problems:
+            print(f"error: {problem}", file=sys.stderr)
+        print("error: the run is not reported: fix the --file paths and run it again", file=sys.stderr)
+        return 1
+    named = named_files(root, "\n".join([os.environ.get("PTC_NAMED_FILES", "")] + explicit), prefix)
+    # WF-11: the changed non-source files' bytes, NAMED_FILE_MAX_BYTES each and CHANGED_CODE_MAX_BYTES together; one left
+    # out is said on stderr (PTC answers "carries no copy" for it with the upload remedy).
+    changed_code = [p for p in (changed or []) if p not in sources and p not in named and not CONFIG_FILE_RE.search(p)]
+    budget = CHANGED_CODE_MAX_BYTES
+    for path, data in named_files(root, "\n".join(changed_code)).items():
+        if path not in body["files_sha"]:
+            continue
+        if len(data) > budget:
+            print(f"warning: {path} ({len(data)} bytes) is left out of the run report (changed files are sent up to {CHANGED_CODE_MAX_BYTES} bytes in all)", file=sys.stderr)
+            continue
+        budget -= len(data)
+        sample[path] = data.decode("utf-8", errors="replace")
     import hashlib
     for path, data in named.items():
         digest = hashlib.sha256(data).hexdigest()
@@ -6365,6 +7262,12 @@ def action_body(scan_path, cfg_path, project_id, sha, branch, root, limit, chang
         body["provenance_request"] = "agent_local"
     if changed is not None:
         body["changed_files"] = changed
+    batch_file = os.environ.get("PTC_FILES_SAMPLE_BATCHES")
+    if batch_file:
+        with open(batch_file, "w") as fh:
+            for batch in batches:
+                entries = {path: {"content": data, "sha": hashlib.sha256(data.encode("utf-8")).hexdigest()} for path, data in batch.items()}
+                fh.write(json.dumps({"project_id": body["project_id"], "files_sample": entries}, sort_keys=True) + "\n")
     print(json.dumps(body, sort_keys=True))
     return 0
 
@@ -6432,6 +7335,8 @@ def main(argv):
         return 0 if res["valid"] else 2
     if cmd == "render":
         return guide_render(argv[1], argv[2], argv[3] == "json", argv[4])
+    if cmd == "wait-timeout":
+        return wait_timeout(argv[1], argv[2], argv[3])
     if cmd == "pushes":
         # L11 (SF-31): the pushes of a door's answer (action-run, delivery-commit, a suite product walked past).
         try:
@@ -6534,7 +7439,8 @@ def main(argv):
                         remote[path] = round(float(q.get("words_required") or sum(br.values())) / len(br), 2)
                 except Exception:
                     pass
-        res = estimate(root, paths, langs, float(rate) if rate else None, float(balance) if balance else None, remote)
+        covered = balance == "covered"
+        res = estimate(root, paths, langs, float(rate) if rate else None, float(balance) if balance and not covered else None, remote, covered)
         if fmt == "unquoted":
             print("\n".join(res["unquoted"]))
             return 0
@@ -6552,7 +7458,9 @@ def main(argv):
             print(f"{l}: {res['words_per_language']} words, {c} credits")
         cost = f", {res['credits_total']} credits" if res["credits_total"] is not None else ""
         print(f"Total: {res['words_total']} words{cost} ({len(res['languages'])} languages)")
-        if res["balance_words"] is not None:
+        if res.get("covered_by"):
+            print("Balance: covered by the subscription (no word balance applies, nothing is short)")
+        elif res["balance_words"] is not None:
             short = res["shortfall_words"]
             print(f"Balance: {res['balance_words']} words" + (f", short by {short} words" if short else ", covers the estimate"))
         return 0
@@ -6645,12 +7553,32 @@ sys.exit(main(sys.argv[1:]))
 PTC_PY_EOF
 )
 
+# WF-11: PTC's own reason in a refusal body ({"error": ...} / {"message": ...} / {"errors": [...]}), one line, at most
+# 300 characters; empty when the body carries none (not JSON, no reason).
+_guide_error_text() {
+    python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+r = d.get("error") or d.get("message") or d.get("errors")
+if isinstance(r, list):
+    r = "; ".join(str(x) for x in r)
+if isinstance(r, dict):
+    r = json.dumps(r)
+print(" ".join(str(r or "").split())[:300], end="")' "$1" 2>/dev/null || true
+}
+
 _ptc_py() {
     if ! command -v python3 >/dev/null 2>&1; then
         log_error "This command needs python3 (>= 3.6) on PATH."
         return 1
     fi
-    PTC_CLI_VERSION="$VERSION" python3 -c "$PTC_PY_HELPER" "$@"
+    # LR2-F6: the helper is read from stdin: passed as one `-c` argument it reached Linux's 128 KiB limit on a single
+    # argument (MAX_ARG_STRLEN; "Argument list too long"). No helper op reads stdin.
+    PTC_CLI_VERSION="$VERSION" python3 - "$@" <<<"$PTC_PY_HELPER"
 }
 
 _ptc_config_pairs() {  # prints "file<TAB>output" per files: entry
@@ -6787,12 +7715,14 @@ cmd_estimate() {
             --languages) langs="$2"; shift 2 ;;
             --rate) rate="$2"; shift 2 ;;
             --balance) balance="$2"; shift 2 ;;
+            --covered) balance=covered; shift ;;
             --api-url) PTC_API_URL="$2"; shift 2 ;;
             --file) files+=("$2"); shift 2 ;;
             --exclude) excludes+="$2"$'\n'; shift 2 ;;
             --check-cases) cases="$2"; shift 2 ;;
             -h|--help)
-                echo "Usage: $SCRIPT_NAME estimate [--json] [--offline] [-d DIR] [-c CONFIG] [--languages de,fr] [--rate CREDITS_PER_WORD] [--balance WORDS] [--file PATH]... [--exclude PATH]..."
+                echo "Usage: $SCRIPT_NAME estimate [--json] [--offline] [-d DIR] [-c CONFIG] [--languages de,fr] [--rate CREDITS_PER_WORD] [--balance WORDS | --covered] [--file PATH]... [--exclude PATH]..."
+                echo "  --covered  the subscription covers the run (PTC's estimate task says so): no word balance, no shortfall."
                 echo "  --exclude PATH  leave a configured file out (repeatable); with --languages it quotes a narrowed scope."
                 echo "  Quote: words by PTC's rule over the configured source files x languages x rate. PO/POT, YAML and JSON are"
                 echo "  counted locally; every other configured file (PHP, .strings, .properties, XML, ...) is counted by PTC's"
@@ -6828,7 +7758,9 @@ cmd_estimate() {
 import json, sys
 d = json.load(sys.stdin)
 b = d.get("balance_words")
-if b is None and "balance_words" not in d:
+if d.get("covered_by"):
+    b = "covered"
+elif b is None and "balance_words" not in d:
     b = float(d.get("trial_balance") or 0) + float(d.get("prepaid_balance") or 0)
 print(d.get("word_cost") if d.get("word_cost") is not None else "", "" if b is None else b)')
         if [[ -z "$rate" ]]; then rate="${vals%% *}"; fi
@@ -6902,7 +7834,8 @@ cmd_describe() {
     if [[ "$sub" != "apply" ]]; then
         echo "Usage: $SCRIPT_NAME describe apply --file descriptions.json [--dry-run] [--into-template] [--json] [-d DIR]"
         echo "  Writes PTC-authored string descriptions where PTC reads them back: gettext = a 'translators:' source"
-        echo "  comment at the call site (usage path:line; template regeneration extracts it into '#.'); with"
+        echo "  comment at the call site (usage path:line; template regeneration extracts it into '#.'; never inside a"
+        echo "  string: on the line above the call or directly before it); with"
         echo "  --into-template, '#.' lines in the .po/.pot instead. Chrome-i18n JSON: the 'description' sibling."
         echo "  Exit 0 all written/present, 2 some skipped, 1 error."
         [[ "$sub" == "-h" || "$sub" == "--help" ]] && return 0
@@ -7147,17 +8080,36 @@ print(json.dumps(d))' > "$body"
             _ptc_py pushes "$last" >&2 || true  # L11 (SF-31): a push told on a still-waiting answer is printed, not lost
             continue
         fi
-        _ptc_py sess task "$(_guide_session_file)" "$last" "$sid" 2>/dev/null || true
-        # Eran 2026-10-05 background wait: an agent reads this output later, so it names the task it waited on.
-        [[ "$fmt" == "text" ]] && echo "PTC's verdict on task $task_id:"
-        _ptc_py render wait "$last" "$fmt" "$VERSION"; return $?
+        _guide_wait_verdict "$sid" "$task_id" "$last" "$fmt"; return $?
     done
+    # GAP-F3 (CLI-19): the budget is spent; ask PTC once more without waiting (timeout_s 0) for the task's stored verdict,
+    # so a timed-out wait prints what PTC holds (a needs_more verdict and its reasons) and a verdict that just arrived wins.
+    SID="$sid" TID="$task_id" python3 -c 'import json,os
+d={"task_id":os.environ["TID"],"timeout_s":0}
+if os.environ["SID"]: d["session_id"]=os.environ["SID"]
+print(json.dumps(d))' > "$body"
+    if GUIDE_RETRIES=0 GUIDE_MAX_TIME=30 _guide_call POST guide/wait "$body" 2>/dev/null; then
+        last="$GUIDE_RESPONSE"
+        if ! python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if d.get("status")=="waiting" or not d.get("verdict") else 1)' "$last" 2>/dev/null; then
+            _guide_wait_verdict "$sid" "$task_id" "$last" "$fmt"; return $?
+        fi
+        _ptc_py pushes "$last" >&2 || true
+    fi
     if [[ "$fmt" == "json" ]]; then
         if [[ -n "$last" ]]; then cat "$last"; else printf '{"status":"waiting","task_id":"%s","waited_s":%s}\n' "$task_id" "$timeout"; fi
     else
-        echo "Still waiting after ${timeout}s: PTC has no verdict for $task_id yet. Run 'guide wait $task_id' again."
+        _ptc_py wait-timeout "$last" "$task_id" "$timeout"
     fi
     return 3
+}
+
+# A verdict PTC answered on guide wait: cached in the session file, printed like submit's.
+_guide_wait_verdict() {
+    local sid="$1" task_id="$2" last="$3" fmt="$4"
+    _ptc_py sess task "$(_guide_session_file)" "$last" "$sid" 2>/dev/null || true
+    # Eran 2026-10-05 background wait: an agent reads this output later, so it names the task it waited on.
+    [[ "$fmt" == "text" ]] && echo "PTC's verdict on task $task_id:"
+    _ptc_py render wait "$last" "$fmt" "$VERSION"
 }
 
 # guide check (G8): POST /guide/check {session_id, commit_sha}. Exit 0 pass, 1 fail, 2 cannot evaluate. The session
@@ -7289,6 +8241,8 @@ show_guide_help() {
     cat <<HELP
 Usage: $SCRIPT_NAME guide <command> [options]
 
+A project begun in the PTC wizard continues with your agent by its id: \`ptc guide start --project-id ID\` (MCP: guide_next with project_id); PTC serves that project, never a second one.
+
   start  [--project-id ID] [--repo-url URL] [--branch B] open (or resume) the guide session; creates the project without --project-id
          [--organization-id ID]                           the organization to create it in, when your token acts in several
                                                           (PTC then lists them: ask the human which one)
@@ -7296,7 +8250,7 @@ Usage: $SCRIPT_NAME guide <command> [options]
   submit TASK_ID [--file evidence.json]                   submit evidence (stdin when no --file)
   skip   TASK_ID --reason TEXT                            skip a task (a human decision)
   status                                                  stage, readiness, task list
-  upload-sources [TASK_ID] [-c CONFIG]                    API channel (L12): upload the source files PTC does not hold at
+  upload-sources [TASK_ID] [-c CONFIG]                    Both channels (L12, L16): upload the source files PTC does not hold at
                                                           their current sha256 (the upload doors of sync, translate=false:
                                                           nothing is translated, no free delivery is used; a file held at
                                                           the same sha256 is skipped) and print what was uploaded. With
@@ -7373,10 +8327,15 @@ _guide_upload_sources() {
     [[ -z "$cfg" ]] && cfg="$PTC_PROJECT_DIR/.ptc-config.yml"
     [[ -f "$cfg" ]] || { log_error "guide upload-sources needs the project's .ptc-config.yml (not found: $cfg)"; return 1; }
     cfg="$(cd "$(dirname "$cfg")" && pwd)/$(basename "$cfg")"
-    local ledger="$PTC_PROJECT_DIR/$PTC_GUIDE_DIR/uploads.tsv"
+    # F12: an absolute path: the upload below runs from inside the project directory, where a relative -d doubles.
+    local ledger; ledger="$(cd "$PTC_PROJECT_DIR" && pwd)/$PTC_GUIDE_DIR/uploads.tsv"
     mkdir -p "$PTC_PROJECT_DIR/$PTC_GUIDE_DIR"
     [[ -f "$PTC_PROJECT_DIR/$PTC_GUIDE_DIR/.gitignore" ]] || echo '*' > "$PTC_PROJECT_DIR/$PTC_GUIDE_DIR/.gitignore"
     touch "$ledger"
+    # F12 (WPML lab run 2: `wpml-cms-nav/wpml-cms-nav/...`): the upload log and the ledger name a file by its path from the
+    # repository root (the path PTC stores, get_base_directory), never from the project directory.
+    local base prefix
+    base=$(cd "$PTC_PROJECT_DIR" && get_base_directory); prefix=$(project_dir_prefix "$base")
     if [[ -n "$task_id" ]]; then
         [[ -z "${PTC_GUIDE_SESSION_ID:-}" ]] && sid=$(_ptc_py sess task-session "$(_guide_session_file)" "$task_id" 2>/dev/null)
         [[ -z "$sid" ]] && sid=$(_guide_session_id)
@@ -7384,12 +8343,15 @@ _guide_upload_sources() {
         _guide_call GET "guide/next?session_id=${sid}" || return 1
         plan=$(ptc_mktemp)
         # -> "UP<TAB>path" to send, "HELD<TAB>path" held at this sha256, "GONE<TAB>path" not on disk; the ledger takes PTC's word.
-        TID="$task_id" ROOT="$PTC_PROJECT_DIR" python3 - "$GUIDE_RESPONSE" "$ledger" > "$plan" <<'PY' || { log_error "PTC's answer does not list $task_id as the current task: run '$SCRIPT_NAME guide next' (or rerun without a task id)"; return 1; }
+        TID="$task_id" ROOT="$base" PREFIX="$prefix" python3 - "$GUIDE_RESPONSE" "$ledger" > "$plan" <<'PY' || { log_error "PTC's answer does not list $task_id as the current task: run '$SCRIPT_NAME guide next' (or rerun without a task id)"; return 1; }
 import hashlib, json, os, sys
 task = (json.load(open(sys.argv[1])) or {}).get("task") or {}
 if task.get("id") != os.environ["TID"]:
     sys.exit(1)
 files = (task.get("payload") or {}).get("files") or []
+pre = os.environ["PREFIX"]
+for f in files:  # F12: the ledger and the upload log key a file by its repository-root path; PTC may name it product-relative
+    f["path"] = f["path"] if not pre or f["path"].startswith(pre) else pre + f["path"]
 ledger = dict(l.rstrip("\n").split("\t", 1) for l in open(sys.argv[2]) if "\t" in l)
 for f in files:
     ledger.pop(f["path"], None)
@@ -7419,7 +8381,7 @@ PY
     fi
     [[ -z "$task_id" ]] && held=$(wc -l < "$skipped" | tr -d ' ')
     # The ledger learns what this run stored.
-    PTC_ROOT="$PTC_PROJECT_DIR" python3 - "$log" "$ledger" <<'PY' || true
+    PTC_ROOT="$base" python3 - "$log" "$ledger" <<'PY' || { log_error "Could not record the uploaded files' sha256 in $ledger (see above): the next run cannot tell what PTC holds."; rc=1; }
 import hashlib, os, sys
 ledger = dict(l.rstrip("\n").split("\t", 1) for l in open(sys.argv[2]) if "\t" in l)
 for line in open(sys.argv[1]):
@@ -7442,7 +8404,8 @@ PY
     local body; body=$(ptc_mktemp)
     SID="$sid" TID="$task_id" python3 -c 'import json,os,sys;print(json.dumps({"session_id":os.environ["SID"],"task_id":os.environ["TID"],"evidence":json.load(open(sys.argv[1]))}))' "$evidence" > "$body"
     _guide_call POST "guide/submit" "$body" || return 1
-    _ptc_py render submit "$GUIDE_RESPONSE" "$fmt" "$VERSION"
+    _ptc_py render submit "$GUIDE_RESPONSE" "$fmt" "$VERSION" || return $?
+    return $rc
 }
 
 cmd_guide() {
@@ -7573,7 +8536,8 @@ PY
 }
 
 # Posted by ptc-action on every run (PTC_API_TOKEN: the organization agent token): the scan, the parsed config,
-# the commit, and a sample of the source files (<= PTC_FILES_SAMPLE_LIMIT bytes, plus every source file the commit changed: S2-R21-2).
+# the commit, and every source file's content (GAP-G12: the report carries the first batch of <= PTC_FILES_SAMPLE_LIMIT
+# bytes, PATCH guide/action_runs/:id/files_sample the rest, one batch per request: _guide_send_sample_batches).
 # Never fails the caller's translation: the action ignores its exit code.
 # The CI platform's identity token for PTC (audience "ptc"): the run's provenance proof (P1). Printed on stdout,
 # empty when this CI offers none - PTC then records the run as unverified provenance.
@@ -7604,6 +8568,85 @@ except Exception:
     return 0
 }
 
+# L16 (SF-50): the repository-root paths PTC asks the run to hash -> GUIDE_RUN_PATHS (one per line, "" when PTC cannot be
+# asked; never fatal). GAP-G6 (WPML lab run 4): GUIDE_RUN_PATHS_PROBLEM says why PTC gave no list (no project, no token,
+# its HTTP code, no answer), so the job log names it instead of a run that silently hashes nothing PTC verified.
+_guide_run_paths() {
+    local token="$1" resp code
+    GUIDE_RUN_PATHS=""; GUIDE_RUN_PATHS_PROBLEM=""
+    [[ -z "${PTC_GUIDE_PROJECT_ID:-}" ]] && { GUIDE_RUN_PATHS_PROBLEM="no project named"; return 0; }
+    [[ -z "$token" ]] && { GUIDE_RUN_PATHS_PROBLEM="no token"; return 0; }
+    resp=$(ptc_mktemp)
+    code=$(ptc_curl -sS --max-time 20 -o "$resp" -w '%{http_code}' -H "Authorization: Bearer $token" -H "Accept: application/json" \
+        "${PTC_API_URL%/}/guide/run_paths?project_id=${PTC_GUIDE_PROJECT_ID}" 2>/dev/null) || true
+    if [[ "$code" != 2* ]]; then
+        [[ -z "$code" || "$code" == 000 ]] && GUIDE_RUN_PATHS_PROBLEM="no answer" || GUIDE_RUN_PATHS_PROBLEM="HTTP $code"
+        return 0
+    fi
+    GUIDE_RUN_PATHS=$(python3 -c 'import json,sys
+try:
+    paths = json.load(open(sys.argv[1])).get("paths") or []
+except Exception:
+    paths = None
+if paths is None:
+    sys.exit(3)
+print("\n".join(p for p in paths if isinstance(p, str) and p and "\n" not in p), end="")' "$resp" 2>/dev/null) \
+        || GUIDE_RUN_PATHS_PROBLEM="an answer that is not a path list"
+    return 0
+}
+
+# GAP-G6 (WPML lab run 4; CLI-16, POL-116): the project the run reports to and asks for its paths, with where it came from:
+# PTC_GUIDE_PROJECT_ID / PTC_PROJECT_ID, then --project-id, then the config's guide.project_id (the one id a CI checkout
+# carries: PTC writes it into every config it hands out), then .ptc/session.json (an agent's checkout whose config has no
+# guide: block yet). Sets PTC_GUIDE_PROJECT_ID and GUIDE_RUN_PROJECT_FROM.
+_guide_run_project() {
+    local cfg="$1" project_id="$2" v
+    GUIDE_RUN_PROJECT_FROM=""
+    if [[ -n "${PTC_GUIDE_PROJECT_ID:-}" ]]; then
+        GUIDE_RUN_PROJECT_FROM="environment"; return 0
+    fi
+    if [[ -n "$project_id" ]]; then
+        PTC_GUIDE_PROJECT_ID="$project_id"; GUIDE_RUN_PROJECT_FROM="--project-id"; return 0
+    fi
+    v=""; [[ -n "$cfg" ]] && v=$(ptc_config_project_id "$cfg" 2>/dev/null || true)
+    if [[ -n "$v" ]]; then
+        PTC_GUIDE_PROJECT_ID="$v"; GUIDE_RUN_PROJECT_FROM="guide.project_id of $cfg"; return 0
+    fi
+    v=$(_ptc_py field "$(_guide_session_file)" project_id 2>/dev/null || true)
+    if [[ -n "$v" && "$v" != None && "$v" != null ]]; then
+        PTC_GUIDE_PROJECT_ID="$v"; GUIDE_RUN_PROJECT_FROM="$PTC_GUIDE_DIR/session.json"; return 0
+    fi
+    return 0
+}
+
+# GAP-G12 (WPML lab run 6): the source files the report could not carry within PTC_FILES_SAMPLE_LIMIT go to the run, one
+# batch (<= the same budget, or one larger file alone) per PATCH guide/action_runs/RUN/files_sample, in file order; a
+# re-sent batch replaces the same paths. $3: one request body per line. A batch PTC did not take is a warning naming its
+# files (the run stays reported; PTC lists the files that never reached it as not_sent). Never fails the run.
+_guide_send_sample_batches() {
+    local token="$1" run_id="$2" batches="$3" n total req lost=0 files
+    total=$(grep -c . "$batches" 2>/dev/null || true)
+    [[ "$total" =~ ^[1-9][0-9]*$ ]] || return 0
+    if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+        log_warning "PTC named no run id: ${total} batch(es) of source files were not sent (PTC quotes only the files the report carried)."
+        return 0
+    fi
+    req=$(ptc_mktemp)
+    for ((n = 1; n <= total; n++)); do
+        sed -n "${n}p" "$batches" > "$req"
+        _guide_request "guide/action_runs/$run_id/files_sample" -sS -o /dev/null -w '%{http_code}' -X PATCH \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+            --data-binary "@$req" "${PTC_API_URL%/}/guide/action_runs/$run_id/files_sample" || true
+        if [[ "$GUIDE_HTTP_CODE" != 2* ]]; then
+            lost=$((lost + 1))
+            files=$(python3 -c 'import json,sys; print(", ".join(sorted(json.load(open(sys.argv[1]))["files_sample"])), end="")' "$req" 2>/dev/null || true)
+            log_warning "PTC answered HTTP $GUIDE_HTTP_CODE for source-file batch $n of $total ($files): PTC lists these files as not sent."
+        fi
+    done
+    (( lost == 0 )) && log_info "Sent every source file to PTC: the report and ${total} batch(es) of at most ${PTC_FILES_SAMPLE_LIMIT:-204800} bytes."
+    return 0
+}
+
 cmd_guide_action_run_impl() {
     local cfg="$1" project_id="${2:-}" out="${3:-}"
     # P4 T9: an agent reports its working tree with the agent token it already has (PTC_ORG_TOKEN), before CI.
@@ -7617,9 +8660,7 @@ cmd_guide_action_run_impl() {
     GUIDE_RUN_FINGERPRINT=$(python3 -c 'import json,sys;print((json.load(open(sys.argv[1])).get("repo") or {}).get("workspace_fingerprint") or "")' "$scan" 2>/dev/null || true)
     # E2: an agent token needs the project named on the call. S2-R3B C-1: without a config and without --project-id
     # this used to exit silently (errexit on the assignment); now it says what is missing and how to give it.
-    local pid_from_cfg=""
-    [[ -n "$cfg" ]] && pid_from_cfg=$(ptc_config_project_id "$cfg") || true
-    [[ -z "${PTC_GUIDE_PROJECT_ID:-}" ]] && PTC_GUIDE_PROJECT_ID="${project_id:-$pid_from_cfg}" || true
+    _guide_run_project "$cfg" "$project_id"
     if [[ -z "${PTC_GUIDE_PROJECT_ID:-}" ]]; then
         log_warning "No PTC project named: an agent token needs --project-id N, or -c/--config-file with a .ptc-config.yml carrying guide.project_id ('ptc guide start' writes it). A legacy project token needs neither."
     fi
@@ -7645,7 +8686,24 @@ cmd_guide_action_run_impl() {
     fi
     # SF-22 (L8): the files guide tasks named (.ptc/session.json, recorded by guide next/submit) and each --file.
     local named; named="${PTC_ACTION_RUN_FILES:-}$(_ptc_py sess named-files "$(_guide_session_file)" 2>/dev/null || true)"
-    PTC_NAMED_FILES="$named" PTC_AGENT_LOCAL="$agent_local" PTC_CI_ID_TOKEN_VALUE="$id_token" _ptc_py action-body "$scan" "$cfgjson" "$project_id" "$sha" "$branch" "$PTC_PROJECT_DIR" "${PTC_FILES_SAMPLE_LIMIT:-204800}" "$changed" > "$body" || return 1
+    # L16 (SF-50, CLI-16): PTC names the paths it verified and the open source-fix tasks' paths (GET guide/run_paths); the run
+    # hashes exactly those on top of its diff, so a CI checkout (shallow, no session file, an empty commit) still reports them.
+    _guide_run_paths "$token"
+    local served="$GUIDE_RUN_PATHS" n_served n_named
+    [[ -n "$served" ]] && named="${named:+$named$'\n'}$served"
+    # GAP-G6: one line in the job log names the project and what the run hashes on PTC's word, so a run that could not ask
+    # PTC (no project, an error) is visible where the job is read, never only in PTC's later "was not reported" verdict.
+    n_served=$(printf '%s\n' "$served" | grep -c . || true)
+    n_named=$(printf '%s\n' "$named" | grep . | sort -u | grep -c . || true)
+    if [[ -z "${PTC_GUIDE_PROJECT_ID:-}" ]]; then
+        log_warning "guide run paths: no project named, so PTC was not asked which paths to hash; ${n_named} named in all."
+    elif [[ -n "$GUIDE_RUN_PATHS_PROBLEM" ]]; then
+        log_warning "guide run paths: project ${PTC_GUIDE_PROJECT_ID} (${GUIDE_RUN_PROJECT_FROM}), PTC's path list unavailable (${GUIDE_RUN_PATHS_PROBLEM}), 0 path(s) served by PTC, ${n_named} named in all."
+    else
+        log_info "guide run paths: project ${PTC_GUIDE_PROJECT_ID} (${GUIDE_RUN_PROJECT_FROM}), ${n_served} path(s) served by PTC, ${n_named} named in all."
+    fi
+    local batches; batches=$(ptc_mktemp)
+    PTC_FILES_SAMPLE_BATCHES="$batches" PTC_NAMED_FILES="$named" PTC_EXPLICIT_FILES="${PTC_EXPLICIT_FILES:-}" PTC_AGENT_LOCAL="$agent_local" PTC_CI_ID_TOKEN_VALUE="$id_token" _ptc_py action-body "$scan" "$cfgjson" "$project_id" "$sha" "$branch" "$PTC_PROJECT_DIR" "${PTC_FILES_SAMPLE_LIMIT:-204800}" "$changed" > "$body" || return 1
     # SF-22 (L8): the fingerprint the run carries (the named files included) is the key `ptc sync` reports and checks by.
     GUIDE_RUN_FINGERPRINT=$(_ptc_py field "$body" workspace_fingerprint 2>/dev/null || true)
     local resp code
@@ -7664,6 +8722,7 @@ except Exception:
         log_info "Reported this run to PTC (guide action run${prov:+, provenance: $prov})."
         # SF-23 (L8): the run key the guide's tasks ask for ({run_key}); `ptc guide action-run` prints it (sync keeps its stdout).
         GUIDE_RUN_KEY=$(_ptc_py field "$resp" run_key 2>/dev/null || true)
+        _guide_send_sample_batches "$token" "$(_ptc_py field "$resp" run_id 2>/dev/null || true)" "$batches"
         [[ -n "$out" ]] && cp "$resp" "$out"
         _ptc_py pushes "$resp" >&2 || true  # L11 (SF-31): e.g. the subscribe push of a refused push
         return 0
@@ -7674,7 +8733,12 @@ except Exception:
         # S2-R3B C-1: the likeliest cause is named, with the remedy, instead of a bare HTTP code.
         log_error "PTC answered HTTP $code for guide/action_runs: the run is not reported. No project was named: pass --project-id N or a .ptc-config.yml with guide.project_id (-c FILE)."
     else
-        log_warning "PTC answered HTTP $code for guide/action_runs: the run is not reported (the guide may be off for this organization)."
+        local why; why=$(_guide_error_text "$resp")
+        if [[ -n "$why" ]]; then
+            log_warning "PTC answered HTTP $code for guide/action_runs: the run is not reported. PTC says: $why"
+        else
+            log_warning "PTC answered HTTP $code for guide/action_runs: the run is not reported (the guide may be off for this organization)."
+        fi
     fi
     return 1
 }
@@ -7682,10 +8746,12 @@ except Exception:
 cmd_guide_action_run() {
     local cfg="" project_id="" out=""
     PTC_ACTION_RUN_FILES=""
+    # F7: each --file is relative to the run directory (-d); a missing one stops the run (action_body explicit_files).
+    PTC_EXPLICIT_FILES=""
     while [[ $# -gt 0 ]]; do
         case $1 in
             --out) out="$2"; shift 2 ;;
-            --file) PTC_ACTION_RUN_FILES+="$2"$'\n'; shift 2 ;;
+            --file) PTC_EXPLICIT_FILES+="$2"$'\n'; shift 2 ;;
             -c|--config-file) cfg="$2"; shift 2 ;;
             --project-id) project_id="$2"; shift 2 ;;
             --api-url) PTC_API_URL="$2"; shift 2 ;;

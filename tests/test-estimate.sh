@@ -70,6 +70,15 @@ echo "=== offline: --rate and --balance given, nothing remote ==="
 txt=$("$CLI" estimate -d "$R" --rate 4 --balance 16 2>&1)
 grep -q "Total: 20 words, 80 credits" <<<"$txt" && grep -q "short by 4 words" <<<"$txt" && pass "text output names the total and the shortfall" || fail "text: $txt"
 
+echo "=== GAP-JOBS F2 (AGD-7): the subscription covers the run - no word balance, no shortfall ==="
+# The estimate task hands `ptc estimate --covered` to an organisation its subscription covers (WPML lab run 2 printed
+# "balance 30,000 words / shortfall 164,705" on an unlimited subscription).
+"$CLI" estimate --json -d "$R" --rate 4 --covered > "$WORK/c.json" 2>"$WORK/c.err"; rc=$?
+[[ $rc -eq 0 && "$(field "$WORK/c.json" "(d['balance_words'], d['shortfall_words'], d['covered_by'], d['credits_total'])" 2>&1)" == "(None, 0, 'subscription', 80)" ]] \
+    && pass "--covered: no balance, nothing short, covered by the subscription" || fail "rc=$rc covered: $(cat "$WORK/c.json" "$WORK/c.err")"
+txt=$("$CLI" estimate -d "$R" --rate 4 --covered 2>&1)
+grep -q "covered by the subscription" <<<"$txt" && ! grep -qi "short by" <<<"$txt" && pass "text output: covered by the subscription, no shortfall" || fail "text: $txt"
+
 echo "=== S2-R28-2: --exclude and --languages quote the scope a 'fewer files / languages' answer names ==="
 "$CLI" estimate --json -d "$R" --rate 4 --balance 30 --exclude locales/en.po --languages de > "$WORK/x.json" 2>"$WORK/x.err"; rc=$?
 [[ $rc -eq 0 && "$(field "$WORK/x.json" "([f['path'] for f in d['files']], d['words_total'], d['credits_total'])" 2>&1)" == "(['locales/en.json'], 8, 32)" ]] \

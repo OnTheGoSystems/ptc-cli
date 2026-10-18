@@ -28,6 +28,14 @@ grep -qxF -- "$EXIT5_LINE" <<<"$recipe" \
   && echo "[PASS] the recipe's exit-5 line names both rejected and unreachable files" \
   || { echo "[FAIL] the recipe's exit-5 line does not name files PTC could not be reached for"; exit 1; }
 
+# L16 (SF-49; production 2026-10-09, GitLab job 401 with a stale legacy PTC_ORG_TOKEN beside a valid PTC_API_TOKEN): the job
+# reads PTC_API_TOKEN (the variable PTC's own ask names) first; the legacy PTC_ORG_TOKEN only without it, with a deprecation line.
+grep -qF 'PTC_ORG_TOKEN="${PTC_API_TOKEN:-$PTC_ORG_TOKEN}" /tmp/ptc-cli.sh guide check' <<<"$recipe" \
+  && ! grep -qF 'PTC_ORG_TOKEN="${PTC_ORG_TOKEN:-$PTC_API_TOKEN}"' <<<"$recipe" \
+  && grep -qF 'PTC_ORG_TOKEN is deprecated - set the masked CI/CD variable PTC_API_TOKEN' <<<"$recipe" \
+  && echo "[PASS] the recipe reads PTC_API_TOKEN first and prints a deprecation line for the legacy PTC_ORG_TOKEN" \
+  || { echo "[FAIL] the recipe reads the legacy PTC_ORG_TOKEN before PTC_API_TOKEN (or prints no deprecation line)"; exit 1; }
+
 if [[ "${1:-}" == "--write" ]]; then render > "$TEMPLATE"; echo "wrote $TEMPLATE"; exit 0; fi
 
 if [[ ! -f "$TEMPLATE" ]]; then echo "[FAIL] the server template $TEMPLATE is missing"; exit 1; fi
