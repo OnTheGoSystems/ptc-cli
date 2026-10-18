@@ -8,7 +8,7 @@ set -euo pipefail  # Strict mode: exit on errors, undefined variables and pipe e
 # Constants
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly VERSION="1.5.1"
+readonly VERSION="1.5.2"
 readonly PTC_USER_AGENT="ptc-cli/${VERSION}"
 
 # Colors for output
@@ -1607,7 +1607,7 @@ perform_upload_action_with_config() {
             # L12 (SF-33): `guide upload-sources` stores the bytes too - the process door with translate=false (the register
             # door keeps no bytes); nothing is translated and no free delivery is used.
             if call_with_rate_limit_retry make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json" \
-                && { [[ -z "${PTC_UPLOAD_HELD:-}" ]] || PTC_PROCESS_STORE_ONLY=1 call_with_rate_limit_retry start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME"; }; then
+                && { [[ -z "${PTC_UPLOAD_HELD:-}" ]] || PTC_PROCESS_STORE_ONLY=1 call_with_rate_limit_retry start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME" "$output_pattern" "$additional_files_json"; }; then
                 uploaded_files+=("$file")
                 log_success "Upload completed: $relative_file_path"
                 [[ -n "${PTC_UPLOAD_LOG:-}" ]] && printf '%s\t%s\n' "$relative_file_path" "$(wc -c < "$file" | tr -d ' ')" >> "$PTC_UPLOAD_LOG"
@@ -1948,6 +1948,7 @@ process_files_in_steps() {
     local files=("$@")
     local base_dir=$(get_base_directory)
     local uploaded_files=()
+    local uploaded_outputs=() uploaded_additional=()  # GAP-G34: per uploaded file, the outputs its process call carries
     start_monitor_clock || return 1
     local unmapped_files=()  # E27: no output pattern could be resolved; failed loudly, never sent
     local processed_files=()
@@ -1961,6 +1962,7 @@ process_files_in_steps() {
         if [[ "$PTC_DRY_RUN" == "true" ]]; then
             log_info "[DRY RUN] Would upload file: $relative_file_path"
             uploaded_files+=("$file")
+            uploaded_outputs+=("${output_file_path:-}"); uploaded_additional+=("${additional_files_json:-}")
         else
             log_info "Uploading file: $relative_file_path"
             
@@ -1980,6 +1982,7 @@ process_files_in_steps() {
             
             if call_with_rate_limit_retry make_ptc_api_call "$file" "$relative_file_path" "$output_file_path" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
                 uploaded_files+=("$file")
+                uploaded_outputs+=("${output_file_path:-}"); uploaded_additional+=("${additional_files_json:-}")
                 log_success "Upload completed: $relative_file_path"
             else
                 log_error "Upload failed: $relative_file_path"
@@ -1996,7 +1999,9 @@ process_files_in_steps() {
     
     # Step 2: Start processing for all uploaded files
     log_info "=== STEP 2: Starting processing for all uploaded files ==="
-    for file in "${uploaded_files[@]}"; do
+    local upload_index
+    for upload_index in "${!uploaded_files[@]}"; do
+        file="${uploaded_files[$upload_index]}"
         local relative_file_path=$(get_relative_path "$file" "$base_dir")
         
         if [[ "$PTC_DRY_RUN" == "true" ]]; then
@@ -2006,7 +2011,8 @@ process_files_in_steps() {
             log_info "Starting processing: $relative_file_path"
             
             local start_rc=0
-            call_with_rate_limit_retry start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME" || start_rc=$?
+            call_with_rate_limit_retry start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME" \
+                "${uploaded_outputs[$upload_index]}" "${uploaded_additional[$upload_index]}" || start_rc=$?
             if (( start_rc == 0 )); then
                 processed_files+=("$file")
                 log_success "Processing started: $relative_file_path"
@@ -2237,6 +2243,7 @@ process_files_in_steps_with_config() {
     local files=("$@")
     local base_dir=$(get_base_directory)
     local uploaded_files=()
+    local uploaded_outputs=() uploaded_additional=()  # GAP-G34: per uploaded file, the outputs its process call carries
     start_monitor_clock || return 1
     local unmapped_files=()  # E27: no output pattern could be resolved; failed loudly, never sent
     local processed_files=()
@@ -2258,6 +2265,7 @@ process_files_in_steps_with_config() {
         if [[ "$PTC_DRY_RUN" == "true" ]]; then
             log_info "[DRY RUN] Would upload file: $relative_file_path"
             uploaded_files+=("$file")
+            uploaded_outputs+=("${output_pattern:-}"); uploaded_additional+=("${additional_files_json:-}")
         else
             log_info "Uploading file: $relative_file_path"
             
@@ -2285,6 +2293,7 @@ process_files_in_steps_with_config() {
             
             if call_with_rate_limit_retry make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
                 uploaded_files+=("$file")
+                uploaded_outputs+=("${output_pattern:-}"); uploaded_additional+=("${additional_files_json:-}")
                 log_success "Upload completed: $relative_file_path"
             else
                 log_error "Upload failed: $relative_file_path"
@@ -2301,7 +2310,9 @@ process_files_in_steps_with_config() {
     
     # Step 2: Start processing for all uploaded files
     log_info "=== STEP 2: Starting processing for all uploaded files ==="
-    for file in "${uploaded_files[@]}"; do
+    local upload_index
+    for upload_index in "${!uploaded_files[@]}"; do
+        file="${uploaded_files[$upload_index]}"
         local relative_file_path=$(get_relative_path "$file" "$base_dir")
         
         if [[ "$PTC_DRY_RUN" == "true" ]]; then
@@ -2311,7 +2322,8 @@ process_files_in_steps_with_config() {
             log_info "Starting processing: $relative_file_path"
             
             local start_rc=0
-            call_with_rate_limit_retry start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME" || start_rc=$?
+            call_with_rate_limit_retry start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME" \
+                "${uploaded_outputs[$upload_index]}" "${uploaded_additional[$upload_index]}" || start_rc=$?
             if (( start_rc == 0 )); then
                 processed_files+=("$file")
                 log_success "Processing started: $relative_file_path"
@@ -2994,6 +3006,8 @@ start_processing() {
     local absolute_file_path="$1"
     local relative_file_path="$2"
     local file_tag_name="$3"
+    local output_file_path="${4:-}"       # GAP-G34: the config's output pattern (the register call's output_file_path)
+    local additional_files_json="${5:-}"  # GAP-G34: its additional_translation_files, the register call's JSON array
     
     # Check if file exists
     if [[ ! -f "$absolute_file_path" ]]; then
@@ -3006,6 +3020,25 @@ start_processing() {
     
     log_debug "Starting file processing via PTC API: $process_url"
     
+    # GAP-G34 (api-cli API-14): the process call carries the config's outputs, the same ones the register call sends,
+    # so PTC applies a changed output before it processes the file (without them PTC kept the outputs it held and
+    # delivered the old pattern). --form-string: a path is sent as is, never read as curl's @file / ;type= syntax.
+    local output_form=()
+    [[ -n "$output_file_path" ]] && output_form+=(--form-string "output_file_path=$output_file_path")
+    # The array is config_additional_files' [{"type":"T","path":"P"},...] (a path holds {{lang}}, so it is split on its
+    # "type" / "path" members, never on braces); the pairs are taken in order.
+    local companion_types=() companion_paths=() companion i
+    while IFS= read -r companion; do
+        [[ -n "$companion" ]] && companion_types+=("$(json_string_field "{$companion}" "type")")
+    done < <(printf '%s' "$additional_files_json" | grep -Eo '"type"[[:space:]]*:[[:space:]]*"[^"]*"' || true)
+    while IFS= read -r companion; do
+        [[ -n "$companion" ]] && companion_paths+=("$(json_string_field "{$companion}" "path")")
+    done < <(printf '%s' "$additional_files_json" | grep -Eo '"path"[[:space:]]*:[[:space:]]*"[^"]*"' || true)
+    for ((i = 0; i < ${#companion_types[@]} && i < ${#companion_paths[@]}; i++)); do
+        output_form+=(--form-string "additional_translation_files[][type]=${companion_types[$i]}"
+                      --form-string "additional_translation_files[][path]=${companion_paths[$i]}")
+    done
+
     # Make multipart/form-data request using curl
     local response
     if [[ -n "$PTC_API_TOKEN" ]]; then
@@ -3016,6 +3049,7 @@ start_processing() {
             -F "file_tag_name=$file_tag_name" \
             -F "file=@$absolute_file_path" \
             ${PTC_PROCESS_STORE_ONLY:+-F "translate=false"} \
+            ${output_form[@]+"${output_form[@]}"} \
             "$process_url" 2>/dev/null)
     else
         log_error "API token required for file processing"
@@ -7000,9 +7034,29 @@ def output_regex(out_pat):
                       .replace(r"\*\*/", "(?:.*/)?").replace(r"\*", "[^/]*") + "$")
 
 
+def ordered_lang(tag, cfg):
+    """GAP-G32 (WPML lab run 7: "195 of 209 delivered files are PTC deliveries", the 14 others shipped translations of
+    languages never ordered): a file is a delivery only for a configured language. Its {{lang}} tag must be the language's
+    file locale (locale_map), or, for a language without a locale_map entry, the language itself or a regional tag of it
+    (de -> de_DE). A config without languages keeps every language."""
+    langs = (cfg or {}).get("languages") or ((cfg or {}).get("guide") or {}).get("languages") or []
+    if isinstance(langs, str):
+        langs = [x.strip() for x in langs.split(",") if x.strip()]
+    if not langs:
+        return True
+    lmap = (cfg or {}).get("locale_map")
+    lmap = lmap if isinstance(lmap, dict) else {}
+    norm = lambda c: str(c).strip().lower().replace("_", "-")
+    t = norm(tag)
+    for lang in langs:
+        if t == norm(lmap.get(lang, lang)) or (lang not in lmap and t.split("-")[0] == norm(lang)):
+            return True
+    return False
+
+
 def delivered_files_sha(root, cfg):
     """sha256 of the committed HEAD blob of every delivered translation file: a file matching a config entry's output
-    pattern with a language in the {{lang}} slot, not the entry's source. Keys are repository-root paths (as files_sha);
+    pattern with a configured language (ordered_lang) in the {{lang}} slot, not the entry's source. Keys are repository-root paths (as files_sha);
     capped at DELIVERED_FILES_MAX files. PTC compares them with the files it delivered (delivery_proof: no git edit)."""
     import hashlib
     entries = [e for e in (cfg or {}).get("files") or [] if e.get("file") and "{{lang}}" in (e.get("output") or "")]
@@ -7016,7 +7070,7 @@ def delivered_files_sha(root, cfg):
         srcs = {f for f in files if fnmatch_path(f, e["file"])}
         for f in files:
             m = rx.match(f)
-            if m and f not in srcs and is_lang(m.group("lang")) and f not in found:
+            if m and f not in srcs and is_lang(m.group("lang")) and ordered_lang(m.group("lang"), cfg) and f not in found:
                 found.append(f)
     out = {}
     for f in sorted(found)[:DELIVERED_FILES_MAX]:
@@ -7048,7 +7102,7 @@ def delivered_files_sha_at(root, cfg, rev):
         rx = output_regex(e["output"])
         for f in files:
             m = rx.match(f)
-            if m and not fnmatch_path(f, e["file"]) and is_lang(m.group("lang")) and f not in found:
+            if m and not fnmatch_path(f, e["file"]) and is_lang(m.group("lang")) and ordered_lang(m.group("lang"), cfg) and f not in found:
                 found.append(f)
     out = {}
     for f in sorted(found)[:DELIVERED_FILES_MAX]:

@@ -671,10 +671,10 @@ Pipelines download the script from a **pinned release tag**, not a moving branch
 so a push to `main` can never change what your build runs:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.5.1/ptc-cli.sh -o ptc-cli.sh
+curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.5.2/ptc-cli.sh -o ptc-cli.sh
 ```
 
-Use an exact release tag such as `v1.5.1` to pin, or the floating `v1` tag to
+Use an exact release tag such as `v1.5.2` to pin, or the floating `v1` tag to
 pick up backward-compatible updates automatically: `v1` always equals the newest
 published CLI — the release job moves it onto every new `vX.Y.Z` and fails if the
 two differ. `ptc init` scaffolds the
@@ -784,7 +784,7 @@ ptc-translate:
     # the CLI is 100+ KB of it.
     # A CI/CD variable PTC_CLI_URL pins another copy of the CLI (curl accepts
     # file://, e.g. file://$CI_PROJECT_DIR/cli/ptc-cli.sh for the repository's own).
-    - curl -fsSL "${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.5.1/ptc-cli.sh}" -o /tmp/ptc-cli.sh
+    - curl -fsSL "${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.5.2/ptc-cli.sh}" -o /tmp/ptc-cli.sh
     - chmod +x /tmp/ptc-cli.sh
     - rm -f /tmp/ptc-written /tmp/ptc-limit-note
     # Report the run to PTC's agent guide (scan, config digests, identity token); never fails the job.

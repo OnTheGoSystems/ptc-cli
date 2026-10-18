@@ -721,7 +721,13 @@ class Handler(BaseHTTPRequestHandler):
             fp = m.group(1).decode() if m else ""
             # (L12, SF-33) a store-only process (translate=false: stored, nothing translated) is journaled as such.
             t = _re.search(rb'name="translate"\r\n\r\n(.*?)\r\n', body)
-            journal(f"     process {fp} translate={t.group(1).decode() if t else 'default'}")
+            # GAP-G34 (api-cli API-14): the outputs the process call carries - output_file_path and the
+            # additional_translation_files[][type]/[path] pairs - or "-" when it sends none.
+            o = _re.search(rb'name="output_file_path"\r\n\r\n(.*?)\r\n', body)
+            types = [x.decode() for x in _re.findall(rb'name="additional_translation_files\[\]\[type\]"\r\n\r\n(.*?)\r\n', body)]
+            paths = [x.decode() for x in _re.findall(rb'name="additional_translation_files\[\]\[path\]"\r\n\r\n(.*?)\r\n', body)]
+            extra = ",".join(f"{a}:{b}" for a, b in zip(types, paths)) or "-"
+            journal(f"     process {fp} translate={t.group(1).decode() if t else 'default'} output={o.group(1).decode() if o else '-'} additional={extra}")
             if fp in PROCESS_503 or (fp in PROCESS_503_ONCE and fp not in PROCESS_503_SEEN):
                 PROCESS_503_SEEN.add(fp)
                 return self._send(503, "<html><body>ERR_NGROK_3004: the upstream closed the connection</body></html>",

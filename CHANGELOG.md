@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 1.5.2
+
+- GAP-G34 (WPML lab run 7 stop 14: a config that moved `wpml-cms-nav.po` from a `.mo` output to a `.po` output plus a `mo` companion shipped PO text under the old `.mo` names): the process call (`PUT source_files/process`) carries the entry's `output_file_path` and its `additional_translation_files[][type]` / `[path]` pairs, the outputs the register call sends, so PTC processes the file on the configured outputs (api-cli API-14).
+- GAP-G32 (WPML lab run 7: "195 of 209 delivered files are PTC deliveries", the 14 others shipped translations of languages never ordered): the delivered files `ptc guide action-run` and `ptc guide delivery-commit` report to PTC, and so the delivery count, are only those of the configured `languages` (their `locale_map` locale, or the language and its regional tags when unmapped); other languages' files that match an output pattern are not deliveries.
 - GAP-G24 (wpml-core MR !939: `sitepress.pot` regenerated without the add-ons silently lost 235-343 strings): `ptc scan
   --json` adds `usages_unmatched`, `{text domain => {calls: [{msgid, msgctxt, path, line, text}], total, truncated}}`: every
   gettext call whose (msgctxt, msgid) is in no census template of its text domain (`""` = no or a variable domain), so PTC's

@@ -192,6 +192,35 @@ grep -qF "✓ locales/en.json" "$WORK/out" && grep -qF "Step-based processing co
 grep -qF "Translation failed for locales/en.json" "$WORK/out" \
     && fail "pattern mode: reported as failed: $(grep -F 'Translation failed' "$WORK/out")" || pass "pattern mode: no failure line"
 
+echo "=== GAP-G34: the process call carries the config's outputs (a changed output reaches the processed file) ==="
+# WPML lab run 7 stop 14: the config moved locale/orig/wpml-cms-nav.po from a .mo output to a .po output plus a make_mo
+# companion; the register call carried the new outputs, the process call sent only file_path/file_tag_name/file and PTC
+# processed the file on its old .mo pattern. The process call now carries output_file_path and the
+# additional_translation_files pairs, the same outputs the register call sends (api-cli API-14).
+R="$WORK/g34"
+mkdir -p "$R/locale/orig"
+printf 'msgid "Hello"\nmsgstr ""\n' > "$R/locale/orig/wpml-cms-nav.po"
+printf 'msgid "Bye"\nmsgstr ""\n' > "$R/locale/orig/plain.po"
+cat > "$R/.ptc-config.yml" <<'YML'
+source_locale: en
+files:
+  - file: locale/orig/wpml-cms-nav.po
+    output: locale/wpml-cms-nav-{{lang}}.po
+    additional_translation_files:
+      - type: mo
+        path: locale/wpml-cms-nav-{{lang}}.mo
+  - file: locale/orig/plain.po
+    output: locale/plain-{{lang}}.po
+YML
+git -C "$R" init -q
+run_in "$R"
+grep -qF "process locale/orig/wpml-cms-nav.po translate=default output=locale/wpml-cms-nav-{{lang}}.po additional=mo:locale/wpml-cms-nav-{{lang}}.mo" "$JOURNAL" \
+    && pass "the process call carries the config's output and its make_mo companion" \
+    || fail "process call outputs: $(grep 'process locale/orig/wpml-cms-nav.po' "$JOURNAL")"
+grep -qF "process locale/orig/plain.po translate=default output=locale/plain-{{lang}}.po additional=-" "$JOURNAL" \
+    && pass "an entry without companions: the process call carries its output and no additional files" \
+    || fail "process call outputs: $(grep 'process locale/orig/plain.po' "$JOURNAL")"
+
 echo
 echo "Total: $((passed + failed))  Passed: $passed  Failed: $failed"
 [[ $failed -eq 0 ]]

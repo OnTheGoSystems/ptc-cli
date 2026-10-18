@@ -64,5 +64,23 @@ sed -i '/^locale_map:/d' "$T/.ptc-config.yml"
 "${NOCI[@]}" PTC_ORG_TOKEN=org-token "$CLI" sync --api-url "$API" -d "$T" >"$WORK/sync2.out" 2>&1
 [[ -s "$WORK/bodies/uploads.raw" ]] && ! grep -q "locale_map" "$WORK/bodies/uploads.raw" && pass "no locale_map in the config -> none in the upload" || fail "unmapped upload: $(head -c 400 "$WORK/bodies/uploads.raw" 2>/dev/null)"
 
+echo "=== delivery report: only the configured languages' files are deliveries (GAP-G32) ==="
+# WPML lab run 7: "195 of 209 delivered files are PTC deliveries"; the 14 others were shipped translations of languages
+# never ordered that matched an output pattern. A file counts only for a configured language (after locale_map).
+R="$WORK/wp-dc"; mkdir -p "$R/languages"
+printf 'msgid ""\nmsgstr ""\n\nmsgid "Hello"\nmsgstr ""\n' > "$R/languages/sitepress.pot"
+printf 'source_locale: en\nlanguages: [he, de]\nlocale_map: {he: he_IL, de: de_DE}\nfiles:\n  - file: languages/sitepress.pot\n    output: languages/sitepress-{{lang}}.po\n' > "$R/.ptc-config.yml"
+git -C "$R" init -q -b main && git -C "$R" add -A && git -C "$R" -c user.email=t@t -c user.name=t commit -qm init
+git -C "$R" checkout -q -b ptc/translations
+for l in he_IL de_DE ar it_IT pt_BR; do printf 'msgid "Hello"\nmsgstr "%s"\n' "$l" > "$R/languages/sitepress-$l.po"; done
+git -C "$R" add -A && git -C "$R" -c user.email=t@t -c user.name=t commit -qm "chore(i18n): update translations via PTC"
+rsha=$(git -C "$R" rev-parse HEAD)
+"${NOCI[@]}" PTC_API_TOKEN=project-token "$CLI" guide delivery-commit --commit "$rsha" --branch ptc/translations \
+  --api-url "$API" -d "$R" --project-id 7 >"$WORK/dc.out" 2>&1
+got=$(python3 -c "import json,sys; print(','.join(sorted(json.load(open(sys.argv[1]))['body']['delivered_files_sha'])))" "$WORK/bodies/guide_delivery_commits.json" 2>/dev/null)
+[[ "$got" == "languages/sitepress-de_DE.po,languages/sitepress-he_IL.po" ]] \
+  && pass "the report lists the 2 ordered languages' files, not ar / it_IT / pt_BR" || fail "delivered files: '$got'"
+grep -q "2 of 2 delivered files are PTC deliveries" "$WORK/dc.out" && pass "the count says 2 of 2" || fail "count: $(cat "$WORK/dc.out")"
+
 echo "passed=$passed failed=$failed"
 [[ $failed -eq 0 ]]
