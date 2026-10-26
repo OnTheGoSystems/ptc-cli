@@ -1,6 +1,6 @@
 #!/bin/bash
 # PENDING fix row #5399 (reg-1229, reg-1230). NOT run by the suite: CI runs tests/test-*.sh only
-# (.gitlab-ci/component-tests.yml), and this file is deliberately named outside that glob.
+# (the suite's component:cli item), and this file is deliberately named outside that glob.
 #
 # `ptc validate` (the post-delivery placeholder pass) must tell four classes apart:
 #   1. a literal percent sign ("100% satisfied", "%{x}% complete") is text, not a printf

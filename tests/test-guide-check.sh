@@ -72,8 +72,12 @@ jcheck "--json refusal carries error.code + error.message" "$WORK/out.json" "d['
 URL="http://127.0.0.1:1/api/v1/" c --session-id gs_pass --json >"$WORK/out.json" 2>/dev/null; expect_rc "PTC unreachable -> exit 2" 2 $?
 jcheck "unreachable refusal has a code" "$WORK/out.json" "d['error']['code'] == 'ptc_unreachable'"
 
-TOKEN="" c --session-id gs_pass >"$WORK/out" 2>&1; expect_rc "no token -> exit 2" 2 $?
+TOKEN="" PTC_API_TOKEN="" c --session-id gs_pass >"$WORK/out" 2>&1; expect_rc "no token -> exit 2" 2 $?
 grep -q "cannot evaluate (no_token)" "$WORK/out" && pass "no_token refusal is named" || fail "no_token output: $(cat "$WORK/out")"
+# Token name: only PTC_API_TOKEN set reaches PTC's check with that bearer.
+env -u PTC_ORG_TOKEN PTC_API_TOKEN=api-token "$CLI" guide check --commit "$SHA" --api-url "$API" -d "$PROJ" --session-id gs_pass >"$WORK/out" 2>&1
+expect_rc "only PTC_API_TOKEN -> pass, exit 0" 0 $?
+jcheck "check with only PTC_API_TOKEN sends it as the bearer" "$BODIES/guide_check.json" "d['headers']['Authorization'] == 'Bearer api-token'"
 
 (cd "$PROJ" && PTC_ORG_TOKEN=org-token "$CLI" guide check --api-url "$API" -d "$PROJ" --json >"$WORK/out.json" 2>/dev/null); expect_rc "no session and no git repo -> exit 2" 2 $?
 jcheck "no session refusal is named" "$WORK/out.json" "d['error']['code'] == 'no_session'"

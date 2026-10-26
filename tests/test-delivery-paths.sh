@@ -69,6 +69,13 @@ grep -q "upload woocommerce-multilingual/locale/orig/woocommerce-multilingual.po
 has_lang "$P/locale/woocommerce-multilingual-de.po" de && pass "German lands at locale/woocommerce-multilingual-de.po" || fail "de not written: $(find "$P" -type f ! -path '*/.git/*' | sort)"
 has_lang "$P/locale/woocommerce-multilingual-fr.po" fr && pass "French lands at locale/woocommerce-multilingual-fr.po" || fail "fr not written"
 cmp -s "$P/locale/orig/woocommerce-multilingual.pot" "$WORK/pot.orig" && pass "the source .pot is untouched" || fail "the source .pot was overwritten"
+# GAP-G40: the success line names where the files were written, not the source file's directory.
+grep -qF "Translations written: 2 file(s) under woocommerce-multilingual/locale" "$WORK/out" \
+    && pass "the success line names the output directory and the count" \
+    || fail "success line: $(grep -E 'SUCCESS.*(unpacked|written)' "$WORK/out")"
+grep -E 'SUCCESS.*(unpacked|written)' "$WORK/out" | grep -qF "locale/orig" \
+    && fail "the success line names the source directory: $(grep -E 'SUCCESS.*(unpacked|written)' "$WORK/out")" \
+    || pass "the success line does not name the source directory"
 
 echo "=== E23: same-basename entries in different directories stay apart ==="
 R="$WORK/samebase"

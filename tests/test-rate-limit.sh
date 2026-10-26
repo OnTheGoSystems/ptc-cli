@@ -198,6 +198,31 @@ make_ptc_api_call "$work_dir/en.json" "en.json" "{{lang}}.json" "main" "" >/dev/
 assert_eq "a real rejection is still a plain failure" "$?" "1"
 
 echo
+echo "=== reg-1167: a 429 carrying Retry-After is waited out once, for exactly that long ==="
+
+# PTC's 429 names the seconds until its bucket frees a slot (CI-15, API-8). The upload that met it must wait that
+# long once and then go through - not walk the 15 s back-off series it took when PTC sent no header.
+# make_ptc_api_call runs ptc_curl in a command substitution, so the request count lives in a file.
+calls_file="$work_dir/upload-calls"
+: > "$calls_file"
+SLEPT=()
+ptc_curl() {
+    echo x >> "$calls_file"
+    if (( $(wc -l < "$calls_file") == 1 )); then
+        printf 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 4\r\n\r\n' > "$PTC_HEADER_DUMP"
+        printf '%s%s' '{"error":"Rate limit exceeded"}' '429'
+    else
+        printf 'HTTP/1.1 201 Created\r\n\r\n' > "$PTC_HEADER_DUMP"
+        printf '%s%s' '{"id":7,"file_path":"en.json"}' '201'
+    fi
+}
+out=$(call_with_rate_limit_retry make_ptc_api_call "$work_dir/en.json" "en.json" "{{lang}}.json" "main" "" 2>&1; echo "rc=$?"; echo "calls=$(wc -l < "$calls_file" | tr -d ' ')"; echo "slept=${SLEPT[*]}")
+assert_contains "the upload goes through after the wait" "$out" "rc=0"
+assert_contains "on its second request" "$out" "calls=2"
+assert_contains "having waited once, the Retry-After seconds" "$out" "slept=4"
+assert_contains "and the log names the wait PTC asked for" "$out" "Waiting 4s, then retry 1 of"
+
+echo
 echo "=== S2-R12: a transient 5xx / no response is not a PTC rejection ==="
 
 ptc_curl() { printf '%s%s' '<html><body>ERR_NGROK_3004 Bad gateway</body></html>' '503'; }

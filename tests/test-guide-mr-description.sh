@@ -84,6 +84,14 @@ grep -qF "$NOTE" <<<"$got"; verdict $? "no check answer: the limit note is still
 got="$(PTC_LIMIT_NOTE_FILE="$WORK/no-such-note" bash "$CLI" guide mr-description --file "$WORK/check-on.json" 2>/dev/null | gitlab_unescape)"
 ! grep -q 'Translation limit reached' <<<"$got"; verdict $? "no note file (limit not reached): nothing added" "a note appeared without a note file: $got"
 
+# GAP-G52 (WPML lab run 10): a suite product's job pushes `ptc/translations-<product>`; PTC's check names that branch
+# (`comment.branch`), and the description's fetch line uses it. Without it (an older PTC), `ptc/translations`.
+printf '{"verdict":"pass","reasons":[],"comment":{"enabled":true,"branch":"ptc/translations-wpml-string-translation","body":"### PTC agent guide"}}' > "$WORK/check-product.json"
+got="$(bash "$CLI" guide mr-description --file "$WORK/check-product.json" 2>/dev/null | gitlab_unescape)"
+grep -qF 'Fetch the translations branch: `git fetch origin ptc/translations-wpml-string-translation`' <<<"$got"; verdict $? "a suite product: the fetch line names the product's branch" "product branch not in the fetch line: $got"
+got="$(bash "$CLI" guide mr-description --file "$WORK/check-on.json" 2>/dev/null | gitlab_unescape)"
+grep -qF 'Fetch the translations branch: `git fetch origin ptc/translations`' <<<"$got"; verdict $? "no branch from PTC: the fetch line names ptc/translations" "default fetch line wrong: $got"
+
 echo "Total: $((passed + failed))  Passed: $passed  Failed: $failed"
 [ "$failed" -eq 0 ]
 

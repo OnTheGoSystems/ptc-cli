@@ -1,8 +1,11 @@
 #!/bin/bash
 # (1.5.0, L21-3) An upload made while the project's suite is still being set up is stored, not translated: PTC answers
 # the process request with 200 + `code: suite_setup_pending` and a `message`. The run prints that message and one line
-# saying the translation starts by itself once the suite is set up, lists the files held, does NOT poll for them, and
-# exits 0 (the next CI run picks the translation up). A file PTC did start in the same run is monitored as always.
+# saying the translation starts by itself once the suite is set up, lists the files held and does NOT poll for them. A
+# file PTC did start in the same run is monitored as always (exit 0). GAP-G46 (WPML lab run 9, CI job 4217058: every one
+# of 41 files held, nothing delivered, no MR, and the job exited 0 "[SUCCESS] Processing completed successfully"): a run
+# where EVERY file was held delivered nothing, so it exits 13 (setup incomplete), prints PTC's reason on its own line,
+# never the success line, and reports the stop to PTC (guide delivery-commit, stopped_reason setup_incomplete).
 set -uo pipefail
 readonly TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CLI="$(dirname "$TEST_DIR")/ptc-cli.sh"
@@ -64,16 +67,26 @@ polls_for() { grep -c "translation_status .*'file_path': '$2'" "$1"; }
 
 readonly SERVER_MESSAGE="Stored, not translated yet: this project belongs to a suite whose setup is not finished (waiting for wpml-sticky-links to finish setup)."
 
-echo "=== config mode, every file held for the suite: the message, the held files, no polling, exit 0 ==="
+readonly FULL_MESSAGE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["message"])' "$TEST_DIR/fixtures/suite_setup_pending/process.json")"
+readonly SOURCE_SHA="7f14186e61e0$(printf '0%.0s' $(seq 1 28))"
+
+echo "=== config mode, every file held for the suite: the message, the held files, no polling, exit 13 (nothing delivered) ==="
 API=""; JOURNAL="$WORK/all.journal"
-PTC_MOCK_LOG="$JOURNAL" PTC_MOCK_SUITE_PENDING=config/locales/a.en.yml,config/locales/b.en.yml start_mock API 20111 20121 20131
-R="$WORK/all"; mkrepo "$R"
+PTC_MOCK_LOG="$JOURNAL" PTC_MOCK_BODY_DIR="$WORK/bodies" PTC_MOCK_SUITE_PENDING=config/locales/a.en.yml,config/locales/b.en.yml start_mock API 20111 20121 20131
+R="$WORK/all"; mkrepo "$R"; mkdir -p "$WORK/bodies"
 start=$SECONDS
-( cd "$R" && PTC_API_TOKEN=t "$CLI" --config-file .ptc-config.yml --api-url "$API" --monitor-interval 1 --monitor-max-attempts 5 --written-manifest "$WORK/all.manifest" ) >"$WORK/all.out" 2>&1
+( cd "$R" && env -u GITHUB_SHA CI_COMMIT_SHA="$SOURCE_SHA" PTC_API_TOKEN=t "$CLI" --config-file .ptc-config.yml --api-url "$API" --monitor-interval 1 --monitor-max-attempts 5 --written-manifest "$WORK/all.manifest" ) >"$WORK/all.out" 2>&1
 rc=$?; took=$((SECONDS - start))
-expect_rc "every file held for the suite -> exit 0" 0 $rc
+expect_rc "every file held for the suite -> exit 13 (setup incomplete, nothing delivered)" 13 $rc
+grep -qxF "Nothing delivered (setup_incomplete): $FULL_MESSAGE" "$WORK/all.out" \
+    && pass "PTC's reason is printed on its own line" || fail "no line 'Nothing delivered (setup_incomplete): <PTC's message>'"
+hasnt "never the success line when nothing was delivered" "$WORK/all.out" "Processing completed successfully"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["body"]; sys.exit(0 if d.get("stopped_reason")=="setup_incomplete" and not d.get("commit_sha") and d.get("source_commit_sha")==sys.argv[2] else 1)' "$WORK/bodies/guide_delivery_commits.json" "$SOURCE_SHA" 2>/dev/null \
+    && pass "the delivery report carries stopped_reason setup_incomplete, the source commit and no commit" || fail "stopped report body: $(cat "$WORK/bodies/guide_delivery_commits.json" 2>/dev/null || echo none)"
 has "the server's message is printed" "$WORK/all.out" "$SERVER_MESSAGE"
-[[ $(count "$WORK/all.out" "$SERVER_MESSAGE") -eq 1 ]] && pass "the message is printed once, not once per file" || fail "message printed $(count "$WORK/all.out" "$SERVER_MESSAGE") times"
+# GAP-G46: once in the run's log, once more as the final "Nothing delivered" line - never once per file.
+logged=$(grep -F -- "$SERVER_MESSAGE" "$WORK/all.out" | grep -vc '^Nothing delivered (setup_incomplete): ')
+[[ $logged -eq 1 ]] && pass "the message is logged once, not once per file" || fail "message logged $logged times"
 has "the suite line names the code and that translation starts by itself" "$WORK/all.out" "Suite setup pending (suite_setup_pending): PTC translates the held files by itself once every project of the suite is set up; the next CI run delivers them."
 has "the held files are counted" "$WORK/all.out" "Held for the suite (stored, not translated yet): 2"
 has "and listed (a)" "$WORK/all.out" "config/locales/a.en.yml"
@@ -102,7 +115,8 @@ echo "=== pattern mode (no config file): the same answer, exit 0, no polling ===
 R="$WORK/patterns"; mkrepo "$R"; rm -f "$R/.ptc-config.yml"
 : > "$JOURNAL"
 ( cd "$R" && PTC_API_TOKEN=t "$CLI" --source-locale en --patterns 'config/locales/*.en.yml' --api-url "$API" --monitor-interval 1 --monitor-max-attempts 5 ) >"$WORK/patterns.out" 2>&1
-expect_rc "pattern mode, every file held -> exit 0" 0 $?
+expect_rc "pattern mode, every file held -> exit 13" 13 $?
+hasnt "pattern mode: never the success line when nothing was delivered" "$WORK/patterns.out" "Processing completed successfully"
 has "pattern mode prints the server's message" "$WORK/patterns.out" "$SERVER_MESSAGE"
 has "pattern mode prints the suite line" "$WORK/patterns.out" "Suite setup pending (suite_setup_pending)"
 [[ $(grep -c translation_status "$JOURNAL") -eq 0 ]] && pass "pattern mode does not poll" || fail "pattern mode polled"
@@ -110,7 +124,7 @@ has "pattern mode prints the suite line" "$WORK/patterns.out" "Suite setup pendi
 echo "=== help and README name the code ==="
 "$CLI" --help >"$WORK/help.out" 2>&1
 has "--help mentions suite_setup_pending" "$WORK/help.out" "suite_setup_pending"
-has "README mentions suite_setup_pending" "$(dirname "$TEST_DIR")/README.md" "suite_setup_pending"
+has "the CLI reference (docs/cli.md) mentions suite_setup_pending" "$(dirname "$TEST_DIR")/docs/cli.md" "suite_setup_pending"
 
 echo
 echo "Passed: $passed  Failed: $failed"

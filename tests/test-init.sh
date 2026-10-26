@@ -378,7 +378,9 @@ test_ci_snippets_use_action() {
 
     local gh gl block
     gh=$(render_ci_github)
-    gl=$(render_ci_gitlab)
+    # The recipe a default `ptc init` prints: production's API URL, so its door is production's (an earlier test in this
+    # file points PTC_API_URL at example.invalid; the recipe derives its CLI door from it).
+    gl=$(PTC_API_URL="https://app.ptc.wpml.org/api/v1/" render_ci_gitlab)
     block=$(print_ci_block "$(mktemp -d)")
 
     assert_contains "github uses the action" "$gh" "uses: OnTheGoSystems/ptc-action@v1"
@@ -393,7 +395,9 @@ test_ci_snippets_use_action() {
     # component had - runner image, loop-safe rules, stable branch - and drops
     # the one thing that could not work.
     assert_not_contains "gitlab does not use an unreachable component" "$gl" "component:"
-    assert_contains "gitlab pins the CLI to this version's tag" "$gl" "ptc-cli/v${VERSION}/ptc-cli.sh"
+    # UI-2 (AGD-16): fetched through PTC's counted door, the version pinned in its path.
+    assert_contains "gitlab pins the CLI to this version on the door" "$gl" "/cli/v${VERSION}/ptc-cli.sh"
+    assert_not_contains "gitlab does not fetch the CLI from GitHub directly" "$gl" "raw.githubusercontent"
     assert_not_contains "gitlab does not float the CLI on main" "$gl" "ptc-cli/main/ptc-cli.sh"
     assert_contains "gitlab brings its own runner image" "$gl" "image: alpine:"
     assert_contains "gitlab installs bash for the CLI" "$gl" "apk add --no-cache bash"
@@ -451,7 +455,8 @@ test_ci_snippets_use_action() {
     # - at one point the CLI printed one shape, a fresh install printed another,
     # and both READMEs printed a third that nothing produced. Compare them.
     local readme="$TEST_DIR/../README.md"
-    if [ -f "$readme" ]; then
+    # The public README (1.5.5) no longer carries the recipe; docs/ci.md describes it in prose. Compare only a copy.
+    if [ -f "$readme" ] && grep -q "^ptc-translate:" "$readme"; then
         local in_readme
         in_readme=$(awk '/^```yaml$/ { block = ""; inblock = 1; next }
                          inblock && /^```$/ { if (block ~ /ptc-translate:/) { printf "%s", block; exit } inblock = 0; next }

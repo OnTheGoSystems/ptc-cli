@@ -84,6 +84,21 @@ grep -q "provenance: ci_verified" "$WORK/ci.out" && pass "CI: the signed token -
 [[ "$(body "'provenance_request' in d")" == "False" ]] && grep -q "No CI identity token" "$WORK/ci2.out" \
     && pass "CI without an identity token: no agent_local request, the identity warning as before" || fail "CI without token: $(body "d.get('provenance_request')") / $(cat "$WORK/ci2.out")"
 
+echo "=== WB-4: a --file the HEAD commit changed, edited again on disk, rides with the bytes on disk ==="
+# WPML lab run 22, gt_2047: the HEAD commit added comments to the file; the source fix applied after it, uncommitted, was
+# "not found" because files_sha kept the committed blob and the copy was dropped.
+mkdir -p "$T/src"
+printf "<?php\necho __( 'Show content in:' ) . ' ' . \$lang;\n" > "$T/src/menu.php"
+git -C "$T" add -A && git -C "$T" -c user.email=t@example.com -c user.name=t commit -qm "comments"
+printf "<?php\necho sprintf( __( 'Show content in: %%s' ), \$lang );\n" > "$T/src/menu.php"
+"${NOCI[@]}" PTC_ORG_TOKEN=org-token "$CLI" guide action-run --api-url "$API" -d "$T" --file src/menu.php >"$WORK/wb4.out" 2>&1
+want=$(sha256sum "$T/src/menu.php" | cut -d' ' -f1)
+[[ "$(body "d['files_sha'].get('src/menu.php')")" == "$want" ]] && pass "files_sha[src/menu.php] = the edited bytes on disk" \
+    || fail "files_sha[src/menu.php]: '$(body "d['files_sha'].get('src/menu.php')")' want $want ($(cat "$WORK/wb4.out"))"
+[[ "$(body "'sprintf' in (d['files_sample'].get('src/menu.php') or '')")" == "True" ]] && pass "the edited copy rides in files_sample" \
+    || fail "files_sample[src/menu.php]: '$(body "d['files_sample'].get('src/menu.php')")'"
+git -C "$T" checkout -q -- src/menu.php
+
 echo ""
 echo "passed=$passed failed=$failed"
 [[ $failed -eq 0 ]]

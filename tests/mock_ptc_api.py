@@ -96,6 +96,28 @@ RETRY_AFTER = os.environ.get("PTC_MOCK_RETRY_AFTER", "1")
 # WF-11 knob: guide/action_runs answers 422 with this `error` text (production: {"error":"payload too large"}).
 ACTION_RUN_422 = os.environ.get("PTC_MOCK_ACTION_RUN_422", "")
 LOGFILE = os.environ.get("PTC_MOCK_LOG", "")
+# R3 (org #6940; docs/api/api/source_files.md, delivered digest): PTC_MOCK_DELIVERED=1 answers the delivered block on
+# translation_status (every language unchanged since its sha; received_in_run when this run key downloaded the file)
+# and records a receipt per (run_key, file) on each served download, with the X-PTC-Delivered-Shas header.
+# PTC_MOCK_DOWNLOAD_FAIL_ONCE (file_path list): the FIRST download of these files answers 500 (a run that died there).
+DELIVERED = os.environ.get("PTC_MOCK_DELIVERED", "") == "1"
+DELIVERED_RECEIPTS = set()
+DOWNLOAD_FAIL_ONCE = {x for x in os.environ.get("PTC_MOCK_DOWNLOAD_FAIL_ONCE", "").split(",") if x}
+DOWNLOAD_FAIL_SEEN = set()
+
+
+def delivered_shas(file_path):
+    """The sorted "<iso>=<sha>" list the server names: the sha256 of each language's file in make_zip's archive."""
+    import hashlib
+    return ",".join(f"{l}={hashlib.sha256(f'{file_path}:{l}'.encode()).hexdigest()}" for l in sorted(LOCALES))
+
+
+def delivered_block(file_path, run_key):
+    received = bool(run_key) and (run_key, file_path) in DELIVERED_RECEIPTS
+    return {"run_key": run_key or None, "unchanged": True, "received_in_run": received, "shas": delivered_shas(file_path),
+            "languages": [{"language": l, "unchanged": True, "received_in_run": received} for l in sorted(LOCALES)]}
+
+
 
 # One process, one port per scenario, so a workflow picks a failure mode purely
 # by the api-url it passes — no restart, no shared mutable state.
@@ -122,6 +144,25 @@ REFUSE_PROCESS = os.environ.get("PTC_MOCK_REFUSE_PROCESS", "") == "1"
 # suite is still being set up: the upload is stored, not translated), body from the recorded fixture.
 SUITE_PENDING = {x for x in os.environ.get("PTC_MOCK_SUITE_PENDING", "").split(",") if x}
 SUITE_PENDING_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "suite_setup_pending", "process.json")
+# (GAP-G57) 40 findings of a readiness audit, over 8,000 characters together.
+LONG_REASONS = [f"finding {i + 1}: " + "the template line needs a translator note naming the placeholder " * 4 for i in range(40)]
+# (PREP-A) PTC's preparedness profile: ten dimensions in PTC's order, a state each, no number anywhere.
+PREPAREDNESS = [
+    {"dimension": "scope", "state": "needs_work", "gates": True,
+     "line": "wpml-sticky-links.po: 12 of 39 entries have no call in the code.", "task": "scope_cleanup"},
+    {"dimension": "completeness", "state": "ready", "gates": True, "line": "Every source file is configured.", "task": None},
+    {"dimension": "context", "state": "needs_work", "gates": False,
+     "line": "40 of 120 strings have no description for translators.", "task": "string_descriptions"},
+    {"dimension": "placeholders", "state": "not_checked", "gates": True, "line": "Placeholders are checked after the census.", "task": None},
+    {"dimension": "sentences", "state": "ready", "gates": False, "line": "No concatenated sentences found.", "task": None},
+    {"dimension": "terminology", "state": "not_checked", "gates": False, "line": "The glossary is built after the first translation.", "task": None},
+    {"dimension": "conventions", "state": "ready", "gates": False, "line": "Register and formats are set for every language.", "task": None},
+    {"dimension": "existing_translations", "state": "not_applicable", "gates": False, "line": "The repository has no translations yet.", "task": None},
+    {"dimension": "delivery", "state": "needs_work", "gates": True, "line": "No delivery channel is set up.", "task": "commit_config"},
+    {"dimension": "durability", "state": "not_checked", "gates": False, "line": "Checked once the CI workflow runs.", "task": None},
+]
+# (PREP-A) next carries `preparedness` only when it changed since last shown: the first next of gs_prep, never again.
+PREP_SHOWN = set()
 PUSH_ROUTES = {"guide/next", "guide/wait", "guide/submit", "guide/skip", "guide/action_runs", "guide/delivery_commits"}
 
 
@@ -147,6 +188,15 @@ def provenance(body):
     if claims.get("sha") != body.get("commit_sha"):
         return "unverified", "identity token sha does not match commit_sha"
     return "ci_verified", claims.get("repository") or claims.get("project_path")
+SCOPE_TASK = {"id": "gt_7", "type": "scope_cleanup", "stage": 2, "title": "Clean up the translation scope",
+              "why": "Templates no code uses would be translated.", "instructions": "Apply or decline each item.",
+              "allowed_scope": [], "evidence_schema": {"type": "object"}, "cli_commands": [], "ask_human": None,
+              "payload": {"items": [{"id": "sc1", "dimension": "scope", "class": "drop_file", "path": "locale/orig/null.pot",
+                                     "line": None, "before": "an orphan gettext template of text domain null (3 entries)",
+                                     "after": None, "command": "git rm locale/orig/null.pot",
+                                     "reason": "none of its 3 entries has a call anywhere in the code, and nothing loads text domain null.",
+                                     "applies_via": "agent"}]}}
+
 TASK = {"id": "gt_1", "type": "repo_census", "stage": 0, "title": "Census the repository",
         "why": "PTC needs to know where the strings live.",
         "instructions": "Run the scan and submit its output.",
@@ -330,11 +380,11 @@ class Handler(BaseHTTPRequestHandler):
         cli = self._cli()
         if route == "guide/sessions" and method == "GET":
             if q.get("repo_url", [""])[0] == "https://example.test/known.git":
-                self._json(200, {"session_id": "gs_found", "project_id": 77, "stage": 1, "readiness": 0.25, "cli": cli})
+                self._json(200, {"session_id": "gs_found", "project_id": 77, "stage": 1, "setup_progress": 0.25, "readiness": 0.25, "cli": cli})
             else:
                 self._json(404, {"error": "no open guide session for that repo_url", "cli": cli})
         elif route == "guide/sessions" and method == "POST":
-            self._json(201, {"session_id": "gs_mock", "stage": 0, "readiness": 0.0, "cli": cli})
+            self._json(201, {"session_id": "gs_mock", "stage": 0, "setup_progress": 0.0, "readiness": 0.0, "cli": cli})
         elif route == "guide/next":
             sid = q.get("session_id", [""])[0]
             if sid == "gs_done":
@@ -360,8 +410,8 @@ class Handler(BaseHTTPRequestHandler):
                                  "repository root, then run `ptc guide next` again."})
             elif sid == "gs_suite":
                 self._json(200, {"task": None, "done": False, "suite": True, "cli": cli, "products": [
-                    {"dir": "pa", "session_id": "gs_pa", "project_id": 81, "state": "done", "readiness": 1.0},
-                    {"dir": "pb", "session_id": "gs_pb", "project_id": 82, "state": "open", "readiness": 0.5}]})
+                    {"dir": "pa", "session_id": "gs_pa", "project_id": 81, "state": "done", "setup_progress": 1.0, "readiness": 1.0},
+                    {"dir": "pb", "session_id": "gs_pb", "project_id": 82, "state": "open", "setup_progress": 0.5, "readiness": 0.5}]})
             elif sid == "gs_named":
                 # (L8, SF-22/SF-24) a source_fixes task naming code files, and an ask_human whose options are objects.
                 self._json(200, {"task": dict(TASK, id="gt_54", type="source_fixes", payload={
@@ -380,14 +430,34 @@ class Handler(BaseHTTPRequestHandler):
             elif sid == "gs_draft":
                 # (L14, SF-41) PTC's generated description draft in ask_human.default, and an also-ask with a default list.
                 self._json(200, {"task": DRAFT_TASK, "cli": cli})
+            elif sid == "gs_scope":
+                # (PREP-B) a scope_cleanup task whose payload carries source-change proposals in the one shape.
+                self._json(200, {"task": SCOPE_TASK, "cli": cli})
+            elif sid == "gs_prep":
+                first = sid not in PREP_SHOWN
+                PREP_SHOWN.add(sid)
+                self._json(200, {"task": TASK, "cli": cli, **({"preparedness": PREPAREDNESS} if first else {})})
             elif sid == "gs_pb":
                 self._json(200, {"task": dict(TASK, id="gt_9", type="commit_config"), "cli": cli})
             else:
                 self._json(200, {"task": TASK, "cli": cli})
         elif route == "guide/status":
-            self._json(200, {"stage": 0, "readiness": 0.25, "cli": cli,
+            # (GAP-G57) task_id: that task's stored verdict, every reason; gt_long an accepted task with LONG_REASONS,
+            # gt_pending a task never answered (no verdict); any other id is not part of the session (404).
+            tid = (q.get("task_id") or [""])[0]
+            task = {}
+            if tid == "gt_long":
+                task = {"task": {"id": tid, "type": "readiness_audit", "state": "accepted", "verdict": "accepted", "reasons": LONG_REASONS}}
+            elif tid == "gt_pending":
+                task = {"task": {"id": tid, "type": "readiness_audit", "state": "pending", "verdict": None, "reasons": []}}
+            elif tid:
+                return self._json(404, {"error": f"task {tid} is not part of this session"}) or True
+            if (q.get("session_id") or [""])[0] == "gs_legacy":
+                # (PREP-A) a PTC from before the preparedness profile: `readiness` only, no `setup_progress`, no profile.
+                return self._json(200, {"stage": 1, "readiness": 0.5, "cli": cli, "tasks": [], "pending_ask_human": []}) or True
+            self._json(200, {"stage": 0, "setup_progress": 0.6, "readiness": 0.6, "preparedness": PREPAREDNESS, "cli": cli,
                              "tasks": [{"id": "gt_1", "type": "repo_census", "state": "done", "verdict": "accepted"}],
-                             "pending_ask_human": [],
+                             "pending_ask_human": [], **task,
                              **({"waiting": GROUPING_WAITING} if (q.get("session_id") or [""])[0] == "gs_grouping" else {})})
         elif route in ("guide/submit", "guide/skip") and method == "POST":
             try:
@@ -417,6 +487,9 @@ class Handler(BaseHTTPRequestHandler):
             if d.get("task_id") == "gt_accepted":
                 # (P4E-4) a closed task: skip is answered like submit, rejected.
                 verdict, reasons = "rejected", ["gt_accepted is already accepted"]
+            if d.get("task_id") == "gt_long" and verdict == "accepted":
+                # (GAP-G57) an accepted verdict whose reasons outrun an agent's display (40 findings, > 8,000 characters).
+                reasons = LONG_REASONS
             self._json(200, {"verdict": verdict, "reasons": reasons, "next": TASK, "cli": cli})
         elif route == "guide/run_paths" and method == "GET":
             # (L16, SF-50) the pre-run door: the paths PTC verified / the open source-fix tasks name (PTC_MOCK_RUN_PATHS,
@@ -593,6 +666,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"translation_status": {
                     "status": "in_progress", "completeness": 40}})
 
+            if DELIVERED:
+                return self._json(200, {"translation_status": {
+                    "status": "completed", "completeness": 100,
+                    "delivered": delivered_block(fp, q.get("run_key", [""])[0])}})
             return self._json(200, {"translation_status": {
                 "status": "completed", "completeness": 100}})
 
@@ -611,8 +688,17 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps({"status": "processing", "retry_after": 1,
                                    "message": "The translations archive is being built. Please retry after the specified delay."})
                 return self._send(202, body, "application/json", {"Retry-After": "1"})
+            if fp in DOWNLOAD_FAIL_ONCE and fp not in DOWNLOAD_FAIL_SEEN:
+                DOWNLOAD_FAIL_SEEN.add(fp)
+                journal(f"     -> 500 download failed for {fp}")
+                return self._json(500, {"success": False, "message": "Internal Server Error", "code": 500})
             blob = make_zip(fp)
             journal(f"     -> zip {len(blob)} bytes for {fp} ({','.join(LOCALES)})")
+            if DELIVERED:
+                run_key = q.get("run_key", [""])[0]
+                if run_key:
+                    DELIVERED_RECEIPTS.add((run_key, fp))
+                return self._send(200, blob, "application/zip", {"X-PTC-Delivered-Shas": delivered_shas(fp)})
             return self._send(200, blob, "application/zip")
 
         return self._json(404, {"success": False, "message": f"no route {route}", "errors": [404]})

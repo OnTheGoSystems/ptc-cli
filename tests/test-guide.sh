@@ -55,12 +55,19 @@ echo "=== version headers on every call ==="
 hdrs=$(bash -c 'source "$1"; curl() { printf "%s\n" "$@"; }; ptc_curl http://x; PTC_HEADER_DUMP=/dev/null ptc_curl http://x' _ "$CLI")
 [[ $(grep -c "^X-PTC-CLI-Version: $CLI_VERSION\$" <<<"$hdrs") == 2 ]] && pass "ptc_curl sends X-PTC-CLI-Version (both branches)" || fail "ptc_curl X-PTC-CLI-Version: $hdrs"
 [[ $(grep -c "^User-Agent: ptc-cli/$CLI_VERSION\$" <<<"$hdrs") == 2 ]] && pass "ptc_curl sends User-Agent (both branches)" || fail "ptc_curl User-Agent"
-bare=$(grep -nE '(^|[^_[:alnum:]])curl +-' "$CLI" | grep -vE '^\s*[0-9]+:\s*#|log_info|curl -H "User-Agent: \$PTC_USER_AGENT"|curl -fsSL "?(\\?\$\{PTC_CLI_URL:-)?https://raw' || true)
+# The CLI script download (a plain GET of the script before any CLI exists: the raw tag or PTC's counted /cli door, the
+# version in the path) is not an API call; every other curl must go through ptc_curl.
+bare=$(grep -nE '(^|[^_[:alnum:]])curl +-' "$CLI" | grep -vE '^\s*[0-9]+:\s*#|log_info|curl -H "User-Agent: \$PTC_USER_AGENT"|curl -fsSL "?(\\?\$\{PTC_CLI_URL:-)?(https://raw|[^ ]*/cli/(v[^/ ]+/)?ptc-cli\.sh)' || true)
 [[ -z "$bare" ]] && pass "no API call bypasses ptc_curl" || fail "bare curl calls: $bare"
 
 echo "=== guide ==="
-TOKEN="" g next >/dev/null 2>&1; expect_rc "no PTC_ORG_TOKEN -> exit 1" 1 $?
+TOKEN="" PTC_API_TOKEN="" g next >/dev/null 2>&1; expect_rc "no PTC_API_TOKEN nor PTC_ORG_TOKEN -> exit 1" 1 $?
 g next >/dev/null 2>&1; expect_rc "no session -> exit 1" 1 $?
+# Token name: only PTC_API_TOKEN set (the name customers are told to use) reaches the request with that bearer.
+env -u PTC_ORG_TOKEN PTC_API_TOKEN=api-token "$CLI" guide start --project-id 7 --repo-url https://example.test/r.git --branch main --api-url "$API" -d "$PROJ" >"$WORK/out" 2>&1
+expect_rc "start with only PTC_API_TOKEN -> exit 0" 0 $?
+jcheck "guide call with only PTC_API_TOKEN sends it as the bearer" "$BODIES/guide_sessions.json" "d['headers']['Authorization'] == 'Bearer api-token'"
+rm -rf "$PROJ/.ptc"
 g start --project-id 7 --repo-url https://example.test/r.git --branch main >"$WORK/out" 2>&1; expect_rc "start -> exit 0" 0 $?
 jcheck "start caches the session id in .ptc/session.json" "$PROJ/.ptc/session.json" "d['session_id'] == 'gs_mock'"
 [[ "$(cat "$PROJ/.ptc/.gitignore" 2>/dev/null)" == "*" ]] && pass "start git-ignores .ptc/ itself" || fail "start did not write .ptc/.gitignore"
@@ -104,7 +111,38 @@ g skip gt_1 --reason "the human said so" >/dev/null 2>&1; expect_rc "skip -> exi
 jcheck "skip body carries the reason" "$BODIES/guide_skip.json" "d['body'] == {'session_id': 'gs_mock', 'task_id': 'gt_1', 'reason': 'the human said so'}"
 out=$(g status 2>/dev/null); rc=$?
 expect_rc "status -> exit 0" 0 $rc
-case "$out" in *"readiness 0.25"*"gt_1"*) pass "status text lists readiness and tasks" ;; *) fail "status text: $out" ;; esac
+case "$out" in *"Stage 0  setup 60%"*"gt_1"*) pass "status text lists the setup progress and tasks" ;; *) fail "status text: $out" ;; esac
+
+echo "=== PREP-A: setup progress and the preparedness profile, never a readiness number ==="
+grep -qi "readiness" <<<"$out" && fail "status still prints readiness: $out" || pass "status prints no readiness"
+grep -qx "Preparedness" <<<"$out" && pass "status prints the Preparedness header" || fail "no Preparedness header: $out"
+[[ $(grep -cE '^  (scope|completeness|context|placeholders|sentences|terminology|conventions|existing_translations|delivery|durability) ' <<<"$out") -eq 10 ]] \
+    && pass "status prints one line per dimension (10)" || fail "dimension lines: $out"
+grep -qxF "  scope                 needs work     wpml-sticky-links.po: 12 of 39 entries have no call in the code. → scope_cleanup" <<<"$out" \
+    && pass "status: a needs work scope line with its task" || fail "scope line: $(grep '^  scope' <<<"$out")"
+grep -qxF "  placeholders          not checked    Placeholders are checked after the census." <<<"$out" \
+    && pass "status: a not checked placeholders line, no task arrow" || fail "placeholders line: $(grep '^  placeholders' <<<"$out")"
+grep -qxF "  existing_translations not applicable The repository has no translations yet." <<<"$out" \
+    && pass "status: not applicable, the longest dimension, stays aligned" || fail "existing_translations line: $(grep '^  existing' <<<"$out")"
+sed -n '/^Preparedness$/,$p' <<<"$out" | grep -q '[0-9]%' && fail "the profile carries a percentage" || pass "the profile carries no percentage"
+out=$(g status --session-id gs_legacy 2>/dev/null)
+case "$out" in "Stage 1  setup 50%"*) pass "status falls back to readiness when setup_progress is absent" ;; *) fail "legacy status: $out" ;; esac
+grep -q "Preparedness" <<<"$out" && fail "legacy status printed a profile: $out" || pass "no Preparedness block when PTC sends none"
+out=$(g start --project-id 42 --repo-url https://example.test/r.git --branch main 2>&1)
+grep -q "stage 0, setup 0%)" <<<"$out" && pass "start prints the setup progress" || fail "start text: $out"
+out=$(g next --session-id gs_prep 2>/dev/null)
+case "$out" in *"Task gt_1 [repo_census]"*"Preparedness"*"  delivery              needs work     No delivery channel is set up. → commit_config"*) \
+    pass "next prints the Preparedness block when PTC sends it" ;; *) fail "next with preparedness: $out" ;; esac
+out=$(g next --session-id gs_prep 2>/dev/null)
+grep -q "Preparedness" <<<"$out" && fail "next printed an unchanged profile: $out" || pass "next prints no block when PTC sends none"
+echo "=== PREP-B: next prints the source-change proposals whole ==="
+out=$(g next --session-id gs_scope 2>/dev/null)
+case "$out" in *"Proposed changes (apply each via your agent, or decline it with a reason):"*"  sc1 [drop_file] locale/orig/null.pot"*"    now: an orphan gettext template of text domain null (3 entries)"*"    change: git rm locale/orig/null.pot"*"    reason: none of its 3 entries has a call anywhere in the code, and nothing loads text domain null."*) \
+    pass "next prints each proposal: file, now, change, reason" ;; *) fail "next proposals: $out" ;; esac
+out=$(g next --session-id gs_prep 2>/dev/null)
+grep -q "Proposed changes" <<<"$out" && fail "a task without proposals printed the block: $out" || pass "no proposal block without proposals"
+GHELP="$("$CLI" guide --help 2>&1 | tr -s ' \n' ' ')"
+grep -q "stage, setup progress, preparedness, task list" <<<"$GHELP" && pass "guide help: status names setup progress and preparedness" || fail "guide help status line"
 g next --session-id gs_done >"$WORK/out" 2>&1; expect_rc "next when done -> exit 0" 0 $?
 grep -q "All guide tasks are done" "$WORK/out" && pass "done is reported" || fail "done text: $(cat "$WORK/out")"
 PTC_ORG_TOKEN=org-token "$CLI" guide next --api-url "$OLD_API" -d "$PROJ" >"$WORK/out" 2>&1; expect_rc "CLI below cli.min_version -> exit 4" 4 $?

@@ -12,7 +12,10 @@ readonly TEMPLATE="$TEST_DIR/../../backend/app/services/guide/gitlab_ci_recipe.y
 render() {
     # shellcheck disable=SC1090
     source <(sed -n '/^render_ci_gitlab() {$/,/^}$/p' "$CLI")
-    VERSION='__PTC_CLI_VERSION__' render_ci_gitlab
+    # UI-2 (AGD-16): the recipe fetches the CLI through the counted door of its PTC (PTC_API_URL's host + /cli); the server
+    # fills that door in as __PTC_CLI_DOOR__ (Guide::Config::CLI_DOOR_ROOT), so the host is rendered as a placeholder and
+    # the door's path folded into the server's slot.
+    PTC_API_URL='__PTC_CLI_HOST__/api/v1/' VERSION='__PTC_CLI_VERSION__' render_ci_gitlab | sed 's#__PTC_CLI_HOST__/cli/#__PTC_CLI_DOOR__/#g'
 }
 
 # S2-R3 item 2 (CI-16): the job hands the preflight's limit note to the merge request description - the job sets
@@ -21,6 +24,18 @@ recipe="$(render)"
 grep -qE '^    PTC_LIMIT_NOTE_FILE: /tmp/ptc-limit-note$' <<<"$recipe" && grep -q 'rm -f /tmp/ptc-written /tmp/ptc-limit-note' <<<"$recipe" \
   && echo "[PASS] the recipe sets PTC_LIMIT_NOTE_FILE for the run and the merge request description, cleared first" \
   || { echo "[FAIL] the recipe does not pass the limit note to the merge request description"; exit 1; }
+
+# CI-1 (WPML lab runs 21-22, RR-1; CI-16): exit 7 (the bounded stop while PTC still translates) is retried twice by GitLab
+# itself, and "Run pipeline" or a schedule on the default branch re-runs the job with no new commit.
+# No retry:when - GitLab ORs it with exit_codes, so `when: script_failure` would retry every failure.
+retry_block="$(awk '/^  retry:$/ {f = 1; print; next} f && /^    / {print; next} {f = 0}' <<<"$recipe")"
+[[ "$retry_block" == $'  retry:\n    max: 2\n    exit_codes: [7]' ]] \
+  && echo "[PASS] the recipe retries the bounded still-translating stop (exit 7) twice, and no other failure (no when:)" \
+  || { echo "[FAIL] the recipe's retry is not exactly {max: 2, exit_codes: [7]} without when:"; printf '%s\n' "$retry_block"; exit 1; }
+RERUN_RULE='    - if: '"'"'($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'"'"
+grep -qxF -- "$RERUN_RULE" <<<"$recipe" \
+  && echo "[PASS] the recipe admits Run pipeline and schedules on the default branch" \
+  || { echo "[FAIL] the recipe does not admit web / schedule runs on the default branch"; exit 1; }
 
 # S2-R19-3 (CI-16, CLI-7): exit 5 covers files PTC rejected AND files PTC could not be reached for; the job says both.
 EXIT5_LINE='    - if [ "$ptc_rc" -eq 5 ]; then echo "PTC rejected some files or could not be reached for them (see '"'"'Rejected by PTC'"'"' / '"'"'Could not reach PTC'"'"' above); the rest was delivered."; exit 5; fi'

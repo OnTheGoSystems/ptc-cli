@@ -11,5 +11,6 @@ printf 'source_locale: en\nfiles:\n  - file: en.yml\n    output: %s\nguide:\n  p
 (cd "$R" && "${NOCI[@]}" PTC_ORG_TOKEN=org-token "$CLI" guide action-run --config-file .ptc-config.yml --api-url "$API_M") >"$WORK/out" 2>&1
 grep -q 'action_runs' "$WORK/mock-M.log" && pass "the report reached PTC" || fail "no action_runs call: $(cat "$WORK/out")"
 grep -qF "payload too large" "$WORK/out" && pass "PTC's error text is printed" || fail "PTC's error text hidden: $(grep -i 'action_runs' "$WORK/out")"
+grep -qF "ptc guide action-run -d <product dir>" "$WORK/out" && pass "PL-2: the 422 comes with the product-dir remedy, never bare" || fail "bare 422: $(grep -i 'action_runs' "$WORK/out")"
 ! grep -qF "the guide may be off" "$WORK/out" && pass "no guess about the guide being off" || fail "still guesses: $(grep -F 'may be off' "$WORK/out")"
 finish

@@ -2,7 +2,7 @@
 # covers: WF-21
 # status: fixed
 # source: tasks/translation-guide/review/wpml-manual/RUN-LOG.md stop 34 (wpml-st-translations-file-scan-ui-block.php:62,76,88,108 flagged)
-# title: the readiness audit does not flag the msgid of a multi-line `_x(` / `__(` call as a hardcoded string
+# title: the string audit does not flag the msgid of a multi-line `_x(` / `__(` call as a hardcoded string
 source "$(dirname "${BASH_SOURCE[0]}")/_lib.bash"
 R="$WORK/plugin"; mkdir -p "$R"
 cat > "$R/plugin.php" <<'PHP'

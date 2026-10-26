@@ -1,5 +1,5 @@
 #!/bin/bash
-# `ptc audit strings`: the i18n readiness audit (G7) — per-framework rule fixtures with expected findings, the runtime
+# `ptc audit strings`: the string audit (G7) — per-framework rule fixtures with expected findings, the runtime
 # loading audit, the size caps and the exit codes.
 set -uo pipefail
 readonly TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,6 +69,11 @@ assert all(f['file']=='big.php' for f in d['findings'])
 "$CLI" audit strings -d "$FIX/js" >"$WORK/txt" 2>&1
 grep -q "^frameworks: js; 5 finding(s)" "$WORK/txt" && pass "text output summary" || fail "text: $(tail -2 "$WORK/txt")"
 "$CLI" audit >/dev/null 2>&1; [[ $? == 1 ]] && pass "audit without a subcommand -> usage, exit 1" || fail "usage rc"
+# PREP-A: the audit is the "string audit"; "readiness" names nothing in the CLI's help any more.
+"$CLI" audit --help >"$WORK/ah" 2>&1; "$CLI" --help >"$WORK/mh" 2>&1
+grep -q "string audit: user-visible text" "$WORK/ah" && pass "audit help says string audit" || fail "audit help: $(head -3 "$WORK/ah")"
+grep -q "audit strings .*string audit of the code" "$WORK/mh" && pass "main help says string audit" || fail "main help: $(grep 'audit strings' "$WORK/mh")"
+grep -qi "readiness" "$WORK/ah" "$WORK/mh" && fail "help still says readiness: $(grep -hi readiness "$WORK/ah" "$WORK/mh")" || pass "no readiness in the audit or main help"
 
 echo "audit strings: $passed passed, $failed failed"
 [[ $failed == 0 ]]

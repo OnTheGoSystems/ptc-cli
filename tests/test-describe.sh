@@ -285,5 +285,39 @@ PY
 cp -R "$K" "$WORK/k1"
 "$CLI" describe apply --file "$WORK/k.json" -d "$K" >/dev/null 2>&1
 if changed=$(tree_diff "$K" "$WORK/k1"); then pass "re-apply of inline notes is idempotent"; else fail "re-apply changed: $changed"; fi
+echo "=== GAP-G44: a usage line gone stale after an earlier apply in the same file still gets its note ==="
+M="$WORK/m"; mkdir -p "$M/languages" "$M/src"
+printf 'msgid ""\nmsgstr ""\n' > "$M/languages/m.pot"
+{ echo '<?php'; echo 'function m() {'; for w in One Two Three Four Five Six Seven Eight; do echo "	echo __( '$w', 'd' );"; done; echo '}'; } > "$M/src/m.php"
+git -C "$M" init -q
+mdesc() { # word:line ... -> descriptions file with the scan-time (original) usage lines
+    python3 -c 'import json,sys; print(json.dumps({"descriptions": [{"file": "languages/m.pot", "key": w, "description": "Label " + w, "usage": {"path": "src/m.php", "line": int(l)}} for w, l in (a.split(":") for a in sys.argv[1:])]}))' "$@"
+}
+mdesc One:3 Two:4 Three:5 Four:6 Five:7 > "$WORK/m1.json"
+mdesc Six:8 Seven:9 Eight:10 > "$WORK/m2.json"
+"$CLI" describe apply --file "$WORK/m1.json" -d "$M" --json >"$WORK/m1.out" 2>/dev/null; expect_rc "first batch -> exit 0" 0 $?
+"$CLI" describe apply --file "$WORK/m2.json" -d "$M" --json >"$WORK/m2.out" 2>/dev/null; expect_rc "second batch with usage lines 5 lines stale -> exit 0" 0 $?
+python3 - "$M" "$WORK/m2.out" <<'PY' && pass "stale usage line: the note lands directly above its call and the apply reports where it moved" || fail "G44: $(cat "$M/src/m.php" "$WORK/m2.out")"
+import json, sys
+src = open(sys.argv[1] + "/src/m.php").read().split("\n")
+for w in ("One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight"):
+    i = src.index("\techo __( '%s', 'd' );" % w)
+    assert src[i - 1] == "\t/* translators: Label %s */" % w, (w, src)
+    assert sum("Label %s " % w in l for l in src) == 1, (w, src)
+d = json.load(open(sys.argv[2]))
+assert not d["skipped"], d["skipped"]
+got = {a["key"]: (a.get("moved_from"), a.get("line")) for a in d["applied"]}
+assert got == {"Six": (8, 13), "Seven": (9, 14), "Eight": (10, 15)}, got
+PY
+cp -R "$M" "$WORK/m-after"
+"$CLI" describe apply --file "$WORK/m2.json" -d "$M" --json >"$WORK/m3.out" 2>/dev/null; expect_rc "re-apply of the stale batch -> exit 0" 0 $?
+"$CLI" describe apply --file "$WORK/m1.json" -d "$M" --json >"$WORK/m4.out" 2>/dev/null; expect_rc "re-apply of the first batch -> exit 0" 0 $?
+if changed=$(tree_diff "$M" "$WORK/m-after"); then pass "re-apply after a moved usage writes no duplicate note"; else fail "re-apply changed: $changed $(cat "$M/src/m.php")"; fi
+python3 - "$WORK/m3.out" "$WORK/m4.out" <<'PY' && pass "re-apply after a moved usage reports every note unchanged" || fail "G44 re-apply: $(cat "$WORK/m3.out" "$WORK/m4.out")"
+import json, sys
+for f, n in ((sys.argv[1], 3), (sys.argv[2], 5)):
+    d = json.load(open(f))
+    assert d["applied"] == [] and d["skipped"] == [] and len(d["unchanged"]) == n, d
+PY
 echo; echo "describe suite: $passed passed, $failed failed"
 [[ $failed -eq 0 ]]

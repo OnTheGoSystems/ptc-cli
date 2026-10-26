@@ -65,6 +65,11 @@ echo "=== offline: --rate and --balance given, nothing remote ==="
 [[ "$(field "$WORK/e.json" "(d['words_per_language'], d['words_total'], d['credits_per_language'], d['credits_total'])" 2>&1)" == "(10, 20, {'de': 40, 'fr': 40}, 80)" ]] \
     && pass "x 2 languages x rate 4: 20 words, 40 credits per language, 80 total" || fail "totals: $(cat "$WORK/e.json")"
 [[ "$(field "$WORK/e.json" "(d['balance_words'], d['shortfall_words'])" 2>&1)" == "(30, 0)" ]] && pass "a balance of 30 words covers 20" || fail "balance: $(cat "$WORK/e.json")"
+# BIL-5: a fractional rate (89% discount: 0.44 credits per word) prices as the server does, whole credits half up,
+# the total rounded once: 10 x 0.44 = 4.4 -> 4 per language, 20 x 0.44 = 8.8 -> 9 in total.
+"$CLI" estimate --json -d "$R" --rate 0.44 --balance 30 > "$WORK/e44.json" 2>/dev/null
+[[ "$(field "$WORK/e44.json" "(d['credits_per_language'], d['credits_total'])" 2>&1)" == "({'de': 4, 'fr': 4}, 9)" ]] \
+    && pass "a fractional rate rounds like the server: 4 per language, 9 in total" || fail "fractional rate: $(cat "$WORK/e44.json")"
 "$CLI" estimate --json -d "$R" --rate 4 --balance 16 > "$WORK/e2.json" 2>/dev/null
 [[ "$(field "$WORK/e2.json" "d['shortfall_words']" 2>&1)" == "4" ]] && pass "a balance of 16 words is 4 short" || fail "shortfall: $(cat "$WORK/e2.json")"
 txt=$("$CLI" estimate -d "$R" --rate 4 --balance 16 2>&1)

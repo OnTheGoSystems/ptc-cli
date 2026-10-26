@@ -229,12 +229,15 @@ test_recipe_translates() {
 
 # --- 1b. AGD-11: a CI/CD variable PTC_CLI_URL pins another copy of the CLI ---
 test_cli_url_knob() {
-    echo -e "${YELLOW}[TEST]${NC} PTC_CLI_URL pins the CLI the recipe downloads; unset, the release tag"
+    echo -e "${YELLOW}[TEST]${NC} PTC_CLI_URL pins the CLI the recipe downloads; unset, the counted door of the recipe's PTC at the release tag"
     local line dir rc version
     version="$(sed -n 's/^readonly VERSION="\(.*\)"/\1/p' "$CLI_UNDER_TEST" | head -1)"
-    line="$(recipe_script | grep -F -- '-o /tmp/ptc-cli.sh')"
-    assert_eq "the download line defaults to the release tag and honours PTC_CLI_URL" "$line" \
-        "curl -fsSL \"\${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v${version}/ptc-cli.sh}\" -o /tmp/ptc-cli.sh"
+    line="$( (unset PTC_API_URL; recipe_script) | grep -F -- '-o /tmp/ptc-cli.sh')"
+    assert_eq "the download line defaults to PTC's CLI door at the release tag and honours PTC_CLI_URL" "$line" \
+        "curl -fsSL \"\${PTC_CLI_URL:-https://app.ptc.wpml.org/cli/v${version}/ptc-cli.sh}\" -o /tmp/ptc-cli.sh"
+    line="$(PTC_API_URL="https://staging-ptc.otgs.work/api/v1/" recipe_script | grep -F -- '-o /tmp/ptc-cli.sh')"
+    assert_eq "the door is the CLI door of the PTC the recipe was written for (PTC_API_URL)" "$line" \
+        "curl -fsSL \"\${PTC_CLI_URL:-https://staging-ptc.otgs.work/cli/v${version}/ptc-cli.sh}\" -o /tmp/ptc-cli.sh"
     dir="$(make_fixture)"
     PTC_CLI_URL="file://$(cd "$TEST_DIR/.." && pwd)/ptc-cli.sh"
     export PTC_TEST_NO_RELEASE=1 PTC_CLI_URL

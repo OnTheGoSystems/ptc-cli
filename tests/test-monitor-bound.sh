@@ -99,12 +99,31 @@ git -C "$R" init -q
 expect_rc "the only file still translating at the bound -> exit 7" 7 $?
 [[ -f "$WORK/clock-empty.manifest" ]] && pass "the written manifest exists when nothing was written" || fail "no manifest file: the job's git add --pathspec-from-file fails on it"
 [[ -f "$WORK/clock-empty.manifest" && ! -s "$WORK/clock-empty.manifest" ]] && pass "and it is empty" || fail "manifest not empty"
-has "option (a): retry the CI job once PTC finishes" "$WORK/clock.out" "Retry this CI job"
+has "option (a): retry the CI job once PTC finishes" "$WORK/clock.out" "Re-run this CI job once PTC finishes"
+has "option (a): the GitLab click" "$WORK/clock.out" 'GitLab "Retry this job"'
+has "option (a): the GitHub click" "$WORK/clock.out" 'GitHub "Re-run failed jobs"'
+has "option (a): the re-run keeps what this run delivered" "$WORK/clock.out" "keeps every file this run delivered"
 hasre "option (b): the exact status command (with the run's file tag)" "$WORK/clock.out" "ptc-cli.sh --config-file .ptc-config.yml( --file-tag-name [^ ]+)? --action status"
 has "option (b): the project page" "$WORK/clock.out" "http://127.0.0.1:19611/dashboard/projects/42"
 hasre "option (c): the exact download command" "$WORK/clock.out" "ptc-cli.sh --config-file .ptc-config.yml( --file-tag-name [^ ]+)? --action download"
 has "option (c): commit what it downloads" "$WORK/clock.out" "commit"
 has "the final line names the exit" "$WORK/clock.out" "still running in PTC"
+
+echo "=== RR-2 addendum: the first MR / PR already says the rest is coming and how to re-run ==="
+( cd "$R" && PTC_LIMIT_NOTE_FILE="$WORK/clock.note" GITHUB_OUTPUT="$WORK/clock.ghout" PTC_MONITOR_MAX_SECONDS=3 PTC_API_TOKEN=t "$CLI" --config-file .ptc-config.yml --api-url "$API" --monitor-interval 1 --monitor-max-attempts 100 ) >"$WORK/clock-note.out" 2>&1
+expect_rc "the noted run still exits 7" 7 $?
+touch "$WORK/clock.note"
+has "the MR note says the delivery is not complete" "$WORK/clock.note" "PTC's delivery is not complete."
+has "the MR note names the file still translating" "$WORK/clock.note" "config/locales/b.en.yml"
+has "the MR note names the GitLab click" "$WORK/clock.note" 'GitLab "Retry this job"'
+has "the MR note names the GitHub click" "$WORK/clock.note" 'GitHub "Re-run failed jobs"'
+has "the PR body (limit-note) carries it" "$WORK/clock.ghout" "PTC's delivery is not complete."
+PTC_LIMIT_NOTE_FILE="$WORK/clock.note" "$CLI" guide mr-description --file "$WORK/no-check.json" >"$WORK/mrd-1.out" 2>/dev/null
+has "the MR description leads with it (no check answer)" "$WORK/mrd-1.out" "PTC's delivery is not complete."
+printf '%s' '{"verdict":"pass","comment":{"enabled":true,"body":"PTC'"'"'s delivery is not complete: the CI run for abc stopped (monitor_bound) after delivering 1 file(s); 1 file(s) are still translating at PTC.","branch":"ptc/translations"}}' > "$WORK/check-stopped.json"
+PTC_LIMIT_NOTE_FILE="$WORK/clock.note" "$CLI" guide mr-description --file "$WORK/check-stopped.json" >"$WORK/mrd-2.out" 2>/dev/null
+[[ "$(grep -o "PTC's delivery is not complete" "$WORK/mrd-2.out" | wc -l | tr -d ' ')" == 1 ]] && pass "with PTC's own sentence in the check, it is said once" || fail "the sentence count with PTC's check: $(grep -o "PTC's delivery is not complete" "$WORK/mrd-2.out" | wc -l)"
+has "and it is PTC's text" "$WORK/mrd-2.out" "stopped (monitor_bound)"
 
 echo "=== attempts cap: the second bound ends the same way ==="
 A="$WORK/attempts"; mkrepo "$A"
@@ -142,7 +161,7 @@ has "the remedy names the API URL and the network" "$WORK/unreach.out" "check th
 has "the last line does not call the unreachable file rejected" "$WORK/unreach.out" "rejected by PTC or could not reach it"
 grep -q "Still translating in PTC" "$WORK/unreach.out" && fail "an unreachable file was reported still translating" || pass "no 'Still translating in PTC' line"
 grep -q "nothing failed" "$WORK/unreach.out" && fail "the unreachable case says 'nothing failed'" || pass "no 'nothing failed' line"
-grep -q "Retry this CI job once PTC finishes" "$WORK/unreach.out" && fail "the retry-once-PTC-finishes option printed for an unreachable PTC" || pass "no 'retry once PTC finishes' option"
+grep -q "Re-run this CI job once PTC finishes" "$WORK/unreach.out" && fail "the retry-once-PTC-finishes option printed for an unreachable PTC" || pass "no 'retry once PTC finishes' option"
 
 echo "=== S2-R19-1: one file in progress, one unreachable at the bound -> both groups, exit 7 ==="
 MX=""; PTC_MOCK_STILL_TRANSLATING=config/locales/a.en.yml PTC_MOCK_STATUS_404=config/locales/b.en.yml start_mock MX 19701 19711 19721
