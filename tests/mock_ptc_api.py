@@ -11,6 +11,7 @@ Endpoints (all under /api/v1/):
     POST detect_config                    -> `ptc init` layout detection
     POST guide/sessions, GET guide/next, POST guide/submit, GET guide/status,
     POST guide/skip, POST guide/action_runs -> agent-guide protocol (ptc-cli 1.1.0)
+    POST guide/glossary/validate -> PTC's glossary validator (400 without a project_id)
          submit verdict = evidence["mock_verdict"] (default "accepted")
     POST guide/check {session_id, commit_sha} -> (ptc-cli 1.3.0) G8 gate: gs_pass / gs_fail / gs_norun (409) / 404
     POST guide/wait {task_id, timeout_s}   -> (ptc-cli 1.2.0) long-poll; by task id:
@@ -27,6 +28,7 @@ Endpoints (all under /api/v1/):
 Knobs (env):
     PTC_MOCK_PORT     default 8787
     PTC_MOCK_LOCALES  comma-separated target locales, default "de,fr"
+    PTC_MOCK_PROCESSING_SECONDS  seconds a file answers "in_progress" after its first status poll (row 7185)
     PTC_MOCK_PENDING  how many status polls answer "in_progress" before
                       "completed" (per file). Default 0.
     PTC_MOCK_LOG      path to append a one-line-per-request journal.
@@ -39,6 +41,7 @@ import json
 import os
 import re
 import sys
+import time
 import zipfile
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,6 +68,10 @@ OUT_OF_CREDIT = {x for x in os.environ.get("PTC_MOCK_OUT_OF_CREDIT", "").split("
 # S2-R3B F-2 knob (file_path list): translation_status answers "in_progress" forever (a first translation that outlives
 # the CI job's monitor bound).
 STILL_TRANSLATING = {x for x in os.environ.get("PTC_MOCK_STILL_TRANSLATING", "").split(",") if x}
+# Row 7185 (CLI-25) knob: translation_status answers "in_progress" for this many seconds after a file's first status poll,
+# then "completed" (a wait the progress heartbeat must not leave silent). 0 = off.
+PROCESSING_SECONDS = float(os.environ.get("PTC_MOCK_PROCESSING_SECONDS", "0"))
+first_polled = {}
 # GAP-CI-2 F14 knob (file_path list): translation_status answers "reviewing" forever (every string translated and stored in
 # PTC, the project's review holding the delivery: POL-11, SourceFilesController#api_status).
 REVIEWING = {x for x in os.environ.get("PTC_MOCK_REVIEWING", "").split(",") if x}
@@ -491,6 +498,12 @@ class Handler(BaseHTTPRequestHandler):
                 # (GAP-G57) an accepted verdict whose reasons outrun an agent's display (40 findings, > 8,000 characters).
                 reasons = LONG_REASONS
             self._json(200, {"verdict": verdict, "reasons": reasons, "next": TASK, "cli": cli})
+        elif route == "guide/glossary/validate" and method == "POST":
+            # (org #7188) PTC's glossary validator (Api::V1::GuideController#glossary_validate): the project is required.
+            d = json.loads(body or b"{}")
+            if not d.get("project_id"):
+                return self._json(400, {"error": "project_id is required"}) or True
+            self._json(200, {"rows": 1, "languages": ["en", "de"], "fail": 0, "warn": 0, "findings": []})
         elif route == "guide/run_paths" and method == "GET":
             # (L16, SF-50) the pre-run door: the paths PTC verified / the open source-fix tasks name (PTC_MOCK_RUN_PATHS,
             # comma-separated); absent -> 404 like a server without the door.
@@ -662,7 +675,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, "<html><body>Tunnel 127.0.0.1 not found (ERR_NGROK_3200)</body></html>",
                                   "text/html", {"ngrok-error-code": "ERR_NGROK_3200"})
             poll_counts[(self.scenario, fp)] += 1
-            if fp in STILL_TRANSLATING or poll_counts[(self.scenario, fp)] <= PENDING:
+            held = PROCESSING_SECONDS > 0 and time.time() - first_polled.setdefault((self.scenario, fp), time.time()) < PROCESSING_SECONDS
+            if fp in STILL_TRANSLATING or held or poll_counts[(self.scenario, fp)] <= PENDING:
                 return self._json(200, {"translation_status": {
                     "status": "in_progress", "completeness": 40}})
 

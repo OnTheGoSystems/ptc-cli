@@ -2,10 +2,12 @@
 # covers: SF-37
 # status: fixed
 # source: L13 staging LW (2026-10-08); cli/tests/test-guide-l13.sh SF-37
-# title: a second `guide start` in a no-git directory rejoins the config's session instead of opening a new project
+# title: a second `guide start` in a directory with no session cache rejoins the config's session instead of opening a new project
 source "$(dirname "${BASH_SOURCE[0]}")/_lib.bash"
 start_mock M 19883
 R="$WORK/rejoin"; mkdir -p "$R/.ptc"
+# CLI-26 (org row 7186): --repo-url must be a remote of the checkout, so the directory carries it as origin.
+git -C "$R" init -q && git -C "$R" remote add origin https://example.test/multi-org.git
 printf 'source_locale: en\nlanguages: [de, es]\nfiles:\n  - file: en.yml\n    output: %s\nguide:\n  session_id: 9\n  project_id: 3526\n' "'{{lang}}.yml'" > "$R/.ptc-config.yml"
 "${NOCI[@]}" PTC_ORG_TOKEN=org-token "$CLI" guide start --repo-url https://example.test/multi-org.git --branch main --api-url "$API_M" -d "$R" >"$WORK/rejoin.out" 2>&1
 rc=$?

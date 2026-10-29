@@ -169,6 +169,15 @@ c2 "runtime: i18n init config" "[x['path'] for x in r['i18n_init']] == ['src/i18
 "$CLI" scan --json -d "$REPO" > "$WORK/plain.json" 2>/dev/null
 python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d['other_string_sources'] == [] or all(o['kind'] != 'templates' or o['samples'][0]['path'] != 'config/locales/en.yml' for o in d['other_string_sources']) else 1)" "$WORK/plain.json" && pass "resource files are never counted as other sources" || fail "resource files counted as other sources"
 
+echo "=== ptc scan --json: a config without a source_locale line scans with the en default (org #6647) ==="
+# The grep reading the line failed on no match under errexit, so scan printed nothing and stopped.
+NS="$WORK/no-src"; mkdir -p "$NS/config/locales"
+printf 'en:\n  save: Save\n' > "$NS/config/locales/en.yml"; printf 'de:\n  save: Speichern\n' > "$NS/config/locales/de.yml"
+printf 'languages: [de]\nfiles:\n  - file: config/locales/en.yml\n    output: config/locales/{{lang}}.yml\n' > "$NS/.ptc-config.yml"
+git -C "$NS" init -q
+"$CLI" scan --json -d "$NS" > "$WORK/no-src.json" 2>"$WORK/no-src.err"; rc=$?
+python3 -c "import json,sys; d=json.load(open(sys.argv[1])); s=d['resource_sets']; sys.exit(0 if len(s) == 1 and s[0]['existing_languages'] == ['de'] and [f['lang'] for f in s[0]['source_files']] == ['en'] else 1)" "$WORK/no-src.json" 2>/dev/null && [[ $rc -eq 0 ]] && pass "config without source_locale -> scan exits 0, en is the source, de an existing translation" || fail "config without source_locale: rc=$rc stdout $(wc -c < "$WORK/no-src.json") bytes $(head -c 300 "$WORK/no-src.err")"
+
 echo "=== ptc scan --json: YAML anchors, aliases and merge keys count the same with and without PyYAML (FMT-29) ==="
 # S2-R1: PTC's own config/locales/admin/placeholders.en.yml (`&default` + `<<: *default`) counted 74 strings
 # without PyYAML and 213 with it, so a scan from a machine without PyYAML disagreed with CI's.

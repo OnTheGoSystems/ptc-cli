@@ -44,6 +44,8 @@ grep -q "or on the guide page in PTC" "$WORK/page.out" && pass "answer_via [chat
 
 echo "=== SF-37: start rejoins the config's session ==="
 R="$WORK/rejoin"; mkdir -p "$R/.ptc"
+# CLI-26 (org row 7186): --repo-url must be a remote of the checkout, so the directory carries it as origin.
+git -C "$R" init -q && git -C "$R" remote add origin https://example.test/multi-org.git
 cat > "$R/.ptc-config.yml" <<'YML'
 source_locale: en
 languages: [de, es]

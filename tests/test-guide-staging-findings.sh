@@ -29,6 +29,8 @@ body() { python3 -c "import json,sys; d=json.load(open(sys.argv[1]))['body']; pr
 
 echo "=== SF-18: guide start, token acting in several organizations ==="
 P="$WORK/plain"; mkdir -p "$P"
+# CLI-26 (org row 7186): --repo-url must be a remote of the checkout, so the directory carries it as origin.
+git -C "$P" init -q && git -C "$P" remote add origin https://example.test/multi-org.git
 "${NOCI[@]}" PTC_ORG_TOKEN=org-token "$CLI" guide start --repo-url https://example.test/multi-org.git --branch main --api-url "$API" -d "$P" >"$WORK/start.out" 2>&1
 rc=$?
 [[ $rc -ne 0 ]] && pass "no organization named -> non-zero exit" || fail "start exit $rc"

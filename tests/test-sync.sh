@@ -73,11 +73,12 @@ got=$(dc "$B" "''.join('%s=%s;' % kv for kv in sorted(d['delivered_files_sha'].i
 [[ -n "$got" && "$got" == "$want" ]] && pass "delivered_files_sha = sha256sum of exactly the four written files" || fail "delivered_files_sha: '$got' want '$want'"
 [[ "$(dc "$B" "d.get('source_commit_sha')")" == "$head" && "$(dc "$B" "d.get('provenance_request')")" == "agent_local" ]] \
     && pass "agent-local report with the source commit git has" || fail "source/provenance: $(dc "$B" "d.get('source_commit_sha'), d.get('provenance_request')")"
-python3 - "$WORK/ok.json" <<'PY' && pass "--json: {run_id, uploaded, delivered, parked, rejected, delivery_commit} = 1, 2, 4, 0, 0, the report's answer" || fail "--json: $(cat "$WORK/ok.json")"
-import json, sys
+HEAD_SHA="$head" python3 - "$WORK/ok.json" <<'PY' && pass "--json: {run_id, run_key, uploaded, delivered, parked, rejected, delivery_commit} = 1, the commit, 2, 4, 0, 0, the report's answer" || fail "--json: $(cat "$WORK/ok.json")"
+import json, os, sys
 d = json.load(open(sys.argv[1]))
-assert sorted(d) == ["delivered", "delivery_commit", "parked", "rejected", "run_id", "uploaded"], sorted(d)
+assert sorted(d) == ["delivered", "delivery_commit", "parked", "rejected", "run_id", "run_key", "uploaded"], sorted(d)
 assert (d["run_id"], d["uploaded"], d["delivered"], d["parked"], d["rejected"]) == (1, 2, 4, 0, 0), d
+assert d["run_key"] == os.environ["HEAD_SHA"], d["run_key"]  # row 7185: the key the guide's first_sync task asks for
 assert d["delivery_commit"]["reported"] == 4, d["delivery_commit"]
 PY
 grep -q "Reported the 4 files this run wrote to PTC" "$WORK/ok.err" && pass "the delivery report is acknowledged in the log" || fail "log: $(grep -i report "$WORK/ok.err")"
@@ -134,6 +135,25 @@ sfp=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['repo']['w
 [[ "$key" == "fp:$fp" && "$(dc "$WORK/bodies-NOGIT" "d.get('workspace_fingerprint')")" == "$fp" ]] && pass "guide check and the delivery report use the run's fingerprint" \
     || fail "check key '$key', report fp '$(dc "$WORK/bodies-NOGIT" "d.get('workspace_fingerprint')")', run fp '$fp'"
 python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$WORK/named.json" 2>/dev/null && pass "sync --json stdout stays one JSON document" || fail "sync --json stdout: $(head -3 "$WORK/named.json")"
+
+echo "=== row 7185 (CLI-25): while PTC translates, sync prints a progress line on every change and at least every interval ==="
+# A first delivery waited 7 minutes with nothing printed (the compact status line rewrites itself with a carriage return).
+# The heartbeat interval is PTC_PROGRESS_INTERVAL (default 60 s); here 1 s against a mock that holds the files in
+# processing for 4 s, polled every 5 s: the state does not change between the first poll and the next, so the lines that
+# repeat it come from the heartbeat alone. They go to stderr: --json stdout stays one JSON document.
+start_mock SLOW 19897 PTC_MOCK_PROCESSING_SECONDS=4
+T="$WORK/slow"; make_tree "$T" git
+python3 -c "import sys; p = sys.argv[1]; s = open(p).read(); open(p, 'w').write(s.replace('monitor_interval: 1\\n', 'monitor_interval: 5\\n'))" "$T/.ptc-config.yml"
+grep -q '^monitor_interval: 5$' "$T/.ptc-config.yml" || fail "the slow tree polls every 5 s"
+git -C "$T" -c user.email=t@t -c user.name=t commit -qam 'poll every 5 s'
+"${NOCI[@]}" PTC_ORG_TOKEN=org-token PTC_PROGRESS_INTERVAL=1 "$CLI" sync --api-url "$API_SLOW" -d "$T" --json >"$WORK/slow.json" 2>"$WORK/slow.err"; rc=$?
+[[ $rc -eq 0 ]] && pass "slow sync -> exit 0" || fail "slow sync exit $rc: $(tail -5 "$WORK/slow.err")"
+n=$(grep -cE '\[INFO\].* sync: 2 processing \(2 file\(s\)\) \([0-9]+s\)$' "$WORK/slow.err")
+[[ $n -ge 2 ]] && pass "the unchanged processing state is repeated by the heartbeat ($n lines >= 2)" || fail "processing lines: $n; $(grep 'sync:' "$WORK/slow.err" | head -5)"
+grep -qE '\[INFO\].* sync: 2 completed \(2 file\(s\)\) \([0-9]+s\)$' "$WORK/slow.err" && pass "the change to completed prints at once" || fail "no completed line: $(grep 'sync:' "$WORK/slow.err" | tail -3)"
+python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$WORK/slow.json" 2>/dev/null && pass "progress lines never reach --json stdout" || fail "slow --json stdout: $(head -3 "$WORK/slow.json")"
+"${NOCI[@]}" PTC_ORG_TOKEN=org-token "$CLI" sync --api-url "$API_SLOW" -d "$T" >"$WORK/slow2.out" 2>"$WORK/slow2.err"
+grep -qE '^run_key: [0-9a-f]{40}$' "$WORK/slow2.out" && pass "sync prints the run_key on stdout (the guide's first_sync task asks for it)" || fail "no run_key line: $(cat "$WORK/slow2.out")"
 
 echo ""
 echo "passed=$passed failed=$failed"

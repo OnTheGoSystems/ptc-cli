@@ -49,6 +49,8 @@ done
 API="http://127.0.0.1:$PORT/api/v1/"
 OLD_API="http://127.0.0.1:$((PORT + 5))/api/v1/"
 PROJ="$WORK/proj"; mkdir -p "$PROJ"
+# CLI-26 (org row 7186): --repo-url must be a remote of the checkout, so the directory carries it as origin.
+git -C "$PROJ" init -q && git -C "$PROJ" remote add origin https://example.test/r.git
 g() { PTC_ORG_TOKEN="${TOKEN-org-token}" "$CLI" guide "$@" --api-url "$API" -d "$PROJ"; }
 
 echo "=== version headers on every call ==="
@@ -340,6 +342,13 @@ jcheck "PTC_PROJECT_ID overrides guide.project_id" "$BODIES/api_languages.json" 
 rm -f "$BODIES"/api_*.json
 ( cd "$WORK/repo" && PTC_API_TOKEN=project-token "$CLI" --config-file .ptc-config.yml --api-url "$API" --monitor-interval 1 ) >/dev/null 2>&1
 jcheck "no guide.project_id -> no header" "$BODIES/api_languages.json" "'X-PTC-Project-Id' not in d['headers']"
+echo "=== CG-1: a push from a repository CI job says so (X-PTC-Upload-Origin: repository) ==="
+rm -f "${BODIES:?}"/api_*.json
+( cd "$WORK/repo" && "${NOID[@]}" GITLAB_CI=true PTC_API_TOKEN=project-token "$CLI" --config-file .ptc-config.yml --api-url "$API" --monitor-interval 1 ) >/dev/null 2>&1
+jcheck "GitLab CI: the upload carries X-PTC-Upload-Origin: repository" "$BODIES/api_source_files.json" "d['headers'].get('X-PTC-Upload-Origin') == 'repository'"
+rm -f "${BODIES:?}"/api_*.json
+( cd "$WORK/repo" && "${NOID[@]}" PTC_API_TOKEN=project-token "$CLI" --config-file .ptc-config.yml --api-url "$API" --monitor-interval 1 ) >/dev/null 2>&1
+jcheck "outside CI: the upload carries no origin header" "$BODIES/api_source_files.json" "'X-PTC-Upload-Origin' not in d['headers']"
 printf 'guide:\n  session_id: x\n  project_id: "1281"  # set by PTC\nfiles: []\n' > "$WORK/pid.yml"
 [[ "$(bash -c 'source "$1"; ptc_config_project_id "$2"' _ "$CLI" "$WORK/pid.yml")" == "1281" ]] && pass "project_id parsing: quotes and trailing comments" || fail "project_id parsing"
 
