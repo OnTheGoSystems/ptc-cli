@@ -32,9 +32,18 @@ Knobs (env):
     PTC_MOCK_PENDING  how many status polls answer "in_progress" before
                       "completed" (per file). Default 0.
     PTC_MOCK_LOG      path to append a one-line-per-request journal.
+    PTC_MOCK_TRIAL_RUNS_REMAINING / PTC_MOCK_TRIAL_RUN_OPEN  (#7346) every response carries X-PTC-TRIAL-API-RUNS-REMAINING /
+                      X-PTC-TRIAL-API-RUN-OPEN with that value (unset: the header is absent)
     PTC_MOCK_PUSHES   1: guide answers carry `subscribe`, and `suggestion` when X-PTC-Pushes: shown (L11)
     PTC_MOCK_BODY_DIR directory where every guide request is saved as
                       <route>.json ({"headers":…, "body":…}) for assertions.
+    (org row 7352, API-38) the device login doors: POST auth/device, POST auth/device/token, GET auth/check
+    PTC_MOCK_DEVICE           approve (default) | deny | expire | missing (auth/device answers 404: a PTC without the door)
+    PTC_MOCK_DEVICE_PENDING   polls answering 428 authorization_pending before the outcome (default 2)
+    PTC_MOCK_DEVICE_TOKEN     the token the approved poll hands over (default ptcu_mock_device_token); auth/check answers
+                              200 to it and to any other bearer but the literal ptcu_refused
+    PTC_MOCK_DEVICE_INTERVAL  the interval the mint answers (default 0, so the tests do not wait)
+    PTC_MOCK_DEVICE_SLOW_DOWN 1: the first poll answers 429 {"error": "slow_down"}
 """
 import io
 import json
@@ -136,6 +145,14 @@ def delivered_block(file_path, run_key):
 #   +5  old_cli    guide responses demand cli.min_version 99.0.0
 SCENARIOS = ["happy", "bad_token", "failed", "no_detect", "soft_fail", "old_cli"]
 BODY_DIR = os.environ.get("PTC_MOCK_BODY_DIR", "")
+# (org row 7352, API-38) the device login doors: one request per server, its polls counted.
+DEVICE = os.environ.get("PTC_MOCK_DEVICE", "approve")
+DEVICE_PENDING = int(os.environ.get("PTC_MOCK_DEVICE_PENDING", "2"))
+DEVICE_TOKEN = os.environ.get("PTC_MOCK_DEVICE_TOKEN", "ptcu_mock_device_token")
+DEVICE_INTERVAL = int(os.environ.get("PTC_MOCK_DEVICE_INTERVAL", "0"))
+DEVICE_SLOW_DOWN = os.environ.get("PTC_MOCK_DEVICE_SLOW_DOWN", "") == "1"
+DEVICE_CODE = "mockdevicecode_" + "x" * 28
+DEVICE_STATE = {"polls": 0, "consumed": False, "slowed": False}
 API_DONE = ("Setup is done; the delivery channel is the API: run `ptc sync` in the project directory to upload, translate and "
             "write the translations (and again after every change); no CI file and no push are needed.")
 WAIT_ROUNDS = int(os.environ.get("PTC_MOCK_WAIT_ROUNDS", "1"))
@@ -295,6 +312,11 @@ class Handler(BaseHTTPRequestHandler):
         # off the `languages` call during preflight).
         self.send_header("X-PTC-TRIAL-BALANCE", os.environ.get("PTC_MOCK_TRIAL_BALANCE", "12000"))
         self.send_header("X-PTC-PREPAID-BALANCE", os.environ.get("PTC_MOCK_PREPAID_BALANCE", "50000"))
+        # (#7346) the trial pool headers, only when a test sets them: absent means no cap, as for a paying organization.
+        for header, knob in (("X-PTC-TRIAL-API-RUNS-REMAINING", "PTC_MOCK_TRIAL_RUNS_REMAINING"),
+                             ("X-PTC-TRIAL-API-RUN-OPEN", "PTC_MOCK_TRIAL_RUN_OPEN")):
+            if os.environ.get(knob):
+                self.send_header(header, os.environ[knob])
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -521,8 +543,8 @@ class Handler(BaseHTTPRequestHandler):
                 d = json.loads(body or b"{}")
             except Exception:
                 d = {}
-            # (S2-R3B C-1) like the server (authenticate_org_run!: params.require(:project_id)): an organization token
-            # without a project is a 400; a project token needs none.
+            # (S2-R3B C-1) like the server (authenticate_org_run!: params.require(:project_id)): an agent token
+            # (Bearer org-token here) without a project is a 400; a project token needs none.
             if self._auth() == "Bearer org-token" and not d.get("project_id") and not self.headers.get("X-PTC-Project-Id"):
                 return self._json(400, {"error": "param is missing or the value is empty: project_id"}) or True
             # (S2-F2 C-2) branch ptc-flaky-once: 503 on the first report, then 201.
@@ -615,6 +637,13 @@ class Handler(BaseHTTPRequestHandler):
             self._save("api_" + route, b"")
         if self._guide("GET", route, q, b""):
             return
+
+        if route == "auth/check":
+            # (org row 7344 / 7352) GET auth/check: 200 to any bearer but ptcu_refused.
+            bearer = self._auth()[len("Bearer "):] if self._auth().startswith("Bearer ") else ""
+            if not bearer or bearer == "ptcu_refused" or self.scenario == "bad_token":
+                return self._json(401, {"error": "Unauthorized", "error_code": 9001})
+            return self._json(200, {"ok": True, "user_id": 7, "organization_id": 5, "organization_ids": [5]})
 
         if route == "languages":
             if self._need_token():
@@ -725,6 +754,36 @@ class Handler(BaseHTTPRequestHandler):
             self._save("api_" + route, b"")
         if self._guide("POST", route, q, body):
             return
+
+        if route == "auth/device":
+            # (org row 7352, API-38) the mint: no credential; PTC_MOCK_DEVICE=missing is a PTC without the door.
+            if DEVICE == "missing":
+                return self._json(404, {"error": "Not Found"})
+            port = self.server.server_address[1]
+            uri = f"http://127.0.0.1:{port}/dashboard/agent-tokens/approve"
+            return self._json(200, {"device_code": DEVICE_CODE, "user_code": "ABCD-EFGH", "verification_uri": uri,
+                                    "verification_uri_complete": uri + "?code=ABCD-EFGH", "expires_in": 600,
+                                    "interval": DEVICE_INTERVAL})
+
+        if route == "auth/device/token":
+            try:
+                code = json.loads(body or b"{}").get("device_code")
+            except ValueError:
+                code = None
+            if code != DEVICE_CODE or DEVICE_STATE["consumed"]:
+                return self._json(410, {"error": "expired_token"})
+            if DEVICE_SLOW_DOWN and not DEVICE_STATE["slowed"]:
+                DEVICE_STATE["slowed"] = True
+                return self._json(429, {"error": "slow_down"})
+            DEVICE_STATE["polls"] += 1
+            if DEVICE_STATE["polls"] <= DEVICE_PENDING:
+                return self._json(428, {"error": "authorization_pending"})
+            if DEVICE == "deny":
+                return self._json(403, {"error": "access_denied"})
+            if DEVICE == "expire":
+                return self._json(410, {"error": "expired_token"})
+            DEVICE_STATE["consumed"] = True
+            return self._json(200, {"token": DEVICE_TOKEN, "user_id": 7}, {"Cache-Control": "no-store"})
 
         if route == "source_files":
             if self._need_token():

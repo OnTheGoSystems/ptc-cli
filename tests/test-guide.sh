@@ -79,6 +79,8 @@ rm -rf "$PROJ/.ptc"
 g start --repo-url https://example.test/r.git --branch main >"$WORK/out" 2>&1; expect_rc "start without --project-id -> exit 0" 0 $?
 jcheck "start without --project-id POSTs /projects {name, repo_url, default_branch}" "$BODIES/projects.json" "d['body']['repo_url'] == 'https://example.test/r.git' and d['body']['default_branch'] == 'main' and d['body']['name']"
 grep -q "Created PTC project 42" "$WORK/out" && grep -q "organization agent token" "$WORK/out" && grep -q "https://ptc.test/dashboard/organizations/5/agent-tokens" "$WORK/out" && pass "start prints the project id and the ORG agent-token page (E5)" || fail "start prints the project id and token page: $(cat "$WORK/out")"
+# Org row 7319 clause 2: at start no delivery channel is chosen yet; the CI secret is named only for a CI delivery.
+grep -q "If the delivery is by CI, the human adds the CI secret PTC_API_TOKEN" "$WORK/out" && pass "start names the CI secret only for a CI delivery" || fail "unconditional CI-secret step: $(cat "$WORK/out")"
 if grep -q "no target languages yet" "$WORK/out" && grep -q "PTC dashboard" "$WORK/out" && grep -q "target_languages task" "$WORK/out"; then
     pass "start tells the operator to set the target languages: the dashboard or the guide's target_languages task (T19)"
 else fail "start names no target-language step: $(cat "$WORK/out")"; fi
@@ -216,7 +218,7 @@ jcheck "delivered_files_sha is read from the reported commit (main's work tree d
 grep -q "Reported the translations-branch commit ${tsha:0:12} to PTC" "$WORK/dc.out" && pass "delivery-commit says what PTC matched" || fail "delivery-commit output: $(cat "$WORK/dc.out")"
 "${NOID[@]}" PTC_API_TOKEN=project-token "$CLI" guide delivery-commit --api-url "$API" -d "$WORK/repo" >/dev/null 2>&1; expect_rc "delivery-commit without --commit -> exit 1" 1 $?
 # S2-R3B C-1: no config and no --project-id used to die silently (errexit on the `&&` assignment) before posting. Now the
-# run is posted (a legacy project token needs no project) after a warning; an organization token's refusal names the remedy.
+# run is posted (a legacy project token needs no project) after a warning; an agent token's refusal (no project named) names the remedy.
 rm -f "$BODIES/guide_action_runs.json"; mkdir -p "$WORK/noconf" && git -C "$WORK/noconf" init -q
 "${NOID[@]}" PTC_API_TOKEN=project-token "$CLI" guide action-run --api-url "$API" -d "$WORK/noconf" >"$WORK/noconf.out" 2>&1; rc=$?
 [[ $rc -eq 0 && -f "$BODIES/guide_action_runs.json" ]] && grep -q -- "--project-id" "$WORK/noconf.out" \
@@ -225,8 +227,8 @@ rm -f "$BODIES/guide_action_runs.json"; mkdir -p "$WORK/noconf" && git -C "$WORK
 rm -f "$BODIES/guide_action_runs.json"
 "${NOID[@]}" PTC_API_TOKEN=org-token "$CLI" guide action-run --api-url "$API" -d "$WORK/noconf" >"$WORK/noconf2.out" 2>&1; rc=$?
 [[ $rc -ne 0 ]] && grep -q "HTTP 400" "$WORK/noconf2.out" && grep -q "guide.project_id" "$WORK/noconf2.out" \
-  && pass "action-run without a project (organization token) -> non-zero, the refusal names --project-id / guide.project_id (C-1)" \
-  || fail "action-run without a project (organization token): rc $rc, out: $(cat "$WORK/noconf2.out")"
+  && pass "action-run without a project (agent token) -> non-zero, the refusal names --project-id / guide.project_id (C-1)" \
+  || fail "action-run without a project (agent token): rc $rc, out: $(cat "$WORK/noconf2.out")"
 
 # D13: with a base ref, the body carries the commit's changed paths (repo-root relative)
 git -C "$WORK/repo" update-ref refs/remotes/origin/main HEAD

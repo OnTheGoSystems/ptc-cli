@@ -10,8 +10,10 @@
 #   - none set: the token from the CLI's own credentials file ($XDG_CONFIG_HOME, else ~/.config, /ptc/credentials,
 #     PTC_API_TOKEN=<token>), read only at mode 600; at 644 it is refused with one line, the value never printed;
 #   - an env name beats the file;
-#   - no token anywhere: the error names PTC_API_TOKEN, PTC_AGENT_TOKEN, --api-token and the credentials file;
+#   - no token anywhere: the error names `ptc auth login` (org #7308), the credentials file, PTC_API_TOKEN, PTC_AGENT_TOKEN and --api-token;
 #   - no log line ever carries a token value.
+#   - org #7319: a token PTC refuses (HTTP 401) is named by its source; an environment token says it wins over the
+#     credentials file and points to `ptc auth login` (CODE=401 makes the curl stub answer 401).
 # The CLI never reads an MCP client's configuration (Eran, 27 Oct 2026): a Claude Code ~/.claude.json carrying a PTC
 # token is not read. Each case runs in its own bash with a temp HOME and working directory (never this machine's own
 # files) and a curl stub that records the bearer it was given to a file. PTC_CLI_UNDER_TEST points it at another copy (the red run).
@@ -49,9 +51,13 @@ run_door() {
                 for a in "$@"; do
                     if [[ "$prev" == "-H" && "$a" == "Authorization: Bearer "* ]]; then printf "%s" "${a#Authorization: Bearer }" > "$REC"; fi
                     [[ "$prev" == "-o" ]] && out="$a"
+                    # #7225: the bearer arrives as a curl config on stdin (-K -), never as an argument.
+                    if [[ "$prev" == "-K" && "$a" == "-" ]]; then
+                        sed -n "s/^header = \"Authorization: Bearer \(.*\)\"\$/\1/p" | tr -d "\n" > "$REC"
+                    fi
                     prev="$a"
                 done
-                if [[ -n "$out" ]]; then printf "{}" > "$out"; printf "200"; else printf "{}200"; fi
+                if [[ -n "$out" ]]; then printf "{}" > "$out"; printf "%s" "${CODE:-200}"; else printf "{}%s" "${CODE:-200}"; fi
             }
             case "$2" in
                 preflight) preflight_check ;;
@@ -153,14 +159,39 @@ echo
 echo "=== no token anywhere: the error names every door ==="
 run_door none-preflight preflight
 assert_failed "preflight: no token -> fails" none-preflight
-assert_out_contains "preflight: names PTC_API_TOKEN and PTC_AGENT_TOKEN" none-preflight "Set PTC_API_TOKEN (or PTC_AGENT_TOKEN)"
+assert_out_contains "preflight: names PTC_API_TOKEN and PTC_AGENT_TOKEN" none-preflight "set PTC_API_TOKEN (or PTC_AGENT_TOKEN)"
 assert_out_contains "preflight: names --api-token" none-preflight "pass --api-token"
-assert_out_contains "preflight: names the credentials file" none-preflight \
-    "write PTC_API_TOKEN=<token> to $WORK_DIR/none-preflight/home/.config/ptc/credentials (mode 600"
+# org #7308: the human saves the token with `ptc auth login`; the error names the command and the file it writes. Org row 7348: in their own terminal, not through the agent. Org row 7352: approved in the browser, no token typed.
+assert_out_contains "preflight: names ptc auth login and the credentials file" none-preflight \
+    "Ask the human to run \`ptc auth login\` in their own terminal, not through the agent, and approve the sign-in in their browser at http://ptc.test (no token is typed; the CLI saves it to $WORK_DIR/none-preflight/home/.config/ptc/credentials, mode 600)"
 run_door none-guide guide
 assert_failed "guide: no token -> fails" none-guide
 assert_out_contains "guide: names PTC_API_TOKEN and PTC_AGENT_TOKEN" none-guide "PTC_API_TOKEN and PTC_AGENT_TOKEN are not set"
-assert_out_contains "guide: names --api-token and the credentials file" none-guide "pass --api-token, or write PTC_API_TOKEN=<token> to"
+assert_out_contains "guide: names ptc auth login and --api-token" none-guide "/home/.config/ptc/credentials, mode 600), or set PTC_API_TOKEN (or PTC_AGENT_TOKEN), or pass --api-token."
+
+echo
+echo "=== a refused token (HTTP 401) names the source it came from (org #7319, CLI-24) ==="
+for door in preflight guide; do
+    creds "env401-$door" 600
+    run_door "env401-$door" "$door" CODE=401 PTC_API_TOKEN="$TOK_API"
+    assert_failed "$door: env token refused -> fails" "env401-$door"
+    assert_out_contains "$door: 401 names PTC_API_TOKEN and that it beats the credentials file" "env401-$door" \
+        "PTC refused the agent token (HTTP 401): it came from the environment variable PTC_API_TOKEN, which wins over the credentials file $WORK_DIR/env401-$door/home/.config/ptc/credentials."
+    assert_out_contains "$door: 401 on an env token points to ptc auth login" "env401-$door" "\`ptc auth login\`"
+    assert_no_token_logged "env401-$door"
+
+    run_door "agent401-$door" "$door" CODE=401 PTC_AGENT_TOKEN="$TOK_AGENT"
+    assert_out_contains "$door: 401 names PTC_AGENT_TOKEN" "agent401-$door" \
+        "PTC refused the agent token (HTTP 401): it came from the environment variable PTC_AGENT_TOKEN."
+    assert_no_token_logged "agent401-$door"
+
+    creds "file401-$door" 600
+    run_door "file401-$door" "$door" CODE=401
+    assert_out_contains "$door: 401 names the credentials file" "file401-$door" \
+        "PTC refused the agent token (HTTP 401): it came from the credentials file $WORK_DIR/file401-$door/home/.config/ptc/credentials."
+    assert_out_contains "$door: 401 on the file points to ptc auth login" "file401-$door" "\`ptc auth login\`"
+    assert_no_token_logged "file401-$door"
+done
 
 echo
 echo "=== ptc sync: the door itself, no token anywhere ==="

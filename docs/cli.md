@@ -2,14 +2,27 @@
 
 For anyone running `ptc-cli.sh` by hand or in a script: usage, options, configuration file, workflow and exit codes.
 
+## Install
+
+From the repository root:
+
+```bash
+mkdir -p .ptc/bin && curl -fsSL https://app.ptc.wpml.org/cli/ptc-cli.sh -o .ptc/bin/ptc-cli.sh && chmod +x .ptc/bin/ptc-cli.sh
+```
+
+Every `ptc` command in these docs is `.ptc/bin/ptc-cli.sh` run from the
+repository root (alias it as `ptc` if you like).
+
 ## Usage
 
 ```bash
-./ptc-cli.sh init                         # detect the project, write .ptc-config.yml and print a CI snippet (prompts first)
-./ptc-cli.sh init --dry-run --verbose     # preview
-./ptc-cli.sh init --yes --force           # non-interactive, overwrite
-PTC_API_TOKEN=your-token ./ptc-cli.sh --config-file .ptc-config.yml
-./ptc-cli.sh -s en -p 'sample-{{lang}}.json,{{lang}}-*.properties'   # patterns instead of a config
+.ptc/bin/ptc-cli.sh auth login                   # you, once: approve the sign-in in your browser; saves your agent token (mode 600)
+.ptc/bin/ptc-cli.sh auth login --paste           # or paste the token from the agent token page
+.ptc/bin/ptc-cli.sh init                         # detect the project, write .ptc-config.yml and print a CI snippet (prompts first)
+.ptc/bin/ptc-cli.sh init --dry-run --verbose     # preview
+.ptc/bin/ptc-cli.sh init --yes --force           # non-interactive, overwrite
+.ptc/bin/ptc-cli.sh --config-file .ptc-config.yml
+.ptc/bin/ptc-cli.sh -s en -p 'sample-{{lang}}.json,{{lang}}-*.properties'   # patterns instead of a config
 ```
 
 `init` sends file **paths only** to the anonymous `detect_config` endpoint (no
@@ -26,7 +39,7 @@ for an unrecognised layout. Patterns cannot carry additional files or outputs.
 | `-t, --file-tag-name TAG` | File tag / branch name (default: from git) |
 | `-d, --project-dir DIR` | Project directory (default: current) |
 | `--api-url URL` | Default `https://app.ptc.wpml.org/api/v1/` |
-| `--api-token TOKEN` | Override; prefer `PTC_API_TOKEN` |
+| `--api-token TOKEN` | Override; prefer `ptc auth login` or `PTC_API_TOKEN` |
 | `--monitor-interval SECONDS` | Status check interval (default 5) |
 | `--monitor-max-attempts COUNT` | Max monitoring attempts (default: max(100, 20 x the number of files)) |
 | `--monitor-max-minutes MIN` | Wall-clock bound for monitoring, from the first upload (default: 45); exit `7` when reached |
@@ -41,7 +54,19 @@ works only for `--api-url`, `--api-token`, `--monitor-interval`,
 `--action` (`init`: `--api-url`, `--api-token`,
 `--project-dir`).
 
-**Token.** `PTC_API_TOKEN` env var; in CI a masked secret of that name.
+**Token.** Your agent token, from PTC's agent token page
+(<https://app.ptc.wpml.org/dashboard/agent-tokens>; one per user, minted the
+first time you need it, rotated there, never a second one). On your machine you
+save it once with `ptc auth login`: at a terminal it prints a link and a code
+(and opens the link unless `--no-browser`), you approve the code on PTC signed in
+as yourself, and the CLI receives the token (no token is typed); `--paste` (or a
+token piped on stdin) takes the token instead, nothing shown. It checks the
+token with PTC and saves it, mode 600, to `%APPDATA%\ptc\credentials` when
+`APPDATA` is set (Git Bash, MSYS, Cygwin), else
+`${XDG_CONFIG_HOME:-~/.config}/ptc/credentials`. Your agent never receives or
+types the token. The CLI takes the first of `--api-token`, `PTC_API_TOKEN`,
+`PTC_AGENT_TOKEN` (the legacy `PTC_ORG_TOKEN` is still accepted), then that
+file. In CI it is a masked secret named `PTC_API_TOKEN`.
 
 **Preflight.** Every run except `--dry-run` first validates the token and
 prints the account state in one line. It stops before any upload only when the
@@ -102,7 +127,7 @@ written, then fail the job with the reason.
 
 | Symptom | Check |
 |---|---|
-| `[ERROR] Failed to upload file: example.json (HTTP 401)` | The API token and its permissions |
-| `[ERROR] Failed to upload file: example.json (HTTP 403)` | The API token, your subscription, the token's permissions |
+| `[ERROR] Failed to upload file: example.json (HTTP 401)` | The agent token: if it was rotated, run `ptc auth login` again with the current one |
+| `[ERROR] Failed to upload file: example.json (HTTP 403)` | The agent token, your subscription, whether you still administer the organization |
 | `[WARNING] No files found for pattern: {{lang}}.json` | File paths in the config; the source locale matches your files; rerun with `--verbose` |
 | `[WARNING] Still translating in PTC: N` / exit 7 | Wait and run the printed `--action status` / `--action download` commands, or raise `monitor_max_minutes` |

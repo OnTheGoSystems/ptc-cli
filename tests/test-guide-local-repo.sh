@@ -60,6 +60,8 @@ L="$WORK/no-git"; tree "$L"
 clear_bodies
 start "$L" >"$WORK/out" 2>&1; expect_rc "no git, no --repo-url -> exit 0" 0 $?
 grep -qx "no git remote: local project, delivery by ptc sync" "$WORK/out" && pass "prints the one local-project line" || fail "local line: $(cat "$WORK/out")"
+# Org row 7319 clause 2 (AGD-3 row 19): a local project delivers by the API alone, so no CI-secret step is served.
+grep -q "Created PTC project" "$WORK/out" && ! grep -q "CI secret" "$WORK/out" && pass "a local project is not told to add a CI secret" || fail "CI secret on a local project: $(cat "$WORK/out")"
 jcheck "POST /projects: local 1, the 64-hex fingerprint, no repo_url" "$BODIES/projects.json" \
     "d['body']['local'] == 1 and len(d['body']['fingerprint']) == 64 and d['body']['repo_url'] == ''"
 jcheck "POST guide/sessions: local 1 and the same fingerprint" "$BODIES/guide_sessions.json" \
@@ -70,6 +72,7 @@ N="$WORK/no-remote"; tree "$N"; git -C "$N" init -q
 clear_bodies
 start "$N" >"$WORK/out" 2>&1; expect_rc "git, no remote, no --repo-url -> exit 0" 0 $?
 grep -q "no git remote: local project" "$WORK/out" && pass "git without a remote: the local-project line" || fail "local line (git): $(cat "$WORK/out")"
+! grep -q "CI secret" "$WORK/out" && pass "git without a remote: no CI-secret step" || fail "CI secret on a local git checkout: $(cat "$WORK/out")"
 jcheck "git without a remote: POST guide/sessions is local" "$BODIES/guide_sessions.json" "d['body']['local'] == 1 and d['body']['repo_url'] == ''"
 
 echo "=== --repo-url that is not a remote: refused, nothing sent ==="

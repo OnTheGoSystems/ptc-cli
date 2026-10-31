@@ -18,17 +18,23 @@ to complete those tasks.
 
 ## `guide` — the MCP session from the command line
 
+The human saves the agent token for the CLI once with `ptc auth login`, in
+their own terminal: they approve the sign-in in their browser, no token is
+typed, and the CLI saves the token mode 600 in its credentials file (`--paste`
+takes the token from PTC's agent token page, `/dashboard/agent-tokens`,
+instead); the agent never receives or types the token. Every `ptc` command below is `.ptc/bin/ptc-cli.sh` run from the
+repository root.
+
 ```bash
-export PTC_API_TOKEN=...                     # your agent token (PTC's agent token page, /dashboard/agent-tokens)
-./ptc-cli.sh guide start --project-id 123    # opens/resumes the session, caches it in .ptc/session.json
-./ptc-cli.sh guide start --organization-id 7 # no project yet: creates it in organization 7
+ptc guide start --project-id 123             # opens/resumes the session, caches it in .ptc/session.json
+ptc guide start --organization-id 7          # no project yet: creates it in organization 7
                                              # (token in several organizations: PTC lists them, ask the human)
-./ptc-cli.sh guide next                      # the next task (--json for the raw response)
-./ptc-cli.sh guide submit gt_abc --file .ptc/scan.json            # a task's result from a file ...
-echo '{"languages":["de"]}' | ./ptc-cli.sh guide submit gt_def    # ... or stdin
-./ptc-cli.sh guide skip gt_ghi --reason "the owner decided to skip this"
-./ptc-cli.sh guide status
-./ptc-cli.sh guide wait gt_jkl --timeout 20m # ends when PTC has a verdict
+ptc guide next                               # the next task (--json for the raw response)
+ptc guide submit gt_abc --file .ptc/scan.json                     # a task's result from a file ...
+echo '{"languages":["de"]}' | ptc guide submit gt_def             # ... or stdin
+ptc guide skip gt_ghi --reason "the owner decided to skip this"
+ptc guide status
+ptc guide wait gt_jkl --timeout 20m          # ends when PTC has a verdict
 ```
 
 Exit codes: `0` next task / accepted / skipped; `2` rejected; `3` needs more
@@ -44,8 +50,11 @@ only on PTC's explicit `done`); `4` this CLI is older than PTC's
 - Other guide calls retry a 5xx, no answer or a 429 with `Retry-After` 3 times
   (`PTC_TRANSIENT_BASE_DELAY`, default 5 s, doubling), then fail with "Could not
   reach PTC". A 4xx is final at once.
-- `--session-id` (or `PTC_GUIDE_SESSION_ID`) overrides the cached session;
-  `--api-url` points at another PTC instance.
+- `--session-id` (or `PTC_GUIDE_SESSION_ID`) and `--project-id` are optional:
+  without them the session and project come from the config's `guide:` block,
+  then the cache `.ptc/session.json` (every successful guide call refreshes it),
+  then PTC's open session for the checkout's origin; `-v` prints where the
+  project came from. `--api-url` points at another PTC instance.
 
 **`guide check [--commit SHA] [--json]`** — the CI gate of a finished guide.
 PTC compares the ptc-action run of the commit (default `CI_COMMIT_SHA`,
@@ -70,8 +79,8 @@ GitLab merge request description (one push-option line for
 ## `scan` — inventory of the repository's translatable files
 
 ```bash
-./ptc-cli.sh scan          # readable summary
-./ptc-cli.sh scan --json   # schema 2, the result PTC expects for its repo_census task
+ptc scan          # readable summary
+ptc scan --json   # schema 2, the result PTC expects for its repo_census task
 ```
 
 Deterministic and offline. Finds translation resource sets (Rails YAML under
@@ -97,8 +106,8 @@ Schema 2 adds (heuristics; counts are lower-bound estimates):
 ## `config validate`
 
 ```bash
-./ptc-cli.sh config validate          # text report, exit 0 valid / 2 invalid
-./ptc-cli.sh config validate --json   # {valid, errors, warnings, config, files:[...], ignored_outputs}
+ptc config validate          # text report, exit 0 valid / 2 invalid
+ptc config validate --json   # {valid, errors, warnings, config, files:[...], ignored_outputs}
 ```
 
 Checks the config structure, that each `file:` resolves, that each `output:`
@@ -110,7 +119,7 @@ translations on disk.
 ## `describe apply` — write PTC's string descriptions into the repository
 
 ```bash
-./ptc-cli.sh describe apply --file descriptions.json [--dry-run] [--into-template] [--json]
+ptc describe apply --file descriptions.json [--dry-run] [--into-template] [--json]
 ```
 
 Input: `{"descriptions":[{"file", "key", "context"?, "description", "usage"?: {"path", "line"}}]}`
@@ -127,7 +136,7 @@ written or present, `2` some skipped (listed with reasons), `1` bad input.
 ## `lint source` — deterministic source-string checks
 
 ```bash
-./ptc-cli.sh lint source [--json] [--file PATH]... [--template languages/x.pot --template-cmd "wp i18n make-pot . languages/x.pot"]
+ptc lint source [--json] [--file PATH]... [--template languages/x.pot --template-cmd "wp i18n make-pot . languages/x.pot"]
 ```
 
 FAIL/WARN findings `{check, level, file, key, text, detail}`:
@@ -141,15 +150,16 @@ error.
 ## `glossary validate|fmt`
 
 ```bash
-./ptc-cli.sh glossary validate glossary.csv --remote [--project-id N] [--json]   # PTC's own validator
-./ptc-cli.sh glossary validate glossary.csv [--source en] [--json]                # offline pre-check
-./ptc-cli.sh glossary fmt glossary.csv [--write]
+ptc glossary validate glossary.csv --remote [--project-id N] [--json]   # PTC's own validator
+ptc glossary validate glossary.csv [--source en] [--json]                # offline pre-check
+ptc glossary fmt glossary.csv [--write]
 ```
 
 `--remote` sends the file (CSV, or YAML by its `.yaml`/`.yml` name) to
 `POST /api/v1/guide/glossary/validate`; its verdict is the one that counts. It
-needs `PTC_API_TOKEN` and the project id (`--project-id`, `PTC_PROJECT_ID` /
-`guide.project_id`, or the current session's). FAIL classes: `structure`,
+needs the agent token (`ptc auth login`) and the project id (`--project-id`,
+`PTC_PROJECT_ID`, the config's `guide.project_id`, the cache
+`.ptc/session.json`, or PTC's open session for the checkout). FAIL classes: `structure`,
 `self_contradiction`, `case_contradiction`, `wrong_script`; WARN:
 `dropped_language`, `duplicate`, `case_variant`, `overlap`,
 `inverse_contradiction`, `keep_vs_translate`, `lint`, `deleted_term`,
@@ -162,7 +172,7 @@ trimmed NFC cells, blank rows dropped.
 ## `audit strings` — is the code ready for translation
 
 ```bash
-./ptc-cli.sh audit strings [--json] [--runtime] [-d DIR]
+ptc audit strings [--json] [--runtime] [-d DIR]
 ```
 
 Finds code that cannot translate well, per framework (WordPress/PHP, JS/React,
@@ -175,7 +185,7 @@ Rails): `hardcoded_string`, `concatenation`, `i18n_call_misuse`, `plural`,
 ## `guide action-run`
 
 ```bash
-./ptc-cli.sh guide action-run [--project-id ID] [--file PATH]... [--out R.json]
+ptc guide action-run [--project-id ID] [--file PATH]... [--out R.json]
 ```
 
 Reports a run to PTC and prints `run_key: <key>` (the commit sha, or
@@ -184,8 +194,10 @@ tasks ask for. Files a guide task named and each `--file PATH` (relative to
 `-d DIR`; at most 100 files of 1 MB, inside the repository) ride with their
 sha256 and bytes. A `--file` that is missing, outside the repository or over
 1 MB stops the run. ptc-action and the GitLab recipe call it after each run
-with the CI secret `PTC_API_TOKEN` (your PTC token); with an agent token, calls send `X-PTC-Project-Id` from
-`PTC_PROJECT_ID` (or `guide.project_id`). PTC ignores the report when the session
+with the CI secret `PTC_API_TOKEN` (your agent token). Calls send `X-PTC-Project-Id`
+for the project `--project-id` names, else `PTC_PROJECT_ID`, the config's
+`guide.project_id`, the cache `.ptc/session.json`, or PTC's open session for the
+checkout. PTC ignores the report when the session
 is off for the organization.
 
 It sends `ci_id_token`, the CI identity token with audience `ptc`, as proof
@@ -199,13 +211,13 @@ answer (`run_id`, `run_key`, `provenance`).
 ## `sync` — the CI job, run locally
 
 ```bash
-PTC_API_TOKEN=... ./ptc-cli.sh sync [--project-id ID] [-d DIR] [-c CONFIG] [--dry-run] [--json]
+ptc sync [--project-id ID] [-d DIR] [-c CONFIG] [--dry-run] [--json]
 ```
 
 Runs the CI job's steps in order: `guide action-run`, `guide check --json`
 (findings go to the log; never withholds the translation), the translate
 workflow, then `guide delivery-commit` with the sha256 of the files it wrote.
-Token: `PTC_API_TOKEN`. Exit codes are the job's (`0`,
+Token: the one `ptc auth login` saved (or `PTC_API_TOKEN`). Exit codes are the job's (`0`,
 `5`, `6`, `7`, see [Exit codes](cli.md#exit-codes)); `13` nothing delivered,
 the suite's setup is not finished; any other code is the
 translation run's own. `--json` prints

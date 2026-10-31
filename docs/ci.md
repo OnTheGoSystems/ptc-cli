@@ -4,15 +4,16 @@ For teams that want the translations delivered as merge requests from their CI.
 
 Before delivering, PTC asks whether you want the translations as a merge request (PTC set up in your CI) or via the API. This page describes the merge-request route. The API route is the other answer; the CLI's download step is `--action download` (see [CLI reference](cli.md#workflow)).
 
-Your agent sets this up when you ask; PTC tells it how. `ptc init` prints the
-same jobs.
+Answer the merge-request route and PTC hands your agent the CI file with that
+answer; the agent adds it to your repository. No separate prompt is needed.
+`ptc init` prints the same jobs.
 
-**Pin the CLI** to a release tag (`v1.5.5`), or use the floating `v1` tag (always
+**Pin the CLI** to a release tag (`v1.5.7`), or use the floating `v1` tag (always
 the newest published CLI).
 
 ### GitHub Actions
 
-Add `PTC_API_TOKEN` to the repository secrets and turn on "Allow GitHub Actions
+Add `PTC_API_TOKEN` (your agent token, from PTC's agent token page) to the repository secrets and turn on "Allow GitHub Actions
 to create and approve pull requests" (Settings -> Actions -> General -> Workflow
 permissions). The job runs through
 [`ptc-action`](https://github.com/OnTheGoSystems/ptc-action), which vendors a

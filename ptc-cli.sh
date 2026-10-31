@@ -6,9 +6,9 @@
 set -euo pipefail  # Strict mode: exit on errors, undefined variables and pipe errors
 
 # Constants
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly VERSION="1.5.6"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || true; readonly SCRIPT_DIR
+SCRIPT_NAME="$(basename "$0")"; readonly SCRIPT_NAME
+readonly VERSION="1.5.8"
 readonly PTC_USER_AGENT="ptc-cli/${VERSION}"
 
 # Colors for output
@@ -118,16 +118,19 @@ resolve_api_token() {
         return 0
     fi
     if [[ -n "${PTC_ORG_TOKEN:-}" ]]; then
+        PTC_API_TOKEN_SOURCE="PTC_ORG_TOKEN"
         log_debug "API token from PTC_ORG_TOKEN (deprecated: set PTC_API_TOKEN)"
         return 0
     fi
-    local file token
-    file=$(ptc_credentials_file)
-    if [[ ! -f "$file" ]]; then
-        log_debug "API token: none in PTC_API_TOKEN, PTC_AGENT_TOKEN, PTC_ORG_TOKEN or $file"
+    local file="" candidate token
+    while IFS= read -r candidate; do
+        [[ -f "$candidate" ]] && { file="$candidate"; break; }
+    done < <(ptc_credentials_files)
+    if [[ -z "$file" ]]; then
+        log_debug "API token: none in PTC_API_TOKEN, PTC_AGENT_TOKEN, PTC_ORG_TOKEN or $(ptc_credentials_file)"
         return 0
     fi
-    if ! _credentials_file_private "$file"; then
+    if ! _ptc_windows_shell && ! _credentials_file_private "$file"; then
         log_warning "Not reading $file: its mode is $(_file_mode "$file"), and a file holding the token must be 600 or stricter (chmod 600 $file)."
         return 0
     fi
@@ -145,7 +148,22 @@ resolve_api_token() {
 }
 
 # The CLI's own credentials file (like gh's hosts.yml, aws's credentials): one line PTC_API_TOKEN=<agent token>, mode 600.
-ptc_credentials_file() { printf '%s/ptc/credentials' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+# Org #7308 (Eran 28 Oct 2026, Windows and Linux alike): `$APPDATA/ptc/credentials` when APPDATA is set (Git Bash, MSYS,
+# Cygwin; cygpath turns C:\... into the shell's path), else `${XDG_CONFIG_HOME:-~/.config}/ptc/credentials`. `ptc auth
+# login` writes it; the doors read the first of ptc_credentials_files that exists.
+ptc_credentials_file() { ptc_credentials_files | head -n1; }
+ptc_credentials_files() {
+    if [[ -n "${APPDATA:-}" ]]; then
+        local appdata="$APPDATA"
+        command -v cygpath >/dev/null 2>&1 && appdata=$(cygpath -u "$APPDATA" 2>/dev/null || printf '%s' "$APPDATA")
+        printf '%s/ptc/credentials\n' "$appdata"
+    fi
+    printf '%s/ptc/credentials\n' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+# Git Bash / MSYS: chmod cannot take group and other access away (the file's ACL, private under the user's profile, does),
+# so the mode check would refuse every file there.
+_ptc_windows_shell() { case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*) return 0 ;; *) return 1 ;; esac; }
 
 # Octal permission bits of a file (GNU stat, else BSD stat); empty when unreadable.
 _file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || true; }
@@ -157,11 +175,200 @@ _credentials_file_private() {
     (( (8#$mode & 8#077) == 0 ))
 }
 
-# The one line every no-token error ends with: the doors that hand this CLI the token.
+# The one line every no-token error ends with: the doors that hand this CLI the token. Org row 7348 (AGD-1; Eran 29 Oct
+# 2026): the human runs `ptc auth login` in their own terminal, not through the agent; org row 7352: and approves the
+# sign-in in the browser, typing no token.
 api_token_doors() {
     local base="${PTC_API_URL%%/api/*}"
     base="${base%/}"
-    printf 'Set PTC_API_TOKEN (or PTC_AGENT_TOKEN), pass --api-token, or write PTC_API_TOKEN=<token> to %s (mode 600; the snippet on %s/dashboard/agent-tokens does it).' "$(ptc_credentials_file)" "$base"
+    printf 'Ask the human to run `ptc auth login` in their own terminal, not through the agent, and approve the sign-in in their browser at %s (no token is typed; the CLI saves it to %s, mode 600), or set PTC_API_TOKEN (or PTC_AGENT_TOKEN), or pass --api-token.' "$base" "$(ptc_credentials_file)"
+}
+
+# Org #7319 (CLI-24, AGD-1): the line a 401 adds - the source the refused token came from (resolve_api_token's order:
+# --api-token, PTC_API_TOKEN, PTC_AGENT_TOKEN, PTC_ORG_TOKEN, then the credentials file) and the way to the current one,
+# `ptc auth login`. An environment token wins over the credentials file (a Codex shell exports PTC_API_TOKEN for Codex's
+# MCP client), so a stale exported token is named as such, never silently tried. Never prints the value.
+api_token_refused() {
+    local src="${PTC_API_TOKEN_SOURCE:-}" file="" candidate msg
+    while IFS= read -r candidate; do
+        [[ -f "$candidate" ]] && { file="$candidate"; break; }
+    done < <(ptc_credentials_files)
+    case "$src" in
+        --api-token)
+            msg="it came from --api-token. Pass the current token, or drop --api-token so the CLI reads PTC_API_TOKEN, PTC_AGENT_TOKEN or the credentials file (the human saves the current token there with \`ptc auth login\`)." ;;
+        PTC_API_TOKEN|PTC_AGENT_TOKEN|PTC_ORG_TOKEN)
+            if [[ -n "$file" ]]; then
+                msg="it came from the environment variable $src, which wins over the credentials file $file. Export the current token in $src, or unset $src so the CLI reads the file; the human saves the current token there with \`ptc auth login\`."
+            else
+                msg="it came from the environment variable $src. Export the current token in $src, or unset it and ask the human to run \`ptc auth login\` (it saves the current token to $(ptc_credentials_file), mode 600)."
+            fi ;;
+        "")
+            msg="Ask the human to run \`ptc auth login\` to save the current token." ;;
+        *)
+            msg="it came from the credentials file $src. Ask the human to run \`ptc auth login\` to save the current token there." ;;
+    esac
+    printf 'PTC refused the agent token (HTTP 401): %s' "$msg"
+}
+
+# Org #7308 (CLI-24, AGD-1; Eran 28 Oct 2026): `ptc auth login` - the human, never the agent, hands this CLI the agent
+# token, saved as PTC_API_TOKEN=<token>, mode 600, to ptc_credentials_file after PTC verified it (GET auth/check: it needs
+# only the token and answers 200 to any live token; org row 7344: GET languages is project-scoped and answers every agent
+# token that names no project 401; the bearer goes to curl through --config on stdin, never on an argument list). The
+# value is never printed.
+# Org row 7352 (API-38; Eran 29 Oct 2026): at a terminal with nothing on stdin it signs the human in through the browser
+# (the device-code form: PTC answers a link and a code, the human approves them on PTC signed in as themselves, the CLI
+# polls until PTC hands it the person's current agent token); --device forces that form, --paste the paste form (no
+# echo at a terminal; one line on stdin when stdin is not a terminal), and piped stdin keeps the paste form unchanged.
+cmd_auth() {
+    case "${1:-}" in
+        login) shift; _auth_login "$@" ;;
+        ""|-h|--help)
+            printf 'Usage: %s auth login [--device | --paste] [--no-browser] [--api-url URL]\n' "$SCRIPT_NAME"
+            printf '  At a terminal it signs you in through the browser: it prints a link and a code, you approve them on PTC, and it\n'
+            printf '  saves your agent token, mode 600, to %s (the token is never shown).\n' "$(ptc_credentials_file)"
+            printf '  --paste       paste the token from the token page instead (one line on stdin when stdin is not a terminal)\n'
+            printf '  --device      the browser sign-in even when stdin is not a terminal\n'
+            printf '  --no-browser  print the link without opening a browser\n' ;;
+        *) log_error "Unknown auth command '$1' (try: $SCRIPT_NAME auth login)"; return 2 ;;
+    esac
+}
+
+_auth_login() {
+    local form="" open_browser=true rc
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --api-url) PTC_API_URL="$2"; shift 2 ;;
+            --api-url=*) PTC_API_URL="${1#*=}"; shift ;;
+            --device) form="device"; shift ;;
+            --paste) form="paste"; shift ;;
+            --no-browser) open_browser=false; shift ;;
+            -h|--help) cmd_auth --help; return 0 ;;
+            *) log_error "Unknown option for auth login: $1 (the token is never an argument: the command prompts for it)"; return 2 ;;
+        esac
+    done
+    if [[ -z "$form" ]]; then
+        if [[ -t 0 ]]; then form="device"; else form="paste"; fi
+    fi
+    if [[ "$form" == device ]]; then
+        _auth_device_login "$open_browser"; rc=$?
+        [[ $rc -eq 3 ]] || return $rc # 3: the human asked for the paste form (a bare Enter) or PTC has no device door
+    fi
+    _auth_paste_login
+}
+
+# The paste form: the token read with no echo at a terminal, else one line from stdin.
+_auth_paste_login() {
+    local base="${PTC_API_URL%%/api/*}" token=""
+    base="${base%/}"
+    if [[ -t 0 ]]; then
+        printf 'Paste your PTC agent token from %s/dashboard/agent-tokens (it is not shown) and press Enter: ' "$base" >&2
+        IFS= read -rs token || true
+        printf '\n' >&2
+    else
+        IFS= read -r token || true
+    fi
+    token="${token//$'\r'/}"
+    token="${token#"${token%%[![:space:]]*}"}"; token="${token%"${token##*[![:space:]]}"}"
+    if [[ -z "$token" ]]; then
+        log_error "No token given; nothing saved. Copy it from $base/dashboard/agent-tokens and run '$SCRIPT_NAME auth login' again."
+        return 1
+    fi
+    _auth_save_token "$token" "Token verified and saved to %s (mode 600). Tell your agent it is done."
+}
+
+# The browser form (API-38): POST auth/device (no credential) answers {device_code, user_code, verification_uri_complete,
+# expires_in, interval}; the CLI prints the link and the code, opens the link (xdg-open / open) unless --no-browser, and
+# polls POST auth/device/token every `interval` seconds: 428 pending, 429 slow down (5 s more), 403 denied, 410 expired
+# or used, 200 {token} once. The device code rides in the request body on stdin (never on an argument list); the token
+# goes from curl's output file to _auth_save_token, never to the screen. Returns 3 when the paste form should run instead.
+_auth_device_login() {
+    local open_browser="$1" tmp code device_code="" user_code="" link="" interval="" expires_in="" token="" line opener deadline wait_s
+    tmp=$(mktemp 2>/dev/null) || { log_error "Could not create a temporary file; nothing saved."; return 1; }
+    code=$(printf '{"client_label":"ptc-cli %s"}' "$VERSION" |
+           ptc_curl -sS -o "$tmp" -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H 'Accept: application/json' \
+                    --data-binary @- "${PTC_API_URL}auth/device" 2>/dev/null) || true
+    if [[ "$code" == 200 ]]; then
+        { IFS= read -r device_code; IFS= read -r user_code; IFS= read -r link; IFS= read -r interval; IFS= read -r expires_in; } < <(
+            python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+for k in ("device_code", "user_code", "verification_uri_complete", "interval", "expires_in"):
+    print(str(d.get(k, "")).replace("\n", " "))' "$tmp" 2>/dev/null)
+    fi
+    if [[ "$code" != 200 || -z "$device_code" || -z "$user_code" || -z "$link" ]]; then
+        rm -f "${tmp:?}"
+        if [[ -t 0 ]]; then
+            log_warning "PTC at ${PTC_API_URL} cannot sign you in through the browser (HTTP ${code:-none}); paste the token instead."
+            return 3
+        fi
+        log_error "PTC at ${PTC_API_URL} cannot sign you in through the browser (HTTP ${code:-none}); nothing saved. Run '$SCRIPT_NAME auth login --paste' instead."
+        return 1
+    fi
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=5
+    [[ "$expires_in" =~ ^[0-9]+$ && "$expires_in" -gt 0 ]] || expires_in=600
+    printf '\nTo sign in, open this link in your browser and approve the code %s:\n  %s\n' "$user_code" "$link" >&2
+    if [[ "$open_browser" == true ]]; then
+        for opener in xdg-open open; do
+            command -v "$opener" >/dev/null 2>&1 && { "$opener" "$link" >/dev/null 2>&1 & break; }
+        done
+    fi
+    if [[ -t 0 ]]; then
+        printf 'Waiting for your approval (or press Enter to paste a token instead)...\n' >&2
+    else
+        printf 'Waiting for your approval...\n' >&2
+    fi
+    deadline=$((SECONDS + expires_in))
+    while (( SECONDS < deadline )); do
+        if [[ -t 0 ]]; then
+            wait_s=$interval; (( wait_s > 0 )) || wait_s=1
+            if IFS= read -r -t "$wait_s" line; then rm -f "${tmp:?}"; return 3; fi
+        else
+            sleep "$interval"
+        fi
+        code=$(printf '{"device_code":"%s"}' "$device_code" |
+               ptc_curl -sS -o "$tmp" -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H 'Accept: application/json' \
+                        --data-binary @- "${PTC_API_URL}auth/device/token" 2>/dev/null) || true
+        case "$code" in
+            200) token=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("token") or "")' "$tmp" 2>/dev/null); break ;;
+            429) interval=$((interval + 5)) ;;
+            403) rm -f "${tmp:?}"; log_error "The sign-in was denied in the browser; nothing saved."; return 1 ;;
+            410) rm -f "${tmp:?}"; log_error "The code expired (or was already used) before it was approved; nothing saved. Run '$SCRIPT_NAME auth login' again."; return 1 ;;
+            *) ;; # 428 authorization_pending, or PTC not reached this time: poll again
+        esac
+    done
+    rm -f "${tmp:?}"
+    if [[ -z "$token" ]]; then
+        log_error "The code expired before it was approved; nothing saved. Run '$SCRIPT_NAME auth login' again."
+        return 1
+    fi
+    _auth_save_token "$token" "Signed in; token saved to %s (mode 600). Tell your agent it is done."
+}
+
+# Verify TOKEN with PTC (GET auth/check, the bearer through --config on stdin) and save PTC_API_TOKEN=<token>, mode 600,
+# to ptc_credentials_file; SUCCESS_FMT names the file (%s). Never prints the value.
+_auth_save_token() {
+    local token="$1" success_fmt="$2" base="${PTC_API_URL%%/api/*}" code file
+    base="${base%/}"
+    if [[ "$token" =~ [[:space:]\"\\] ]]; then
+        log_error "That is not an agent token (it has spaces or quotes); nothing saved."
+        return 1
+    fi
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+           ptc_curl -sS -o /dev/null -w '%{http_code}' --config - -X GET "${PTC_API_URL}auth/check" 2>/dev/null) || true
+    case "$code" in
+        200) ;;
+        401|403) log_error "PTC refused this token (HTTP $code): it is unknown, rotated or expired. Nothing saved; copy the current one from $base/dashboard/agent-tokens."; return 1 ;;
+        *) log_error "Could not verify the token with PTC at ${PTC_API_URL} (HTTP ${code:-none}). Nothing saved; try again."; return 1 ;;
+    esac
+    file=$(ptc_credentials_file)
+    if ! ( umask 077; mkdir -p "${file%/*}" && printf 'PTC_API_TOKEN=%s\n' "$token" > "$file.tmp.$$" && chmod 600 "$file.tmp.$$" &&
+           mv -f "$file.tmp.$$" "$file" ); then
+        log_error "Could not write $file; nothing saved."
+        return 1
+    fi
+    # shellcheck disable=SC2059 # the callers' fixed sentences, %s the file
+    log_success "$(printf "$success_fmt" "$file")"
+    [[ -n "${PTC_API_TOKEN:-}${PTC_AGENT_TOKEN:-}" ]] && log_warning "PTC_API_TOKEN or PTC_AGENT_TOKEN is set in this shell and wins over the saved token."
+    return 0
 }
 
 # All PTC API requests go through this wrapper so every call carries a versioned
@@ -180,10 +387,28 @@ ptc_curl() {
     # CG-1 (DLV-8, AGD-4): inside a repository's CI job (_guide_in_ci: GitLab CI, GitHub Actions) the files this CLI pushes
     # come from the repository, so PTC counts them git-originating and the merge request it opens carries them.
     _guide_in_ci && extra+=(-H "X-PTC-Upload-Origin: repository")
-    if [[ -n "${PTC_HEADER_DUMP:-}" ]]; then
-        curl -H "User-Agent: $PTC_USER_AGENT" -H "X-PTC-CLI-Version: $VERSION" ${extra[@]+"${extra[@]}"} -D "$PTC_HEADER_DUMP" "$@"
+    # Org #7225: a credential never rides on curl's argument list (every process on the machine can read it there). Each
+    # call site's -H "Authorization: ..." is taken out of the arguments and handed to curl as a config on stdin (-K -,
+    # header = "..."), written by the shell itself (a here-string: a pipe, or a private temp file bash removes at once).
+    local a pend="" args=() kcfg=""
+    for a in "$@"; do
+        if [[ -n "$pend" ]]; then
+            pend=""
+            case "$a" in
+                [Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]:*)
+                    a=${a//\\/\\\\}; kcfg+="header = \"${a//\"/\\\"}\""$'\n'; continue ;;
+            esac
+            args+=(-H "$a"); continue
+        fi
+        [[ "$a" == -H ]] && { pend=1; continue; }
+        args+=("$a")
+    done
+    [[ -n "$pend" ]] && args+=(-H)
+    [[ -n "${PTC_HEADER_DUMP:-}" ]] && args=(-D "$PTC_HEADER_DUMP" ${args[@]+"${args[@]}"})
+    if [[ -n "$kcfg" ]]; then
+        curl -H "User-Agent: $PTC_USER_AGENT" -H "X-PTC-CLI-Version: $VERSION" -K - ${extra[@]+"${extra[@]}"} ${args[@]+"${args[@]}"} <<<"$kcfg"
     else
-        curl -H "User-Agent: $PTC_USER_AGENT" -H "X-PTC-CLI-Version: $VERSION" ${extra[@]+"${extra[@]}"} "$@"
+        curl -H "User-Agent: $PTC_USER_AGENT" -H "X-PTC-CLI-Version: $VERSION" ${extra[@]+"${extra[@]}"} ${args[@]+"${args[@]}"}
     fi
 }
 
@@ -656,7 +881,7 @@ write_paused_note() {
     local previous=""
     [[ -n "${PTC_LIMIT_NOTE_FILE:-}" && -s "$PTC_LIMIT_NOTE_FILE" ]] && previous="$(cat "$PTC_LIMIT_NOTE_FILE")"$'\n\n'
     if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-        local delim="PTC_LIMIT_$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')"
+        local delim; delim="PTC_LIMIT_$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')" || true
         printf 'limit-note<<%s\n%s\n%s\n' "$delim" "$previous$body" "$delim" >> "$GITHUB_OUTPUT"
     fi
     if [[ -n "${PTC_LIMIT_NOTE_FILE:-}" ]]; then
@@ -678,7 +903,7 @@ write_still_translating_note() {
     local previous=""
     [[ -n "${PTC_LIMIT_NOTE_FILE:-}" && -s "$PTC_LIMIT_NOTE_FILE" ]] && previous="$(cat "$PTC_LIMIT_NOTE_FILE")"$'\n\n'
     if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-        local delim="PTC_LIMIT_$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')"
+        local delim; delim="PTC_LIMIT_$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')" || true
         printf 'limit-note<<%s\n%s\n%s\n' "$delim" "$previous$body" "$delim" >> "$GITHUB_OUTPUT"
     fi
     if [[ -n "${PTC_LIMIT_NOTE_FILE:-}" ]]; then
@@ -772,6 +997,7 @@ COMMANDS:
     init                           Scaffold a .ptc-config.yml from your repository
                                    (scans files, calls detect_config, writes config
                                    + a CI snippet). See '$SCRIPT_NAME init --help'.
+    auth login                     Prompt for the agent token, verify it, save it (mode 600) where the CLI reads it.
     guide next|submit|wait|status|skip  Agent-guide protocol transport (PTC_API_TOKEN or PTC_AGENT_TOKEN, else ~/.config/ptc/credentials; PTC_ORG_TOKEN still accepted).
                                    See '$SCRIPT_NAME guide --help'.
     sync [--project-id ID] [-d DIR] [--dry-run] [--json]
@@ -1302,7 +1528,7 @@ extract_additional_files() {
     fi
     
     if [[ ${#json_objects[@]} -gt 0 ]]; then
-        local json_array="[$(IFS=','; echo "${json_objects[*]}")]"
+        local json_array; json_array="[$(IFS=','; echo "${json_objects[*]}")]"
         echo "$json_array"
         log_debug "Additional files JSON array: $json_array"
     fi
@@ -1540,8 +1766,8 @@ process_files() {
                     log_debug "Additional translation files specified for: $file_entry"
                     while IFS= read -r additional_line; do
                         if [[ -n "$additional_line" ]]; then
-                            local key=$(echo "$additional_line" | sed 's/^ *//' | sed 's/:.*//')
-                            local value=$(echo "$additional_line" | sed 's/^[^:]*: *//')
+                            local key; key=$(echo "$additional_line" | sed 's/^ *//' | sed 's/:.*//')
+                            local value; value=$(echo "$additional_line" | sed 's/^[^:]*: *//')
                             log_debug "  $key: $value"
                         fi
                     done <<< "$additional_files_section"
@@ -1644,13 +1870,13 @@ process_files() {
 # Function to perform only upload action
 perform_upload_action() {
     local files=("$@")
-    local base_dir=$(get_base_directory)
+    local base_dir; base_dir=$(get_base_directory) || true
     local uploaded_files=()
     local unmapped_files=()  # E27: no output pattern could be resolved; failed loudly, never sent
     
     log_info "=== UPLOAD ACTION: Uploading all files ==="
     for file in "${files[@]}"; do
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
         
         if [[ "$PTC_DRY_RUN" == "true" ]]; then
             log_info "[DRY RUN] Would upload file: $relative_file_path"
@@ -1697,14 +1923,14 @@ perform_upload_action() {
 # Function to perform only upload action with config file support
 perform_upload_action_with_config() {
     local files=("$@")
-    local base_dir=$(get_base_directory)
+    local base_dir; base_dir=$(get_base_directory) || true
     local uploaded_files=()
     local unmapped_files=()  # E27: no output pattern could be resolved; failed loudly, never sent
     local attempted=0
     
     log_info "=== UPLOAD ACTION: Uploading all files ==="
     for file in "${files[@]}"; do
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
         # L12 (SF-33): `guide upload-sources` names the files PTC does not hold yet; the others are not sent again.
         if [[ -n "${PTC_UPLOAD_ONLY+x}" ]] && ! PTC_LEFT_OUT_FILES="$PTC_UPLOAD_ONLY" is_left_out_file "$relative_file_path"; then
             continue
@@ -1778,13 +2004,13 @@ perform_upload_action_with_config() {
 # Function to perform only status check action
 perform_status_action() {
     local files=("$@")
-    local base_dir=$(get_base_directory)
+    local base_dir; base_dir=$(get_base_directory) || true
     local checked_files=()
     local problem_files=()
     
     log_info "=== STATUS ACTION: Checking translation status for all files ==="
     for file in "${files[@]}"; do
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
         
         if [[ "$PTC_DRY_RUN" == "true" ]]; then
             log_info "[DRY RUN] Would check status for file: $relative_file_path"
@@ -1828,13 +2054,13 @@ perform_status_action() {
 # Function to perform only download action
 perform_download_action() {
     local files=("$@")
-    local base_dir=$(get_base_directory)
+    local base_dir; base_dir=$(get_base_directory) || true
     local downloaded_files=()
     local failed_files=()
     
     log_info "=== DOWNLOAD ACTION: Downloading completed translations for all files ==="
     for file in "${files[@]}"; do
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
         
         if [[ "$PTC_DRY_RUN" == "true" ]]; then
             log_info "[DRY RUN] Would download translations for file: $relative_file_path"
@@ -1877,7 +2103,7 @@ perform_download_action() {
     if [[ ${#downloaded_files[@]} -gt 0 ]]; then
         log_success "Successfully downloaded ${#downloaded_files[@]} file(s)"
         for file in "${downloaded_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             log_success "  ✓ $relative_file_path"
         done
     fi
@@ -1885,7 +2111,7 @@ perform_download_action() {
     if [[ ${#failed_files[@]} -gt 0 ]]; then
         log_warning "Failed to download ${#failed_files[@]} file(s)"
         for file in "${failed_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             log_warning "  ✗ $relative_file_path"
         done
     fi
@@ -2050,10 +2276,10 @@ report_still_translating() {
 # WF-20: the time bound is what ends a run; the unset attempts cap (counted per ROUND, one pass over every file) is only a
 # safety net and never binds before it: at least one round per monitor interval over the whole bound, plus slack.
 scale_monitor_max_attempts() {
-    local files="${1:-0}"
+    local nfiles="${1:-0}"
     [[ "$PTC_MONITOR_MAX_ATTEMPTS_SET" == "true" ]] && return 0
-    [[ "$files" =~ ^[0-9]+$ ]] || return 0
-    local scaled=$((files * 20)) secs="" interval="${PTC_MONITOR_INTERVAL:-5}" by_time
+    [[ "$nfiles" =~ ^[0-9]+$ ]] || return 0
+    local scaled=$((nfiles * 20)) secs="" interval="${PTC_MONITOR_INTERVAL:-5}" by_time
     [[ $scaled -lt 100 ]] && scaled=100
     if [[ -n "$PTC_MONITOR_MAX_SECONDS" ]]; then secs="$PTC_MONITOR_MAX_SECONDS"
     elif [[ "$PTC_MONITOR_MAX_MINUTES" =~ ^[0-9]+$ ]]; then secs=$(( PTC_MONITOR_MAX_MINUTES * 60 )); fi
@@ -2063,7 +2289,7 @@ scale_monitor_max_attempts() {
         [[ $scaled -lt $by_time ]] && scaled=$by_time
     fi
     PTC_MONITOR_MAX_ATTEMPTS=$scaled
-    log_debug "Monitor budget: $PTC_MONITOR_MAX_ATTEMPTS polls for $files file(s)"
+    log_debug "Monitor budget: $PTC_MONITOR_MAX_ATTEMPTS polls for $nfiles file(s)"
 }
 
 # WF-20: PTC's suggested wait (retry_after of an in-progress 202, capped at 300 s): the largest seen this round.
@@ -2143,7 +2369,7 @@ monitor_round_sleep() {
 
 process_files_in_steps() {
     local files=("$@")
-    local base_dir=$(get_base_directory)
+    local base_dir; base_dir=$(get_base_directory) || true
     local uploaded_files=()
     local uploaded_outputs=() uploaded_additional=()  # GAP-G34: per uploaded file, the outputs its process call carries
     start_monitor_clock || return 1
@@ -2154,7 +2380,7 @@ process_files_in_steps() {
     # Step 1: Upload all files
     log_info "=== STEP 1: Uploading all files ==="
     for file in "${files[@]}"; do
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
         
         if [[ "$PTC_DRY_RUN" == "true" ]]; then
             log_info "[DRY RUN] Would upload file: $relative_file_path"
@@ -2199,7 +2425,7 @@ process_files_in_steps() {
     local upload_index
     for upload_index in "${!uploaded_files[@]}"; do
         file="${uploaded_files[$upload_index]}"
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
         
         if [[ "$PTC_DRY_RUN" == "true" ]]; then
             log_info "[DRY RUN] Would start processing: $relative_file_path"
@@ -2245,7 +2471,7 @@ process_files_in_steps() {
     
     if [[ "$PTC_DRY_RUN" == "true" ]]; then
         for file in "${processed_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             log_info "[DRY RUN] Would monitor and download: $relative_file_path"
         done
         log_success "[DRY RUN] All files would be processed successfully"
@@ -2281,7 +2507,7 @@ process_files_in_steps() {
         local still_monitoring=()
         
         for file in "${monitoring_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             
             # Check status quietly
             local status_output
@@ -2308,7 +2534,7 @@ process_files_in_steps() {
                 set_file_status "$file" "failed"
             elif [[ $status_result -eq 3 ]]; then
                 # Terminal failure - stop polling this file, it cannot recover
-                local terminal_status=$(echo "$status_output" | cut -d'|' -f1)
+                local terminal_status; terminal_status=$(echo "$status_output" | cut -d'|' -f1)
                 local partial_result=1
                 if [[ "$terminal_status" == "failed" ]]; then
                     deliver_failed_status_file "$relative_file_path" "$base_dir" >/dev/null 2>&1
@@ -2329,7 +2555,7 @@ process_files_in_steps() {
                 esac
             elif [[ $status_result -eq 2 ]]; then
                 # Still in progress - extract actual status
-                local actual_status=$(echo "$status_output" | cut -d'|' -f1)
+                local actual_status; actual_status=$(echo "$status_output" | cut -d'|' -f1)
                 if [[ -z "$actual_status" || "$actual_status" == "null" ]]; then
                     actual_status="status_unknown"
                 fi
@@ -2375,7 +2601,7 @@ process_files_in_steps() {
     log_success "Completed files: ${#completed_files[@]}"
     if [[ ${#completed_files[@]} -gt 0 ]]; then
         for file in "${completed_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             log_success "  ✓ $relative_file_path"
         done
     fi
@@ -2383,7 +2609,7 @@ process_files_in_steps() {
     if [[ ${#failed_files[@]} -gt 0 ]]; then
         log_error "Failed files: ${#failed_files[@]}"
         for file in "${failed_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             log_error "  ✗ $relative_file_path"
         done
     fi
@@ -2440,7 +2666,7 @@ write_run_summary() {  # uploaded completed parked rejected
 
 process_files_in_steps_with_config() {
     local files=("$@")
-    local base_dir=$(get_base_directory)
+    local base_dir; base_dir=$(get_base_directory) || true
     local uploaded_files=()
     local uploaded_outputs=() uploaded_additional=()  # GAP-G34: per uploaded file, the outputs its process call carries
     start_monitor_clock || return 1
@@ -2455,7 +2681,7 @@ process_files_in_steps_with_config() {
     # Step 1: Upload all files
     log_info "=== STEP 1: Uploading all files ==="
     for file in "${files[@]}"; do
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
         
         if is_left_out_file "$relative_file_path"; then
             log_warning "Left out (over the balance, census order): $relative_file_path"
@@ -2512,7 +2738,7 @@ process_files_in_steps_with_config() {
     local upload_index
     for upload_index in "${!uploaded_files[@]}"; do
         file="${uploaded_files[$upload_index]}"
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
         
         if [[ "$PTC_DRY_RUN" == "true" ]]; then
             log_info "[DRY RUN] Would start processing: $relative_file_path"
@@ -2566,7 +2792,7 @@ process_files_in_steps_with_config() {
     
     if [[ "$PTC_DRY_RUN" == "true" ]]; then
         for file in "${processed_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             log_info "[DRY RUN] Would monitor and download: $relative_file_path"
         done
         write_run_summary "${#uploaded_files[@]}" 0 0 0
@@ -2587,7 +2813,7 @@ process_files_in_steps_with_config() {
     # Initialize all files as unknown status. S2-R3B F-2: the keys are registered here (they never were in config
     # mode, so every status read was "unknown"); the bound summary and the progress letters read PTC's last state.
     for file in "${monitoring_files[@]}"; do
-        local relative_file_path=$(get_relative_path "$file" "$base_dir")
+        local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
         file_status_keys+=("$relative_file_path")
         file_status_values+=("unknown")
     done
@@ -2602,12 +2828,12 @@ process_files_in_steps_with_config() {
         local still_monitoring=()
         
         for file in "${monitoring_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             
             # Get current status
             local status_output
             status_output=$(get_translation_status_quiet "$relative_file_path" "$PTC_FILE_TAG_NAME")
-            local status=$(echo "$status_output" | cut -d'|' -f1)
+            local status; status=$(echo "$status_output" | cut -d'|' -f1)
             set_file_status "$relative_file_path" "$status"
             case "$status" in
                 error|not_found) _ptc_status_unavailable_mark "$relative_file_path" "${status_output#*|}" ;;
@@ -2673,7 +2899,7 @@ process_files_in_steps_with_config() {
         # Build status string
         local status_string=""
         for file in "${monitoring_files[@]}"; do
-            local relative_file_path_status=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path_status; relative_file_path_status=$(get_relative_path "$file" "$base_dir")
             local file_status
             file_status=$(get_file_status "$relative_file_path_status")
             local status_char
@@ -2708,7 +2934,7 @@ process_files_in_steps_with_config() {
     log_success "Completed files: ${#completed_files[@]}"
     if [[ ${#completed_files[@]} -gt 0 ]]; then
         for file in "${completed_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             log_success "  ✓ $relative_file_path"
         done
     fi
@@ -2716,7 +2942,7 @@ process_files_in_steps_with_config() {
     if [[ ${#failed_files[@]} -gt 0 ]]; then
         log_error "Failed files: ${#failed_files[@]}"
         for file in "${failed_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             log_error "  ✗ $relative_file_path"
         done
     fi
@@ -2727,7 +2953,7 @@ process_files_in_steps_with_config() {
     local still_lines=() status_unreachable_lines=() in_progress_files=() unavailable
     if [[ ${#monitoring_files[@]} -gt 0 ]]; then
         for file in "${monitoring_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             if unavailable=$(_ptc_status_unavailable_get "$relative_file_path"); then
                 status_unreachable_lines+=("$relative_file_path"$'\t'"$unavailable")
                 unreachable_files+=("$file")
@@ -2752,7 +2978,7 @@ process_files_in_steps_with_config() {
     if [[ ${#rejected_files[@]} -gt 0 ]]; then
         log_error "Rejected by PTC (not translated; the reason is logged once above): ${#rejected_files[@]}"
         for file in "${rejected_files[@]}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             log_error "  ⊘ $relative_file_path"
         done
     fi
@@ -2761,7 +2987,7 @@ process_files_in_steps_with_config() {
     if [[ $upload_unreachable_count -gt 0 ]]; then
         log_error "Could not reach PTC (5xx or no response after ${PTC_TRANSIENT_MAX_RETRIES} retries; not rejected, re-run to translate): $upload_unreachable_count"
         for file in "${unreachable_files[@]:0:$upload_unreachable_count}"; do
-            local relative_file_path=$(get_relative_path "$file" "$base_dir")
+            local relative_file_path; relative_file_path=$(get_relative_path "$file" "$base_dir")
             log_error "  ✗ $relative_file_path"
         done
     fi
@@ -2857,6 +3083,7 @@ preflight_check() {
         401)
             rm -f "$header_file"
             log_error "Preflight failed: PTC rejected the API token (HTTP 401)."
+            log_error "$(api_token_refused)"
             log_info "The token is unknown or past its expiration date. Generate a new one in PTC."
             return 1
             ;;
@@ -2877,10 +3104,20 @@ preflight_check() {
 
     # The balance headers ride on every api/v1 response, so the languages call
     # above already carries them - no separate request needed for the numbers.
-    local trial_balance prepaid_balance
+    local trial_balance prepaid_balance runs_remaining run_open
     trial_balance=$(http_header_value "$header_file" "X-PTC-TRIAL-BALANCE")
     prepaid_balance=$(http_header_value "$header_file" "X-PTC-PREPAID-BALANCE")
+    runs_remaining=$(http_header_value "$header_file" "X-PTC-TRIAL-API-RUNS-REMAINING")
+    run_open=$(http_header_value "$header_file" "X-PTC-TRIAL-API-RUN-OPEN")
     rm -f "$header_file"
+
+    # #7346 (POL-1): every free automatic delivery of the trial is used and no push window of this project is open, so
+    # PTC refuses this push (HTTP 402) and delivers nothing: say so once and stop before any upload. Only on PTC's
+    # explicit "false": an open window (the rest of an admitted push) runs, and a server without the header runs as before.
+    if [[ "$runs_remaining" == "0" && "$run_open" == "false" ]]; then
+        log_error "Nothing was uploaded: the trial's free automatic deliveries are used up, so PTC would refuse this sync (HTTP 402). Upgrade in PTC (Billing) to continue."
+        return 1
+    fi
 
     # Source locale check. The server translates from the project's configured
     # source language regardless of what this run claims, so a mismatch means
@@ -2999,7 +3236,7 @@ for p in left:
     log_warning "Preflight: $note"
     local body="**Translation limit reached (PTC balance).** $note Top up or raise the limit in PTC (Billing), then push again to translate the rest."
     if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-        local delim="PTC_LIMIT_$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')"
+        local delim; delim="PTC_LIMIT_$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')" || true
         printf 'limit-note<<%s\n%s\n%s\n' "$delim" "$body" "$delim" >> "$GITHUB_OUTPUT"
     fi
     if [[ -n "${PTC_LIMIT_NOTE_FILE:-}" ]]; then
@@ -3309,7 +3546,7 @@ get_translation_status_quiet() {
     local status_url="${PTC_API_URL}source_files/translation_status"
     
     # Prepare query parameters
-    local query_params="file_path=$(printf '%s' "$relative_file_path" | sed 's/ /%20/g')"
+    local query_params; query_params="file_path=$(printf '%s' "$relative_file_path" | sed 's/ /%20/g')"
     if [[ -n "$file_tag_name" ]]; then
         query_params="${query_params}&file_tag_name=$(printf '%s' "$file_tag_name" | sed 's/ /%20/g')"
     fi
@@ -3403,7 +3640,7 @@ check_translation_status() {
     log_debug "Checking translation status via PTC API: $status_url"
     
     # Prepare query parameters
-    local query_params="file_path=$(printf '%s' "$relative_file_path" | sed 's/ /%20/g')"
+    local query_params; query_params="file_path=$(printf '%s' "$relative_file_path" | sed 's/ /%20/g')"
     if [[ -n "$file_tag_name" ]]; then
         query_params="${query_params}&file_tag_name=$(printf '%s' "$file_tag_name" | sed 's/ /%20/g')"
     fi
@@ -3521,7 +3758,6 @@ display_file_status() {
     local completed_count="$1"
     local total_count="$2"
     local round="$3"
-    local max_round="$4"
     local status_string="$5"
     
     # Clear current line and move cursor to beginning
@@ -3821,7 +4057,7 @@ download_translations() {
     log_debug "Downloading translations via PTC API: $download_url"
     
     # Prepare query parameters
-    local query_params="file_path=$(printf '%s' "$relative_file_path" | sed 's/ /%20/g')"
+    local query_params; query_params="file_path=$(printf '%s' "$relative_file_path" | sed 's/ /%20/g')"
     if [[ -n "$file_tag_name" ]]; then
         query_params="${query_params}&file_tag_name=$(printf '%s' "$file_tag_name" | sed 's/ /%20/g')"
     fi
@@ -3851,7 +4087,7 @@ download_translations() {
     # after the XXXXXX and exits 1 with "Invalid argument". GNU mktemp allows
     # it, which is why this only ever failed outside GitHub runners. unzip
     # identifies the archive by content, so the name costs nothing.
-    local temp_zip=$(mktemp /tmp/ptc_translations_XXXXXX)
+    local temp_zip; temp_zip=$(mktemp /tmp/ptc_translations_XXXXXX) || true
     log_debug "Created temporary ZIP file: $temp_zip"
     
     local http_code
@@ -3875,7 +4111,7 @@ download_translations() {
 
         # Check file size to verify download
         if [[ -f "$temp_zip" ]]; then
-            local file_size=$(stat -f%z "$temp_zip" 2>/dev/null || stat -c%s "$temp_zip" 2>/dev/null || echo "unknown")
+            local file_size; file_size=$(stat -f%z "$temp_zip" 2>/dev/null || stat -c%s "$temp_zip" 2>/dev/null || echo "unknown")
             log_debug "Downloaded file size: $file_size bytes"
             if [[ "$PTC_VERBOSE" == "true" ]]; then
                 log_info "Downloaded ZIP file: $file_size bytes"
@@ -3923,7 +4159,7 @@ download_translations() {
         # Unpack ZIP and place files in correct directory structure
         if command -v unzip >/dev/null 2>&1; then
             # Get directory where the original file is located
-            local source_dir=$(dirname "$relative_file_path")
+            local source_dir; source_dir=$(dirname "$relative_file_path")
             local target_dir="$base_dir"
             if [[ "$source_dir" != "." ]]; then
                 target_dir="$base_dir/$source_dir"
@@ -3948,7 +4184,7 @@ download_translations() {
             fi
             
             # Create temporary directory for extraction
-            local temp_extract_dir=$(mktemp -d /tmp/ptc_extract_XXXXXX)
+            local temp_extract_dir; temp_extract_dir=$(mktemp -d /tmp/ptc_extract_XXXXXX) || true
             log_debug "Created extraction directory: $temp_extract_dir"
             
             # Extract ZIP to temporary directory first
@@ -3963,16 +4199,16 @@ download_translations() {
                 if [[ "$PTC_VERBOSE" == "true" ]]; then
                     log_info "Files found in archive:"
                     find "$temp_extract_dir" -type f 2>/dev/null | while read -r extracted_file; do
-                        local extracted_filename=$(basename "$extracted_file")
-                        local extracted_size=$(stat -f%z "$extracted_file" 2>/dev/null || stat -c%s "$extracted_file" 2>/dev/null || echo "unknown")
+                        local extracted_filename; extracted_filename=$(basename "$extracted_file")
+                        local extracted_size; extracted_size=$(stat -f%z "$extracted_file" 2>/dev/null || stat -c%s "$extracted_file" 2>/dev/null || echo "unknown")
                         log_info "  - $extracted_filename ($extracted_size bytes)"
                     done
                 fi
                 
                 log_debug "Extracted files:"
                 find "$temp_extract_dir" -type f 2>/dev/null | while read -r extracted_file; do
-                    local extracted_filename=$(basename "$extracted_file")
-                    local extracted_size=$(stat -f%z "$extracted_file" 2>/dev/null || stat -c%s "$extracted_file" 2>/dev/null || echo "unknown")
+                    local extracted_filename; extracted_filename=$(basename "$extracted_file")
+                    local extracted_size; extracted_size=$(stat -f%z "$extracted_file" 2>/dev/null || stat -c%s "$extracted_file" 2>/dev/null || echo "unknown")
                     log_debug "  - $extracted_filename ($extracted_size bytes)"
                 done
                 # Move files from temp directory to target directory, preserving structure
@@ -4041,7 +4277,7 @@ download_translations() {
                             # `git add` and takes the whole staging call with it.
                             record_written_path "$target_file" "$base_dir"
                             printf '%s\n' "$target_file" >> "$written_list"
-                            local final_size=$(stat -f%z "$target_file" 2>/dev/null || stat -c%s "$target_file" 2>/dev/null || echo "unknown")
+                            local final_size; final_size=$(stat -f%z "$target_file" 2>/dev/null || stat -c%s "$target_file" 2>/dev/null || echo "unknown")
                             log_debug "Successfully moved $filename ($final_size bytes)"
                             if [[ "$PTC_VERBOSE" == "true" ]]; then
                                 log_info "  ✓ $filename ($final_size bytes)"
@@ -7458,9 +7694,16 @@ def guide_render(kind, body_path, as_json, version):
                 print("\n" + "\n".join(pushes))
     elif kind == "status":
         if not as_json:
-            print(f"Stage {resp.get('stage')}  {setup_label(resp)}".rstrip())
-            for t in resp.get("tasks") or []:
+            # Org #7319 (AGD-2): the state `next` answers done on, and why a done setup's progress is short of 100%.
+            tasks = resp.get("tasks") or []
+            done = ""
+            if resp.get("setup_done") is True:
+                done = "  setup done" + (" (a skipped task counts half)" if any(t.get("state") == "skipped" for t in tasks) else "")
+            print(f"Stage {resp.get('stage')}  {setup_label(resp)}{done}".rstrip())
+            for t in tasks:
                 print(f"  {t.get('id')}  {t.get('type')}  {t.get('state')}  {t.get('verdict') or ''}")
+                for r in (t.get("reasons") or []) if t.get("state") == "skipped" else []:
+                    print(f"      skipped: {r}")
             for q in resp.get("pending_ask_human") or []:
                 print(f"  waiting on the human: {q.get('question') if isinstance(q, dict) else q}")
             for p in resp.get("products") or []:
@@ -7950,7 +8193,7 @@ def action_body(scan_path, cfg_path, project_id, sha, branch, root, limit, chang
     return 0
 
 
-def project_answer(path):
+def project_answer(path, local=False):
     """SF-18 (L8): POST /api/v1/projects' answer. A project -> its id on stdout and the created / rejoined text on stderr.
     PTC's "which organization" answer (the token acts in several organizations, none named) -> the organizations as a
     readable list and the remedy on stderr, exit 3. Anything else -> PTC's error, exit 1."""
@@ -7966,10 +8209,14 @@ def project_answer(path):
         else:
             u = d.get("token_page_url") or ""
             u = u if "/agent-tokens" in u else "PTC > Agent tokens"
-            sys.stderr.write("Created PTC project %s.\nThe human adds the CI secret PTC_API_TOKEN = the organization agent token (the same token "
-                             "the agent uses), from: %s\nThe project has no target languages yet: the human sets them in the PTC dashboard "
+            # Org #7319 (AGD-3 rows 19-20): no channel is chosen at start; the CI secret is named only for a CI delivery (the
+            # delivery_channel task asks for it once CI is chosen), and never on a local project, whose delivery is the API.
+            ci = "" if local else ("If the delivery is by CI, the human adds the CI secret PTC_API_TOKEN = the organization agent token "
+                                   "(the same token the agent uses), from: %s (the guide's delivery_channel task asks for it once CI is "
+                                   "chosen)\n" % u)
+            sys.stderr.write("Created PTC project %s.\n%sThe project has no target languages yet: the human sets them in the PTC dashboard "
                              "(the project's target languages), or through the guide's target_languages task when an agent runs the "
-                             "guide.\n" % (d["project_id"], u))
+                             "guide.\n" % (d["project_id"], ci))
         print(d["project_id"])
         return 0
     orgs = d.get("organizations")
@@ -8025,7 +8272,7 @@ def main(argv):
             print(line)
         return 0
     if cmd == "project-answer":
-        return project_answer(argv[1])
+        return project_answer(argv[1], local=len(argv) > 2 and argv[2] == "local")
     if cmd == "field":
         v = json.load(open(argv[1]))
         for k in argv[2].split("."):
@@ -8487,6 +8734,8 @@ print(d.get("word_cost") if d.get("word_cost") is not None else "", "" if b is N
             remote=$(mktemp); hdrs=$(mktemp); body_file=$(mktemp)
             while IFS= read -r path; do
                 [[ -z "$path" || ! -f "$root/$path" ]] && continue
+                # try only counts the three attempts; the loop body never reads it.
+                # shellcheck disable=SC2034
                 for try in 1 2 3; do
                     code=$(ptc_curl -s -o "$body_file" -D "$hdrs" -w '%{http_code}' -X POST -H "Authorization: Bearer $token" \
                         ${ehdr[@]+"${ehdr[@]}"} -F "file=@$root/$path" -F "file_path=$path" "${PTC_API_URL}source_files/estimate" 2>/dev/null) || code=000
@@ -8638,7 +8887,7 @@ _guide_lookup_session() {
 # PTC_GUIDE_PROJECT_ID, guide.project_id of the config (CFG: the -c file, else the project dir's .ptc-config.yml), the
 # local cache's project_id (.ptc/session.json), then PTC's open session for the checkout's origin (B4; skipped for a
 # local session with no remote, and when the third argument is "nolookup"). Sets and exports PTC_GUIDE_PROJECT_ID, sets
-# GUIDE_PROJECT_SOURCE (flag, env, config, cache, ptc) and GUIDE_RUN_PROJECT_FROM (the same, spelled out), and in verbose
+# GUIDE_RUN_PROJECT_FROM (the source, spelled out: the flag, the environment, the config file, the cache or PTC), and in verbose
 # mode logs `project <id> from <source>`. 1 when no source names a project.
 GUIDE_NO_PROJECT_SOURCES="--project-id N, PTC_PROJECT_ID, guide.project_id in .ptc-config.yml, or a guide session (.ptc/session.json)"
 _guide_project_id() {
@@ -8648,7 +8897,7 @@ _guide_project_id() {
     if [[ -n "$flag" ]]; then
         v="$flag"; src=flag; from="--project-id"
     elif [[ -n "${PTC_GUIDE_PROJECT_ID:-}" ]]; then
-        v="$PTC_GUIDE_PROJECT_ID"; src=env; from="environment"
+        v="$PTC_GUIDE_PROJECT_ID"; src="env"; from="environment"
     else
         v=$(ptc_config_project_id "$cfgf" 2>/dev/null || true)
         if [[ -n "$v" ]]; then
@@ -8663,11 +8912,11 @@ _guide_project_id() {
         fi
     fi
     if [[ -z "$v" ]]; then
-        GUIDE_PROJECT_SOURCE=""; GUIDE_RUN_PROJECT_FROM=""
+        GUIDE_RUN_PROJECT_FROM=""
         log_debug "project: none from ${GUIDE_NO_PROJECT_SOURCES}${GUIDE_LOOKUP_PROBLEM:+ (PTC lookup: $GUIDE_LOOKUP_PROBLEM)}"
         return 1
     fi
-    GUIDE_PROJECT_SOURCE="$src"; GUIDE_RUN_PROJECT_FROM="$from"
+    GUIDE_RUN_PROJECT_FROM="$from"
     PTC_GUIDE_PROJECT_ID="$v"; export PTC_GUIDE_PROJECT_ID
     log_debug "project $v from $src ($from)"
     return 0
@@ -8686,6 +8935,11 @@ _guide_find_session() {
     # .ptc/session.json is used only when it names the same project, or when the config has no block.
     local cfg_sid cfg_pid cfgf="${cfg:-$PTC_PROJECT_DIR/.ptc-config.yml}" v
     cfg_sid=$(ptc_config_guide_field "$cfgf" session_id); cfg_pid=$(ptc_config_project_id "$cfgf")
+    # Org #7224: what each source held, for the no-session message (_guide_no_session).
+    GUIDE_SID_CFG="$cfgf"; GUIDE_SID_CACHE="absent"
+    [[ -f "$f" ]] && GUIDE_SID_CACHE="present, no session_id"
+    [[ -f "$f" && -n "$cfg_sid" && -n "$cfg_pid" && "$(_ptc_py field "$f" project_id 2>/dev/null)" != "$cfg_pid" ]] && \
+        GUIDE_SID_CACHE="present, names another project than guide.project_id $cfg_pid (not used)"
     if [[ -f "$f" ]] && { [[ -z "$cfg_sid" || -z "$cfg_pid" ]] || [[ "$(_ptc_py field "$f" project_id 2>/dev/null)" == "$cfg_pid" ]]; }; then
         v=$(_guide_cached_field session_id)
         if [[ -n "$v" ]]; then GUIDE_SID="$v"; log_debug "session $v from cache ($PTC_GUIDE_DIR/session.json)"; return 0; fi
@@ -8699,23 +8953,65 @@ _guide_find_session() {
         [[ -n "$GUIDE_SID" ]] && { log_debug "session $GUIDE_SID from ptc (open session for this repository)"; return 0; }
     fi
     GUIDE_SID_PROBLEM="$GUIDE_LOOKUP_PROBLEM"
+    # Org #7343: a project named by --project-id or the environment, with no session in any local source (the session
+    # was opened over MCP on a checkout with no remote, so there is no repository URL to look up) -> rejoin it.
+    _guide_rejoin_project && return 0
     return 1
+}
+
+# Org #7343: the `guide start --project-id` rejoin for a door that was given its project (the flag or the environment,
+# never a cache or config guess): POST guide/sessions answers the project's existing session (Guide::Engine.open_session),
+# which the cache then learns. 0 with GUIDE_SID set; else 1 and the caller's no-session message stands.
+_guide_rejoin_project() {
+    [[ "${GUIDE_RUN_PROJECT_FROM:-}" == "--project-id" || "${GUIDE_RUN_PROJECT_FROM:-}" == environment ]] || return 1
+    local pid="${PTC_GUIDE_PROJECT_ID:-}" origin branch fp="" body lscan sid
+    [[ -n "$pid" ]] || return 1
+    origin=$(git -C "$PTC_PROJECT_DIR" remote get-url origin 2>/dev/null || true)
+    branch=$(git -C "$PTC_PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    if [[ -z "$origin" ]]; then
+        lscan=$(ptc_mktemp)
+        cmd_scan --json -d "$PTC_PROJECT_DIR" > "$lscan" 2>/dev/null || true
+        fp=$(python3 -c 'import json,sys;print((json.load(open(sys.argv[1])).get("repo") or {}).get("workspace_fingerprint") or "")' "$lscan" 2>/dev/null || true)
+    fi
+    body=$(ptc_mktemp)
+    PID="$pid" URL="$origin" BR="$branch" FP="$fp" python3 -c 'import json,os;d={"project_id":int(os.environ["PID"]) if os.environ["PID"].isdigit() else os.environ["PID"],"repo_url":os.environ["URL"],"branch":os.environ["BR"]};d.update({"local":1,"fingerprint":os.environ["FP"]} if not os.environ["URL"] else {});print(json.dumps(d))' > "$body"
+    _guide_call POST guide/sessions "$body" || return 1
+    sid=$(_ptc_py field "$GUIDE_RESPONSE" session_id 2>/dev/null || true)
+    [[ -z "$sid" || "$sid" == None ]] && return 1
+    _guide_cache_ids "$sid" "$pid"
+    GUIDE_SID="$sid"; GUIDE_SID_PROBLEM=""
+    log_info "Guide session $sid of PTC project $pid (named by ${GUIDE_RUN_PROJECT_FROM})"
+    return 0
 }
 
 # Kept for callers that read the id on stdout.
 _guide_session_id() { _guide_find_session || true; printf '%s' "$GUIDE_SID"; }
 
 # The door's error when _guide_find_session found nothing: the token error when no token let PTC be asked (never "No
-# guide session"), PTC's answer when the lookup failed, else the way to start a session.
+# guide session"), PTC's answer when the lookup failed, else "No guide session". Org #7224: then every source it checked
+# with its result, one per line (the config file, the session cache, PTC's lookup), and the one command that opens one.
 _guide_no_session() {
+    local cfgf="${GUIDE_SID_CFG:-$PTC_PROJECT_DIR/.ptc-config.yml}" cfg_state="absent" lookup
+    [[ -f "$cfgf" ]] && cfg_state="present, no guide.session_id"
     case "${GUIDE_SID_PROBLEM:-}" in
         "no token")
-            log_error "No API token: PTC_API_TOKEN and PTC_AGENT_TOKEN are not set (PTC_ORG_TOKEN is still accepted). $(api_token_doors)" ;;
+            log_error "No API token: PTC_API_TOKEN and PTC_AGENT_TOKEN are not set (PTC_ORG_TOKEN is still accepted). $(api_token_doors)"
+            lookup="not attempted (no API token)" ;;
+        "no git remote")
+            log_error "No guide session."; lookup="not attempted (no git remote origin to look up)" ;;
+        "HTTP 404")
+            log_error "No guide session (PTC lookup by repo URL answered HTTP 404)."; lookup="attempted: no open session for this repository (HTTP 404)" ;;
         HTTP*)
-            log_error "No guide session (PTC lookup by repo URL answered ${GUIDE_SID_PROBLEM}): run '$SCRIPT_NAME guide start' or pass --session-id." ;;
+            log_error "No guide session (PTC lookup by repo URL answered ${GUIDE_SID_PROBLEM})."; lookup="attempted: ${GUIDE_SID_PROBLEM}" ;;
         *)
-            log_error "No guide session: run '$SCRIPT_NAME guide start --project-id ID' or pass --session-id." ;;
+            log_error "No guide session."; lookup="${GUIDE_SID_PROBLEM:-attempted: none open}" ;;
     esac
+    {
+        printf '  Checked config file %s: %s\n' "$cfgf" "$cfg_state"
+        printf '  Checked session cache %s: %s\n' "$(_guide_session_file)" "${GUIDE_SID_CACHE:-absent}"
+        printf '  Checked PTC lookup by repo URL: %s\n' "$lookup"
+        printf "  Start a session: %s guide start --project-id ID\n" "$SCRIPT_NAME"
+    } >&2
     return 1
 }
 
@@ -8838,6 +9134,7 @@ _guide_call() {
     # S2-F2 C-2: a transient answer was retried and _guide_request said "Could not reach PTC" (guide wait says it itself).
     _guide_transient_code "$code" && return 1
     log_error "PTC answered HTTP $code for $method /$path: $(head -c 500 "$GUIDE_RESPONSE")"
+    [[ "$code" == "401" ]] && log_error "$(api_token_refused)"  # org #7319: the refused token's source
     [[ "$code" == "404" ]] && log_error "(404: the agent guide is not enabled for this organization, or the session does not exist.)"
     return 1
 }
@@ -9381,7 +9678,7 @@ cmd_guide() {
                 _guide_call POST projects "$pbody" || return 1
                 # SF-18 (L8): a token acting in several organizations gets PTC's "which organization" answer (no project_id);
                 # it is printed as a list with the --organization-id remedy, never a traceback.
-                project_id=$(_ptc_py project-answer "$GUIDE_RESPONSE") || return 1
+                project_id=$(_ptc_py project-answer "$GUIDE_RESPONSE" "$([[ -z "$repo_url" ]] && echo local || echo repo)") || return 1
             fi
             _ptc_py body "$(PID="$project_id" URL="$repo_url" BR="$branch" FP="$local_fp" python3 -c 'import json,os;d={"project_id":int(os.environ["PID"]) if os.environ["PID"].isdigit() else os.environ["PID"],"repo_url":os.environ["URL"],"branch":os.environ["BR"]};d.update({"local":1,"fingerprint":os.environ["FP"]} if not os.environ["URL"] else {});print(json.dumps(d))')" > "$body"
             _guide_call POST guide/sessions "$body" || return 1
@@ -9831,7 +10128,7 @@ cmd_sync() {
     ( PTC_GUIDE_RUN_KEY="${fingerprint:+fp:$fingerprint}" PTC_ORG_TOKEN="${PTC_ORG_TOKEN:-$PTC_API_TOKEN}" cmd_guide check --json --config-file "$cfg" --api-url "$PTC_API_URL" -d "$PTC_PROJECT_DIR" > "$check" ) 2>&1 | cat >&2 || true
     _guide_mr_description "$check" >/dev/null || true
     # 3. translate: the same CLI, the job's arguments, run in the project directory
-    local self="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")" rc=0
+    local self rc=0; self="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
     local args=(--config-file "$cfg" --written-manifest "$manifest" --api-url "$PTC_API_URL")
     [[ "$dry" == "true" ]] && args+=(--dry-run)
     ( cd "$PTC_PROJECT_DIR" && PTC_RUN_SUMMARY="$summary" PTC_PROGRESS_LABEL=sync bash "$self" "${args[@]}" ) >&2 || rc=$?
@@ -9899,6 +10196,7 @@ main() {
     fi
     # Agent-guide commands: no source locale / patterns needed.
     case "${1:-}" in
+        auth)   shift; cmd_auth "$@";   exit $? ;;
         guide)  shift; cmd_guide "$@";  exit $? ;;
         scan)   shift; cmd_scan "$@";   exit $? ;;
         config) shift; cmd_config "$@"; exit $? ;;
